@@ -6,6 +6,7 @@
 #   tools\uv       uv (pinned, checksum-verified) to fetch Python and packages
 #   tools\pythons  Python 3.10 (gsplat's prebuilt Windows wheels are cp310 only)
 #   gsplat\venv    torch 2.4.1 (CUDA 12.4) + gsplat 1.5.3 prebuilt (no compiler needed)
+#   tools\colmap   COLMAP 4.2.1 CUDA build (checksum-verified), for pose refinement here
 # Needs an NVIDIA driver recent enough for CUDA 12.4 (>= 550). The Mac copies the
 # gs\*.py scripts to <Root>\gsplat\gs before every job, so there's nothing else to update.
 param([string]$Root = "D:\gaussqueue")
@@ -17,6 +18,8 @@ $UvSha256 = "5d223efa0bf00208c3853246af09420419dfbd352536aa6bb8163d6170e23890"  
 $Torch = "torch==2.4.1"
 $TorchIndex = "https://download.pytorch.org/whl/cu124"
 $Gsplat = "gsplat==1.5.3+pt24cu124"
+$ColmapVersion = "4.2.1"
+$ColmapSha256 = "e9c5cbd84c2ea986d2e970a2473fc2d2e6b34a2cdcf5d3df2765c319a63af881"   # colmap-x64-windows-cuda.zip
 $GsplatIndex = "https://docs.gsplat.studio/whl/gsplat/"
 
 $uvDir = Join-Path $Root "tools\uv"
@@ -49,10 +52,25 @@ Run @("pip", "install", "--python", $py, $Gsplat, "--find-links", $GsplatIndex)
 Run @("pip", "install", "--python", $py, "pillow", "packaging", "setuptools")
 New-Item -ItemType Directory -Force (Join-Path $Root "gsplat\gs") | Out-Null
 
+$colmapDir = Join-Path $Root "tools\colmap"
+$colmap = Join-Path $colmapDir "bin\colmap.exe"
+if (-not (Test-Path $colmap)) {
+    $zip = Join-Path $Root "tools\colmap.zip"
+    Invoke-WebRequest "https://github.com/colmap/colmap/releases/download/$ColmapVersion/colmap-x64-windows-cuda.zip" -OutFile $zip
+    $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+    if ($hash -ne $ColmapSha256) { Remove-Item $zip; throw "COLMAP checksum mismatch: $hash" }
+    Expand-Archive $zip -DestinationPath $colmapDir -Force
+    Remove-Item $zip
+}
+& $colmap -h 2>&1 | Select-Object -First 1
+
 & $py -c "import torch, gsplat; assert torch.cuda.is_available(), 'CUDA not available'; print('torch', torch.__version__, '|', torch.cuda.get_device_name(0), '| gsplat', gsplat.__version__)"
 if ($LASTEXITCODE) { throw "gsplat check failed" }
 
 $r = $Root -replace '\\', '/'
 Write-Host ""
 Write-Host "Done. Add this to the worker's entry in the Mac's GaussQueue config.json:"
-Write-Host "  `"gsplat`": {`"python`": `"$r/gsplat/venv/Scripts/python.exe`", `"scripts`": `"$r/gsplat/gs`"}"
+Write-Host "  `"gsplat`": {`"python`": `"$r/gsplat/venv/Scripts/python.exe`", `"scripts`": `"$r/gsplat/gs`"},"
+Write-Host "  `"colmap`": `"$r/tools/colmap/bin/colmap.exe`""
+Write-Host "COLMAP's GPU feature extraction needs a recent NVIDIA driver (560.x crashed in testing);"
+Write-Host "until then add `"colmap_gpu`": false, or leave `"colmap`" out to refine on the Mac."

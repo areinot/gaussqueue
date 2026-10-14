@@ -1204,7 +1204,7 @@ def pose_cache_dir(cfg, colmap_dir, name):
     return POSE_CACHE / f"{name}-{h.hexdigest()[:16]}"
 
 
-FEATURE_POINTS = "points3D_features.txt"
+FEATURE_POINTS = "points3D_features.txt"   # written by gs/refine.py
 SPACE_VERSION = "space1"   # bump when gs/fuse.py's space map changes, to invalidate cached maps
 
 
@@ -1237,7 +1237,7 @@ def save_pose_cache(cache, model, stats):
     tmp.rename(cache)
 
 
-def refined_model(cfg, colmap_dir, work, beat, job):
+def refined_model(cfg, colmap_dir, work, beat, job, worker=None):
     """Refined poses for a capture: from the pose cache if this exact capture was
     refined before, otherwise computed with COLMAP and saved to the cache."""
     cache = pose_cache_dir(cfg, colmap_dir, job["name"])
@@ -1249,7 +1249,7 @@ def refined_model(cfg, colmap_dir, work, beat, job):
         log(f"using cached pose refinement for {job['name']} ({cache.name})")
         model, stats = build_refined_model(colmap_dir, cache, work / "model"), dict(stats, cached=True)
     else:
-        model, stats = refine_poses(cfg, colmap_dir, work, beat, job)
+        model, stats = refine_poses(cfg, colmap_dir, work, beat, job, worker)
         try:
             save_pose_cache(cache, model, stats)
         except OSError as e:
@@ -1279,131 +1279,59 @@ def merge_feature_points(model):
     return len(extra)
 
 
-def refine_poses(cfg, colmap_dir, work, beat, job):
-    """Refine ARKit/LiDAR poses with COLMAP and return a new COLMAP folder:
-    SIFT features -> matching (exhaustive, or spatial using the known positions as
-    priors for big captures) -> triangulate with the known poses -> bundle-adjust
-    poses + points (intrinsics fixed) -> similarity-align back onto the original
-    camera centres, so the capture's LiDAR points and "up" still line up.
-    Raises on failure; the caller falls back to the original poses."""
-    import sqlite3
-    import struct
-    colmap = shutil.which(cfg.get("colmap") or "colmap") or cfg.get("colmap")
-    if not colmap or not os.access(colmap, os.X_OK):
-        raise RuntimeError("colmap not found (brew install colmap)")
-    src, images = colmap_dir / "sparse" / "0", colmap_dir / "images"
+def refine_poses(cfg, colmap_dir, work, beat, job, worker=None):
+    """Refine ARKit/LiDAR poses with COLMAP (gs/refine.py) and return a new COLMAP folder with
+    the refined poses, the original photos and LiDAR points, and COLMAP's feature points.
+    Runs on a remote worker that has COLMAP when one is given (GPU SIFT; its photos are then
+    reused for training), else, or if that fails, on this Mac. Raises on failure; the caller
+    falls back to the original poses."""
+    src = colmap_dir / "sparse" / "0"
     if not (src / "images.txt").exists():
         raise RuntimeError("pose refinement needs a text COLMAP model (images.txt)")
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
-    logf, db = work / "colmap.log", work / "database.db"
-    cams = [l.split() for l in open(src / "cameras.txt") if l.strip() and not l.startswith("#")]
-    if len(cams) != 1:
-        raise RuntimeError("pose refinement supports single-camera captures only")
-    model, params = cams[0][1], ",".join(cams[0][4:])
-    orig = read_poses(src / "images.txt")
-    n = len(orig)
-
-    job["phase"] = f"refining poses: features ({n} photos)"
-    beat(force=True)
-    run_cmd([colmap, "feature_extractor", "--database_path", db, "--image_path", images,
-             "--ImageReader.camera_model", model, "--ImageReader.single_camera", 1,
-             "--ImageReader.camera_params", params, "--FeatureExtraction.use_gpu", 0,
-             "--FeatureExtraction.max_image_size", 1600, "--log_target", "stderr"], beat, logf)
-
-    con = sqlite3.connect(db)
-    ids = {nm: (iid, cid) for iid, nm, cid in con.execute("select image_id, name, camera_id from images")}
-    frames = {d: (f, r) for f, r, d in con.execute(
-        "select f.frame_id, f.rig_id, d.data_id from frames f join frame_data d on f.frame_id = d.frame_id")}
-    job["phase"] = "refining poses: matching"
-    beat(force=True)
-    if n <= 120:
-        con.close()
-        run_cmd([colmap, "exhaustive_matcher", "--database_path", db,
-                 "--FeatureMatching.use_gpu", 0, "--log_target", "stderr"], beat, logf)
-    else:  # match each photo with its spatial neighbours, using the known positions
-        cov = struct.pack("<9d", 0.04, 0, 0, 0, 0.04, 0, 0, 0, 0.04)
-        for nm, (_, _, c) in orig.items():
-            iid, cid = ids[nm]
-            con.execute("insert into pose_priors (corr_data_id, corr_sensor_id, corr_sensor_type, "
-                        "position, position_covariance, gravity, coordinate_system) "
-                        "values (?,?,0,?,?,NULL,1)", (iid, cid, struct.pack("<3d", *c), cov))
-        con.commit()
-        con.close()
-        run_cmd([colmap, "spatial_matcher", "--database_path", db, "--FeatureMatching.use_gpu", 0,
-                 "--SpatialMatching.ignore_z", 0, "--SpatialMatching.max_num_neighbors", 30,
-                 "--SpatialMatching.max_distance", 10, "--log_target", "stderr"], beat, logf)
-
-    # Known-pose model with the database's ids (COLMAP 4 also wants rigs + frames).
-    known = work / "known"
-    known.mkdir()
-    cid = next(iter(ids.values()))[1]
-    (known / "cameras.txt").write_text(" ".join([str(cid)] + cams[0][1:]) + "\n")
-    (known / "rigs.txt").write_text(f"1 1 CAMERA {cid}\n")
-    img_lines, frame_lines = [], []
-    for nm, (p, _, _) in orig.items():
-        iid, c = ids[nm]
-        fid, rig = frames[iid]
-        img_lines += [" ".join([str(iid)] + p[1:8] + [str(c), nm]), ""]
-        frame_lines.append(" ".join([str(fid), str(rig)] + p[1:8] + ["1", "CAMERA", str(c), str(iid)]))
-    (known / "images.txt").write_text("\n".join(img_lines) + "\n")
-    (known / "frames.txt").write_text("\n".join(frame_lines) + "\n")
-    (known / "points3D.txt").write_text("")
-
-    job["phase"] = "refining poses: bundle adjustment"
-    beat(force=True)
-    tri, ba, aligned, txt = (work / d for d in ("tri", "ba", "aligned", "txt"))
-    for d in (tri, ba, aligned, txt):
-        d.mkdir()
-    run_cmd([colmap, "point_triangulator", "--database_path", db, "--image_path", images,
-             "--input_path", known, "--output_path", tri, "--refine_intrinsics", 0,
-             "--log_target", "stderr"], beat, logf)
-    before = mean_reprojection(colmap, tri)
-    run_cmd([colmap, "bundle_adjuster", "--input_path", tri, "--output_path", ba,
-             "--BundleAdjustment.refine_focal_length", 0,
-             "--BundleAdjustment.refine_principal_point", 0,
-             "--BundleAdjustment.refine_extra_params", 0,
-             "--BundleAdjustment.refine_sensor_from_rig", 0, "--log_target", "stderr"], beat, logf)
-    after = mean_reprojection(colmap, ba)
-    ref = work / "ref_centres.txt"
-    ref.write_text("".join(f"{nm} {c[0]:.6f} {c[1]:.6f} {c[2]:.6f}\n" for nm, (_, _, c) in orig.items()))
-    run_cmd([colmap, "model_aligner", "--input_path", ba, "--output_path", aligned,
-             "--ref_images_path", ref, "--ref_is_gps", 0, "--alignment_type", "custom",
-             "--alignment_max_error", 0.25, "--log_target", "stderr"], beat, logf)
-    run_cmd([colmap, "model_converter", "--input_path", aligned, "--output_path", txt,
-             "--output_type", "TXT", "--log_target", "stderr"], beat, logf)
-
-    new = read_poses(txt / "images.txt")
-    common = [nm for nm in orig if nm in new]
-    if len(common) < 0.9 * n:
-        raise RuntimeError(f"only {len(common)}/{n} photos survived refinement")
-    shift = sorted(math.dist(orig[nm][2], new[nm][2]) * 100 for nm in common)
-    turn = sorted(math.degrees(2 * math.acos(min(1, abs(sum(a * b for a, b in zip(orig[nm][1], new[nm][1]))))))
-                  for nm in common)
-    stats = {"photos": n, "reprojection_px_before": before, "reprojection_px_after": after,
-             "median_shift_cm": round(shift[len(shift) // 2], 1), "max_shift_cm": round(shift[-1], 1),
-             "median_turn_deg": round(turn[len(turn) // 2], 2), "max_turn_deg": round(turn[-1], 2)}
-    if after is None or (before is not None and after > before * 1.05) or shift[-1] > 200:
-        raise RuntimeError(f"refinement looked worse than the original poses: {stats}")
-
-    # Trainable folder: refined poses, original photos and LiDAR points.
-    out = work / "model"
-    (out / "sparse" / "0").mkdir(parents=True)
-    (out / "images").symlink_to(images.resolve())
-    lines = []
-    for nm in orig:   # write in the original order, poses from the refined model
-        p = new[nm][0] if nm in new else orig[nm][0]
-        lines += [" ".join(p[:8] + [cams[0][0], nm]), ""]
-    (out / "sparse" / "0" / "images.txt").write_text("\n".join(lines) + "\n")
-    (out / "sparse" / "0" / "cameras.txt").write_text(" ".join(cams[0]) + "\n")  # intrinsics unchanged
-    if (src / "points3D.txt").exists():
-        shutil.copyfile(src / "points3D.txt", out / "sparse" / "0" / "points3D.txt")
-    else:
-        shutil.copyfile(txt / "points3D.txt", out / "sparse" / "0" / "points3D.txt")
-    # COLMAP's triangulated feature points (same frame), for init_feature_points
-    shutil.copyfile(txt / "points3D.txt", out / "sparse" / "0" / FEATURE_POINTS)
+    out = work / "refined"
+    stats = None
+    if worker is not None and worker.remote and worker.can_refine():
+        try:
+            stats = worker.refine(cfg, job, colmap_dir, out, beat)
+        except Exception as e:
+            log(f"pose refinement on {worker.label} failed, refining on the Mac instead: {e}")
+            warn = job.setdefault("warnings", [])
+            warn.append(f"refined on the Mac ({worker.label}: {str(e)[:80]})")
+    if stats is None:
+        stats = refine_locally(cfg, colmap_dir, work, out, beat, job)
+    model = work / "model"
+    (model / "sparse" / "0").mkdir(parents=True)
+    (model / "images").symlink_to((colmap_dir / "images").resolve())
+    for f in ("images.txt", "cameras.txt", FEATURE_POINTS):
+        shutil.copyfile(out / f, model / "sparse" / "0" / f)
+    pts = src / "points3D.txt" if (src / "points3D.txt").exists() else out / FEATURE_POINTS
+    shutil.copyfile(pts, model / "sparse" / "0" / "points3D.txt")
     log(f"refined poses for {job['name']}: {stats}")
-    return out, stats
+    return model, stats
+
+
+def refine_locally(cfg, colmap_dir, work, out, beat, job):
+    colmap = shutil.which(cfg.get("colmap") or "colmap") or cfg.get("colmap")
+    if not colmap or not os.access(colmap, os.X_OK):
+        raise RuntimeError("colmap not found (brew install colmap)")
+    cmd = [sys.executable, "-I", "-u", str(GS_DIR / "refine.py"), "--colmap", colmap,
+           "--images", str(colmap_dir / "images"), "--model", str(colmap_dir / "sparse" / "0"),
+           "--work", str(work / "colmap"), "--out", str(out)]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    last = ""
+    for line in proc.stdout:   # PHASE lines drive the dashboard; the last line is the result
+        line = line.strip()
+        if line.startswith("PHASE: "):
+            job["phase"] = f"refining poses: {line[7:]}"
+            beat(force=True)
+        elif line:
+            last = line
+    proc.wait()
+    if proc.returncode:
+        raise RuntimeError(last.removeprefix("error: ")[:200] or f"refine.py exited with {proc.returncode}")
+    return json.loads((out / "stats.json").read_text())
 
 
 RESTART = object()  # train() result: settings changed while paused, run again
@@ -1838,13 +1766,59 @@ class RemoteWorker:
         if r.returncode:
             raise RuntimeError(f"upload to {self.label} failed: {r.stderr.strip()[:200]}")
 
-    def upload_capture(self, d, colmap_dir, sensor, beat):
-        """A fresh <d>/data with the trainable photos + poses (and the LiDAR depth maps)."""
-        self.ps(f"Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '{d}'; "
-                f"New-Item -ItemType Directory -Force '{d}/data','{d}/out' | Out-Null")
-        self.upload_dir(colmap_dir, ["images", "sparse"], f"{d}/data", beat)
+    def upload_capture(self, d, colmap_dir, sensor, beat, have_images=False):
+        """A fresh <d>/data with the trainable photos + poses (and the LiDAR depth maps).
+        have_images: the photos are already there (uploaded for pose refinement); keep them."""
+        if have_images:
+            self.ps(f"Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '{d}/data/sparse','{d}/out',"
+                    f"'{d}/data/sensor_data'; New-Item -ItemType Directory -Force '{d}/out' | Out-Null")
+            self.upload_dir(colmap_dir, ["sparse"], f"{d}/data", beat)
+        else:
+            self.ps(f"Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '{d}'; "
+                    f"New-Item -ItemType Directory -Force '{d}/data','{d}/out' | Out-Null")
+            self.upload_dir(colmap_dir, ["images", "sparse"], f"{d}/data", beat)
         if sensor:
             self.upload_dir(sensor.parent, [sensor.name], f"{d}/data", beat)
+
+    def can_refine(self):
+        """Pose refinement here needs COLMAP and the gs scripts (run with the gsplat Python)."""
+        return bool(self.spec.get("colmap") and self.gsplat and self.online)
+
+    def refine(self, cfg, job, colmap_dir, out, beat):
+        """Run gs/refine.py here on the capture's photos and original poses; download the
+        refined poses into out. The photos stay in <job dir>/data/images for training."""
+        name, d = job["name"], self.job_dir(job["name"])
+        job["phase"] = f"uploading to {self.label} for pose refinement"
+        beat(force=True)
+        self.ps(f"Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '{d}'; "
+                f"New-Item -ItemType Directory -Force '{d}/data','{d}/orig' | Out-Null")
+        self.upload_dir(colmap_dir, ["images"], f"{d}/data", beat)
+        self.upload_dir(colmap_dir, ["sparse"], f"{d}/orig", beat)
+        job["images_on"] = self.name
+        self.sync_gsplat()
+        cwd = self.gsplat["scripts"]
+        args = [f"{cwd}/refine.py", "--colmap", self.spec["colmap"].replace("\\", "/"),
+                "--images", f"{d}/data/images", "--model", f"{d}/orig/sparse/0",
+                "--work", f"{d}/refine", "--out", f"{d}/refined"]
+        if self.spec.get("colmap_gpu", True):
+            args.append("--gpu")
+        log(f"run on {self.label}: refine {' '.join(map(str, args))}")
+        job["phase"] = f"refining poses on {self.label}"
+        beat(force=True)
+
+        def poll():
+            out_ = self.ps(f"Get-Content '{d}/refine.log' -Tail 5 -ErrorAction SilentlyContinue", check=False)
+            phases = [l[7:].strip() for l in out_.splitlines() if l.startswith("PHASE: ")]
+            if phases:
+                job["phase"] = f"refining poses on {self.label}: {phases[-1]}"
+        code = self.run(self.gsplat["python"], args, cwd, d, "refine", beat, poll)
+        if code:
+            last = self.ps(f"Get-Content '{d}/refine.log' -Tail 3 -ErrorAction SilentlyContinue", check=False)
+            raise RuntimeError(f"exit {code}: {last.strip().splitlines()[-1][:160] if last.strip() else ''}")
+        out.mkdir(parents=True, exist_ok=True)
+        for f in ("images.txt", "cameras.txt", FEATURE_POINTS, "stats.json"):
+            self.download(f"{d}/refined/{f}", out / f)
+        return dict(json.loads((out / "stats.json").read_text()), machine=self.label)
 
     def sync_gsplat(self):
         """Copy this repo's gs/*.py to the worker, so it always runs the matching code."""
@@ -1898,7 +1872,8 @@ class RemoteWorker:
         gs = st.get("trainer") == "gsplat" and bool(self.gsplat)
         job.update(phase=f"uploading to {self.label}", step=None, eta=None, paused=False)
         beat(force=True)
-        self.upload_capture(d, colmap_dir, sensor if gs else None, beat)
+        self.upload_capture(d, colmap_dir, sensor if gs else None, beat,
+                            have_images=job.get("images_on") == self.name)
         if gs:
             self.sync_gsplat()
             g = sub_config(cfg, "gsplat")
@@ -2157,14 +2132,17 @@ def process(cfg, paths, state, status, item, beat, worker=None):
             source = colmap
             if job["settings"].get("refine_poses"):
                 if refined is None:
-                    if worker.remote:   # COLMAP runs on the Mac; don't squeeze a Mac training job
+                    remote_refine = worker.remote and worker.can_refine()
+                    if worker.remote and not remote_refine:   # COLMAP on the Mac: don't squeeze a Mac training job
                         wait_for_mac_memory(cfg, status, job, beat)
                     try:
-                        refined = refined_model(cfg, colmap, job_dir / "refine", beat, job)
+                        refined = refined_model(cfg, colmap, job_dir / "refine", beat, job,
+                                                worker if remote_refine else None)
                     except Exception as e:
                         log(f"pose refinement failed for {name}: {e}")
                         warnings.append(f"pose refinement skipped: {str(e)[:120]}")
                         refined = (None, None)
+                    warnings += job.pop("warnings", [])   # e.g. refined on the Mac after all
                 if refined[0]:
                     source = refined[0]
                 job["refine"] = refined[1]
