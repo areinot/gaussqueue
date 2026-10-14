@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GaussQueue Monitor</title>
+<style>
+:root {
+  --bg: #f6f6f4; --panel: #ffffff; --text: #1c1c1a; --muted: #6b6b66; --line: #e3e3de;
+  --accent: #3a6df0; --ok: #1f8a4c; --warn: #b7791f; --bad: #c53030; --track: #ececea;
+  --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 16px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #121212; --panel: #1c1c1e; --text: #ececea; --muted: #9a9a94; --line: #2c2c2e;
+    --accent: #7aa2ff; --ok: #4cc47f; --warn: #e0a84a; --bad: #ff6b6b; --track: #2c2c2e;
+    --shadow: none;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }
+main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 48px; }
+header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+h1 { font-size: 22px; margin: 0; letter-spacing: -.01em; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+  margin: 28px 0 10px; font-weight: 600; }
+.stamp { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; opacity: .8; }
+.live { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+.dot.stale { background: var(--bad); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
+.now { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 0; overflow: hidden; }
+.now .hero { background: #000; min-height: 220px; display: flex; align-items: center; justify-content: center; }
+.now .hero img { width: 100%; height: 100%; max-height: min(60vh, 520px); object-fit: contain; display: block; cursor: zoom-in; }
+.now .info { padding: 18px 20px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.name { font-weight: 600; font-size: 17px; overflow-wrap: anywhere; }
+.phase { color: var(--muted); }
+.bar { height: 8px; background: var(--track); border-radius: 99px; overflow: hidden; }
+.bar > div { height: 100%; background: var(--accent); border-radius: 99px; transition: width .6s; }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.stat .k { font-size: 12px; color: var(--muted); }
+.stat .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+.strip { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; }
+.strip figure { margin: 0; flex: 0 0 auto; text-align: center; font-size: 11px; color: var(--muted); }
+.strip img { height: 54px; border-radius: 6px; display: block; cursor: zoom-in; border: 2px solid transparent; }
+.strip img.sel { border-color: var(--accent); }
+.idle { padding: 28px 20px; color: var(--muted); text-align: center; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; align-items: start; }
+.card { overflow: hidden; display: flex; flex-direction: column; }
+.thumb { aspect-ratio: 4 / 3; background: var(--track); display: flex; align-items: center;
+  justify-content: center; color: var(--muted); font-size: 12px; text-align: center; padding: 0; }
+.thumb { position: relative; overflow: hidden; }
+.thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; cursor: zoom-in; }
+.thumb .note { padding: 12px; }
+.card .body { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.card .name { font-size: 14px; }
+.meta { font-size: 12px; color: var(--muted); }
+.badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 99px;
+  border: 1px solid currentColor; text-transform: uppercase; letter-spacing: .04em; }
+.b-queued { color: var(--accent); } .b-arriving { color: var(--warn); }
+.b-done { color: var(--ok); } .b-FAILED { color: var(--bad); }
+.history .row { display: grid; grid-template-columns: 96px minmax(0, 1fr) auto; gap: 14px; align-items: center;
+  padding: 10px 12px; border-top: 1px solid var(--line); }
+.history .row:first-child { border-top: 0; }
+.history .row .thumb { aspect-ratio: 4 / 3; border-radius: 6px; overflow: hidden; }
+.history .detail { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.empty { color: var(--muted); padding: 16px; text-align: center; }
+.err { color: var(--bad); }
+.quality { font-size: 12px; color: var(--muted); }
+.quality b { color: var(--text); font-weight: 600; }
+.b-held { color: var(--muted); }
+.b-next { color: var(--ok); }
+.card.held .thumb img { filter: grayscale(.8); opacity: .6; }
+.toggle { align-self: flex-start; background: none; border: 0; padding: 2px 0; color: var(--accent);
+  font: inherit; font-size: 12px; cursor: pointer; }
+.settings { border-top: 1px solid var(--line); padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 9px; }
+.seg { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { flex: 1; background: none; border: 0; border-left: 1px solid var(--line); padding: 5px 0;
+  font: inherit; font-size: 12px; color: var(--text); cursor: pointer; }
+.seg button:first-child { border-left: 0; }
+.seg button.on { background: var(--accent); color: #fff; }
+.fields { display: grid; grid-template-columns: 1fr 1fr; gap: 7px 8px; }
+.fields label { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--muted); }
+.fields input, .fields select { font: inherit; font-size: 13px; padding: 4px 6px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--text); width: 100%; min-width: 0; }
+.fields .changed { border-color: var(--accent); }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.actions button { font: inherit; font-size: 12px; padding: 4px 9px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+.actions button:hover, .seg button:hover:not(.on) { background: var(--track); }
+.serr { font-size: 12px; color: var(--bad); min-height: 0; }
+#lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.88); display: none; align-items: center;
+  justify-content: center; z-index: 10; cursor: zoom-out; padding: 16px; }
+#lightbox img { max-width: 100%; max-height: 100%; border-radius: 6px; }
+#lightbox.open { display: flex; }
+@media (max-width: 720px) {
+  .now { grid-template-columns: 1fr; }
+  .history .row { grid-template-columns: 72px minmax(0, 1fr); }
+  .history .row .when { grid-column: 2; }
+}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>GaussQueue</h1>
+    <span class="stamp" id="stamp" title="Time of the last successful refresh"></span>
+    <div class="live"><span class="dot" id="dot"></span><span id="live">connecting…</span></div>
+  </header>
+
+  <h2>Training now</h2>
+  <div id="now" class="panel"><div class="idle">Loading…</div></div>
+
+  <h2 id="queue-h">Inbox</h2>
+  <div id="queue"></div>
+
+  <h2>Recent</h2>
+  <div id="history" class="panel history"></div>
+</main>
+<div id="lightbox"><img alt=""></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const img = (name, alt) => name ? `<img src="/img/${encodeURIComponent(name)}" alt="${esc(alt)}" data-zoom loading="lazy">` : "";
+const dur = (s) => { s = Math.max(0, Math.round(s)); const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
+  return h ? `${h}h ${String(m).padStart(2,"0")}m` : m ? `${m}m` : `${s}s`; };
+const clock = (t) => new Date(t*1000).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+const size = (b) => b > 1e9 ? (b/1e9).toFixed(1)+" GB" : (b/1e6).toFixed(0)+" MB";
+const kindText = (k, f) => [k && k !== "unknown" ? k : null, f ? `${f} frames` : null].filter(Boolean).join(" · ");
+
+const PRESET_LABEL = {fast: "Fast", standard: "Standard", high: "High", custom: "Custom"};
+const kfmt = (n) => n >= 1e6 ? `${+(n/1e6).toFixed(1)}M` : n >= 1000 ? `${+(n/1000).toFixed(1)}k` : String(n);
+const qualityText = (st) => st ? `<b>${PRESET_LABEL[st.preset] || esc(st.preset)}</b> · ${kfmt(st.total_steps)} steps · ${st.max_resolution}px · SH${st.sh_degree} · ≤${kfmt(st.max_splats)} splats${st.subsample_frames > 1 ? ` · every ${st.subsample_frames} frames` : ""}` : "";
+const FIELD_OPTS = {
+  max_resolution: [720, 960, 1080, 1280, 1440, 1920, 2560, 3840],
+  sh_degree: [[0, "0 · flat colour"], [1, "1"], [2, "2"], [3, "3 · full sheen"]],
+  max_splats: [500000, 1000000, 1500000, 3000000, 5000000, 10000000, 20000000],
+  subsample_frames: [[1, "all"], [2, "every 2nd"], [3, "every 3rd"], [4, "every 4th"]],
+};
+const openSettings = new Set();   // queue items whose settings panel is expanded
+const itemErrors = {};            // name -> last error message from the server
+
+let selected = null;   // checkpoint preview chosen in the strip (null = latest)
+let lastJob = null;
+let last = null;       // latest /api/status payload, for the 1s clock ticker
+
+// Only touch the DOM when a section's markup actually changed. Rebuilding
+// identical HTML re-creates every <img>, which is what made the page flicker.
+function setHTML(el, html) {
+  if (el._html === html) return;
+  el._html = html;
+  el.innerHTML = html;
+}
+
+// Load an image before it goes on screen, so swapping a preview never blanks.
+const loaded = new Set();
+function preload(name) {
+  if (!name || loaded.has(name)) return Promise.resolve();
+  return new Promise((res) => {
+    const i = new Image();
+    i.onload = i.onerror = () => { loaded.add(name); res(); };
+    i.src = `/img/${encodeURIComponent(name)}`;
+  });
+}
+
+const heroName = (c) => {
+  const previews = c.previews || [];
+  return selected && previews.includes(selected) ? selected : (c.preview || c.thumb);
+};
+
+function renderNow(c) {
+  const el = $("now");
+  if (!c) { lastJob = null; selected = null; el.className = "panel";
+    setHTML(el, `<div class="idle">Idle. Drop a capture (zip or folder with a COLMAP model) into <b>${esc(last && last.inbox_dir || "the inbox")}</b>.</div>`); return; }
+  if (c.name !== lastJob) { selected = null; lastJob = c.name; }
+  const previews = c.previews || [];
+  const hero = heroName(c);
+  const pct = c.step != null && c.total ? Math.min(100, 100*c.step/c.total) : 0;
+  const stepLabel = (n) => { const m = n.match(/_step(\d+)\.jpg$/); return m ? `${(+m[1]/1000).toFixed(1)}k` : ""; };
+  el.className = "panel now";
+  // Time-dependent values (elapsed, ETA) are left as empty slots and filled by tick().
+  setHTML(el, `
+    <div class="hero">${hero ? img(hero, c.name) : `<span class="meta">no preview yet</span>`}</div>
+    <div class="info">
+      <div class="name">${esc(c.name)}</div>
+      <div class="phase">${esc(c.phase)}${kindText(c.kind, c.frames) ? " · " + esc(kindText(c.kind, c.frames)) : ""}</div>
+      ${c.settings ? `<div class="quality">${qualityText(c.settings)}</div>` : ""}
+      <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
+      <div class="stats">
+        <div class="stat"><div class="k">Step</div><div class="v">${c.step != null ? `${c.step.toLocaleString()} / ${(c.total||0).toLocaleString()}` : "—"}</div></div>
+        <div class="stat"><div class="k">Elapsed</div><div class="v" data-t="elapsed">—</div></div>
+        <div class="stat"><div class="k">ETA</div><div class="v" data-t="eta">—</div></div>
+      </div>
+      ${previews.length ? `<div class="strip">${previews.map(p => `
+        <figure><img src="/img/${encodeURIComponent(p)}" data-pick="${esc(p)}" class="${p === hero ? "sel" : ""}" alt="">${stepLabel(p)}</figure>`).join("")}</div>
+        <div class="meta">Click a checkpoint to show it above; renders are from a camera held out of training.</div>` : ""}
+    </div>`);
+}
+
+function selectHTML(key, value, opts) {
+  const list = opts.map(o => Array.isArray(o) ? o : [o, key === "max_splats" ? kfmt(o) : String(o)]);
+  if (!list.some(([v]) => v === value)) list.push([value, key === "max_splats" ? kfmt(value) : String(value)]);
+  list.sort((a, b) => a[0] - b[0]);
+  return `<select data-set="${key}">${list.map(([v, l]) => `<option value="${v}"${v === value ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
+}
+
+function settingsHTML(it) {
+  const st = it.settings, base = (last.presets || {})[st.base] || {};
+  const cls = (k) => st.preset === "custom" && base[k] !== undefined && base[k] !== st[k] ? "changed" : "";
+  const field = (k, label, inner) => `<label>${label}${inner.replace("<select", `<select class="${cls(k)}"`).replace("<input", `<input class="${cls(k)}"`)}</label>`;
+  return `
+    <div class="settings" data-item="${esc(it.name)}">
+      <div class="seg">${["fast", "standard", "high"].map(p => `
+        <button data-act="preset" data-value="${p}" class="${st.preset === p ? "on" : ""}"
+          title="${esc(Object.entries(last.presets[p] || {}).map(([k, v]) => `${k}: ${v}`).join(", "))}">${PRESET_LABEL[p]}</button>`).join("")}</div>
+      <div class="fields">
+        ${field("total_steps", "Training steps", `<input data-set="total_steps" type="number" min="${last.limits.total_steps[0]}" max="${last.limits.total_steps[1]}" step="500" value="${st.total_steps}">`)}
+        ${field("max_resolution", "Max resolution (px)", selectHTML("max_resolution", st.max_resolution, FIELD_OPTS.max_resolution))}
+        ${field("sh_degree", "Colour detail (SH)", selectHTML("sh_degree", st.sh_degree, FIELD_OPTS.sh_degree))}
+        ${field("max_splats", "Splat cap", selectHTML("max_splats", st.max_splats, FIELD_OPTS.max_splats))}
+        ${field("subsample_frames", "Frames used", selectHTML("subsample_frames", st.subsample_frames, FIELD_OPTS.subsample_frames))}
+      </div>
+      <div class="actions">
+        <button data-act="run_next">Run next</button>
+        <button data-act="hold" data-value="${it.hold ? "false" : "true"}">${it.hold ? "Resume" : "Hold"}</button>
+        ${st.preset !== "standard" ? `<button data-act="reset">Reset</button>` : ""}
+      </div>
+      ${itemErrors[it.name] ? `<div class="serr">${esc(itemErrors[it.name])}</div>` : ""}
+    </div>`;
+}
+
+function renderQueue(q) {
+  $("queue-h").textContent = `Inbox (${q.length})`;
+  // Don't rebuild while someone is typing in a settings field.
+  const a = document.activeElement;
+  if (a && $("queue").contains(a) && (a.tagName === "INPUT" || a.tagName === "SELECT")) return;
+  if (!q.length) { setHTML($("queue"), `<div class="panel empty">Nothing waiting.</div>`); return; }
+  const editable = !!(last && last.presets);
+  let pos = 0;
+  setHTML($("queue"), `<div class="grid">${q.map((it) => {
+    const queued = it.state === "queued" && !it.hold;
+    if (queued) pos++;
+    const badge = it.hold ? `<span class="badge b-held">on hold</span>`
+      : queued ? `<span class="badge b-queued">#${pos} in queue</span>`
+      : `<span class="badge b-${esc(it.state)}">${esc(it.state)}</span>`;
+    return `
+    <div class="panel card${it.hold ? " held" : ""}">
+      <div class="thumb">${it.thumb ? img(it.thumb, it.name) : `<span class="note">${esc(it.thumb_note || "making thumbnail…")}</span>`}</div>
+      <div class="body">
+        <div class="name">${esc(it.name)}</div>
+        <div>${badge}${it.run_next && !it.hold ? ` <span class="badge b-next">next</span>` : ""}</div>
+        <div class="meta">${esc([kindText(it.kind, it.frames), it.size ? size(it.size) : null, it.is_dir ? "folder" : "zip"].filter(Boolean).join(" · "))}</div>
+        ${it.settings ? `<div class="quality">${qualityText(it.settings)}${it.est_seconds ? ` · ≈${dur(it.est_seconds)}` : ""}</div>` : ""}
+        <div class="meta">seen <span data-since="${it.first_seen}"></span> ago</div>
+        ${editable && it.settings ? `<button class="toggle" data-toggle="${esc(it.name)}">${openSettings.has(it.name) ? "Hide settings" : "Settings"}</button>` : ""}
+      </div>
+      ${editable && it.settings && openSettings.has(it.name) ? settingsHTML(it) : ""}
+    </div>`; }).join("")}</div>`);
+}
+
+async function sendItem(name, body) {
+  try {
+    const r = await fetch("/api/item", {method: "POST", headers: {"Content-Type": "application/json"},
+                                        body: JSON.stringify({name, ...body})});
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) delete itemErrors[name]; else itemErrors[name] = j.error || `error ${r.status}`;
+  } catch (e) { itemErrors[name] = "service not reachable"; }
+  if (document.activeElement && $("queue").contains(document.activeElement)) document.activeElement.blur();
+  await refresh();
+}
+
+function renderHistory(h) {
+  if (!h.length) { setHTML($("history"), `<div class="empty">No finished jobs yet.</div>`); return; }
+  setHTML($("history"), h.map(r => `
+    <div class="row">
+      <div class="thumb">${img(r.preview || r.thumb, r.name)}</div>
+      <div>
+        <div class="name">${esc(r.name)} <span class="badge b-${esc(r.result)}">${esc(r.result)}</span></div>
+        <div class="detail">${esc(r.duration)}${r.detail ? " · " + esc(r.detail) : ""}${r.result === "done" ? ` · outbox/${esc(r.name)}/` : ""}</div>
+      </div>
+      <div class="meta when">${esc(r.finished)}</div>
+    </div>`).join(""));
+}
+
+// Update clocks in place every second without re-rendering anything.
+function tick() {
+  if (!last) return;
+  const now = Date.now()/1000, c = last.current;
+  const age = now - last.updated;
+  $("dot").classList.toggle("stale", age > 60);
+  $("live").textContent = age > 60 ? `stale: last update ${dur(age)} ago` :
+    `live · ${last.settings.total_steps.toLocaleString()} steps @ ${last.settings.max_resolution}px`;
+  const set = (sel, text) => document.querySelectorAll(sel).forEach(e => { if (e.textContent !== text) e.textContent = text; });
+  if (c) {
+    set('[data-t="elapsed"]', c.started ? dur(now - c.started) : "—");
+    set('[data-t="eta"]', c.eta ? `${clock(c.eta)} (${dur(c.eta - now)})` : "—");
+  }
+  document.querySelectorAll("[data-since]").forEach(e => {
+    const t = dur(now - +e.dataset.since);
+    if (e.textContent !== t) e.textContent = t;
+  });
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/status", {cache: "no-store"});
+    const s = await r.json();
+    if (s.current) await preload(heroName(s.current));
+    last = s;
+    $("stamp").textContent = new Date().toLocaleTimeString([], {hour: "numeric", minute: "2-digit", second: "2-digit"});
+    renderNow(s.current); renderQueue(s.queue || []); renderHistory(s.history || []);
+    tick();
+  } catch (e) {
+    $("dot").classList.add("stale");
+    $("live").innerHTML = `<span class="err">service not reachable</span>`;
+  }
+}
+
+document.addEventListener("change", (e) => {
+  const f = e.target.closest("[data-set]");
+  if (!f) return;
+  const name = f.closest("[data-item]").dataset.item;
+  sendItem(name, {action: "set", key: f.dataset.set, value: +f.value});
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && e.target.matches("input[data-set]")) e.target.blur();  // commits via change
+});
+
+document.addEventListener("click", (e) => {
+  const tog = e.target.closest("[data-toggle]");
+  if (tog) { const n = tog.dataset.toggle; openSettings.has(n) ? openSettings.delete(n) : openSettings.add(n);
+    if (last) renderQueue(last.queue || []); return; }
+  const act = e.target.closest("[data-act]");
+  if (act) {
+    const name = act.closest("[data-item]").dataset.item;
+    const body = {action: act.dataset.act};
+    if (act.dataset.value !== undefined) body.value = act.dataset.act === "hold" ? act.dataset.value === "true" : act.dataset.value;
+    sendItem(name, body); return;
+  }
+  const pick = e.target.closest("[data-pick]");
+  if (pick) { selected = pick.dataset.pick; preload(selected).then(() => last && renderNow(last.current)); return; }
+  const z = e.target.closest("[data-zoom]");
+  if (z) { $("lightbox").querySelector("img").src = z.src; $("lightbox").classList.add("open"); return; }
+  if (e.target.closest("#lightbox")) $("lightbox").classList.remove("open");
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("lightbox").classList.remove("open"); });
+
+refresh();
+setInterval(refresh, 3000);
+setInterval(tick, 1000);
+</script>
+</body>
+</html>

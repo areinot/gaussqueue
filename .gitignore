@@ -1,0 +1,23 @@
+# Runtime state normally lives in $GAUSSQUEUE_HOME (~/Library/Application Support/GaussQueue),
+# but never commit it if a local run puts it here.
+config.json
+state.json
+overrides.json
+*.log
+work/
+jobs/
+tmp/
+status/
+outbox/
+bin/
+
+# Training outputs and Brush's GPU autotune cache (written to the working directory)
+*.ply
+eval_*/
+target/
+
+# Python, editors, macOS
+__pycache__/
+*.pyc
+*.bak
+.DS_Store

@@ -1,0 +1,21 @@
+{
+  "inbox_dir": "~/Library/Mobile Documents/com~apple~CloudDocs/GaussQueue/inbox",
+  "outbox_dir": "~/Library/Mobile Documents/com~apple~CloudDocs/GaussQueue/outbox",
+  "status_dir": "~/Library/Mobile Documents/com~apple~CloudDocs/GaussQueue/status",
+  "imessage_to": "",
+  "notify_checkpoints": [
+    0.25,
+    0.5,
+    0.75
+  ],
+  "dashboard_port": 8765,
+  "standard": {
+    "total_steps": 15000,
+    "max_resolution": 1440,
+    "sh_degree": 3,
+    "max_splats": 10000000,
+    "subsample_frames": 1
+  },
+  "settle_seconds": 30,
+  "keep_work_days": 7
+}
