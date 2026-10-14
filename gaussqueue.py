@@ -55,6 +55,9 @@ DEFAULTS = {
     # SPZ 4 (SplatTransform's default) isn't gzip-wrapped and many apps load it as empty;
     # 3 is the widely supported classic format.
     "spz_version": 3,
+    # Native PLY->SPZ/flip tool built from tools/spz-native (Niantic's spz library). Used for
+    # .spz and for the flip when present: no WebAssembly 4 GB ceiling, much less memory.
+    "spz_native": str(APP_HOME / "bin/gq_spz"),
     # Rotate results 180° about X so "up" is up in SuperSplat & co. (SplatKing/COLMAP
     # captures are +Y-up, most splat viewers expect -Y-up). Per-capture override on the dashboard.
     "flip_up": False,
@@ -242,7 +245,7 @@ def load_config():
             return _last_good_config
         raise ConfigError("config.json must set inbox_dir")
     for k in ("inbox_dir", "outbox_dir", "work_dir", "status_dir", "attach_dir", "brush",
-              "splat_transform", "share_dir"):
+              "splat_transform", "share_dir", "spz_native"):
         if cfg.get(k):
             cfg[k] = str(Path(cfg[k]).expanduser())
     _last_good_config = cfg
@@ -1414,6 +1417,29 @@ def splat_transform(cfg, args, dst, beat=lambda: None, timeout=1800):
     return None
 
 
+def native_spz(cfg):
+    tool = cfg.get("spz_native")
+    return tool if tool and os.access(tool, os.X_OK) else None
+
+
+def run_native(cfg, args, dst, beat=lambda: None, timeout=3600):
+    """Run gq_spz; returns None on success or a short error string."""
+    proc = subprocess.Popen([native_spz(cfg)] + [str(a) for a in args],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    deadline = time.time() + timeout
+    while proc.poll() is None and time.time() < deadline:
+        beat()
+        time.sleep(1)
+    if proc.poll() is None:
+        proc.kill()
+        return "timed out"
+    out = proc.stdout.read().strip()
+    if proc.returncode or not Path(dst).exists():
+        log(f"gq_spz {' '.join(map(str, args))} failed: {out[-500:]}")
+        return (out.splitlines() or ["failed"])[-1][:120]
+    return None
+
+
 def compress(cfg, ply, out_dir, name, beat, formats=None):
     """Write <name>.<fmt> for each configured format with SplatTransform.
     Returns ({fmt: bytes}, [error strings]); failures never fail the job."""
@@ -1423,9 +1449,13 @@ def compress(cfg, ply, out_dir, name, beat, formats=None):
     sizes, errors = {}, []
     for fmt in formats:
         dst = out_dir / f"{name}.{fmt}"
-        # -N drops NaN/degenerate splats, which some viewers choke on
-        extra = ["--spz-version", int(cfg.get("spz_version", 3))] if fmt == "spz" else []
-        err = splat_transform(cfg, [ply, "-N"] + extra + [dst], dst, beat)
+        version = int(cfg.get("spz_version", 3))
+        if fmt == "spz" and native_spz(cfg):   # native: no WebAssembly memory ceiling
+            err = run_native(cfg, [ply, dst, "--spz-version", version], dst, beat)
+        else:
+            # -N drops NaN/degenerate splats, which some viewers choke on
+            extra = ["--spz-version", version] if fmt == "spz" else []
+            err = splat_transform(cfg, [ply, "-N"] + extra + [dst], dst, beat)
         if err:
             errors.append(f"{fmt}: {err}")
         else:
@@ -1434,7 +1464,11 @@ def compress(cfg, ply, out_dir, name, beat, formats=None):
 
 
 def flip_ply(cfg, src, dst, beat=lambda: None):
-    """Rotate a splat 180° about X (turns a +Y-up scene -Y-up and vice versa)."""
+    """Rotate a splat 180° about X (turns a +Y-up scene -Y-up and vice versa), including the
+    spherical harmonics. Natively with gq_spz when installed (fast, low memory), otherwise
+    with SplatTransform."""
+    if native_spz(cfg):
+        return run_native(cfg, [src, dst, "--flip"], dst, beat)
     return splat_transform(cfg, [src, "-r", FLIP, "-N", dst], dst, beat)
 
 
@@ -2263,6 +2297,11 @@ def check():
         else:
             print(f"! splat-transform not found ({cfg['splat_transform']}); "
                   "results will be .ply only. install.sh installs it when Node.js is available.")
+    if native_spz(cfg):
+        print(f"✓ gq_spz (native .spz/flip): {cfg['spz_native']}")
+    else:
+        print("  gq_spz not built: .spz and flips use SplatTransform (WebAssembly; 4 GB limit "
+              "can fail on ~10M-splat captures). install.sh builds it when cmake + a C++ compiler exist.")
     colmap = shutil.which(cfg.get("colmap") or "colmap")
     if colmap:
         print(f"✓ colmap: {colmap}" + (" (refine_poses on by default)" if cfg.get("refine_poses") else ""))

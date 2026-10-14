@@ -10,6 +10,7 @@ tmp/
 status/
 outbox/
 bin/
+build/
 
 # Training outputs and Brush's GPU autotune cache (written to the working directory)
 *.ply

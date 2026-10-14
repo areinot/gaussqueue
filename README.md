@@ -87,6 +87,11 @@ structure-from-motion step. Any capture that contains a COLMAP model
 - Python 3.9+. The system `python3` from the Xcode Command Line Tools is fine. There are
   no third-party packages.
 - Optional: [COLMAP](https://colmap.github.io) 4.x for pose refinement (`brew install colmap`).
+- Optional: CMake + a C++17 compiler (`xcode-select --install`, `brew install cmake`) to
+  build **gq_spz** (`tools/spz-native`), a small native tool built on
+  [Niantic's spz library](https://github.com/nianticlabs/spz). When it's installed,
+  GaussQueue uses it for `.spz` output and for flips. SplatTransform's SPZ encoder is
+  WebAssembly with a 4 GB memory ceiling, and it aborts on large (~10M-splat) captures.
 - Optional: [Node.js](https://nodejs.org) for the `.sog`/`.spz` compression step
   (`brew install node`). Without it, results are `.ply` only.
 - For iMessage notifications: the Messages app signed in to iMessage on the Mac.

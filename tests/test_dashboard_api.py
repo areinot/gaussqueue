@@ -318,6 +318,26 @@ class DashboardAPITest(unittest.TestCase):
             self.status.workers = {}
             self.status.write(self.cfg)
 
+    def test_native_spz_is_used_when_installed(self):
+        gq, root = self.gq, Path(self.tmp.name)
+        fake = root / "fake_gq_spz"
+        log = root / "fake_calls.txt"
+        fake.write_text("#!/bin/sh\n"
+                        f"echo \"$@\" >> '{log}'\n"
+                        "printf x > \"$2\"\n")
+        fake.chmod(0o755)
+        ply = root / "in.ply"
+        ply.write_text("ply")
+        cfg = dict(self.cfg, spz_native=str(fake), spz_version=3)
+        sizes, errors = gq.compress(cfg, ply, root / "cmp", "t", lambda: None, ["spz"])
+        self.assertEqual((sizes, errors), ({"spz": 1}, []))
+        self.assertIsNone(gq.flip_ply(cfg, ply, root / "flipped.ply"))
+        calls = log.read_text().splitlines()
+        self.assertIn("t.spz --spz-version 3", calls[0])
+        self.assertTrue(calls[1].endswith("flipped.ply --flip"))
+        # Not installed -> falls back (no native call recorded).
+        self.assertIsNone(gq.native_spz(dict(cfg, spz_native=str(root / "missing"))))
+
     def test_snapshot_has_estimates_and_presets(self):
         snap = self.snapshot()
         self.assertEqual(set(snap["presets"]), {"preview", "fast", "standard", "high"})

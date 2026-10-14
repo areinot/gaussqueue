@@ -75,6 +75,18 @@ else
   echo "Node.js not found: skipping SplatTransform; results will be .ply only (brew install node, then rerun)."
 fi
 
+# --- gq_spz (native SPZ encoder + flip) --------------------------------------
+if command -v cmake >/dev/null && { command -v c++ >/dev/null || command -v clang++ >/dev/null; }; then
+  echo "Building gq_spz (native SPZ encoder)…"
+  cmake -S "$REPO/tools/spz-native" -B "$APP_HOME/build/spz-native" -DCMAKE_BUILD_TYPE=Release >/dev/null \
+    && cmake --build "$APP_HOME/build/spz-native" --config Release -j 4 >/dev/null \
+    && install -m 755 "$APP_HOME/build/spz-native/gq_spz" "$APP_HOME/bin/gq_spz" \
+    && echo "Installed $APP_HOME/bin/gq_spz" \
+    || echo "gq_spz build failed; .spz will use SplatTransform (fine for captures under ~5M splats)."
+else
+  echo "cmake/C++ compiler not found: skipping gq_spz (xcode-select --install; brew install cmake)."
+fi
+
 # --- config ------------------------------------------------------------------
 if [[ ! -f "$APP_HOME/config.json" ]]; then
   [[ -n "$inbox" ]] || { echo "First install needs --inbox <dir> (where captures will arrive)." >&2; exit 2; }
