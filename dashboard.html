@@ -89,9 +89,13 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
    sits in the next column under the neighbouring card (placed by placeHelp()). */
 .grid { grid-auto-flow: row dense; }
 .grid > .card.helping { grid-row: span 2; }
-.helpcard { align-self: stretch; padding: 14px 16px 14px 26px; border-left: 2px solid var(--accent) !important; }
-.helpcard.on-left { padding: 14px 26px 14px 16px; border-left: 1px solid var(--line) !important;
-  border-right: 2px solid var(--accent) !important; }  /* edge faces its card */
+/* The help card's grid cell is invisible; the text sits in its own box, moved to line up with
+   the setting, with the brace in the gutter between it and the capture's card. */
+.helpcard { align-self: stretch; padding: 0 0 0 22px; background: none !important; border: 0 !important;
+  box-shadow: none !important; }
+.helpcard.on-left { padding: 0 22px 0 0; }
+.helpcard .hbody { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  box-shadow: var(--shadow); padding: 12px 14px; }
 /* A curly brace in the gutter spans the help text, its point at the described setting's line. */
 .help .hbody { position: relative; }
 .help .brace { position: absolute; top: 0; left: -19px; width: 12px; height: 100%; overflow: visible;
@@ -524,7 +528,7 @@ function alignHelp() {
     // Aim for the title on the setting's line; near the bottom the text is pushed up instead
     // (the brace's point still lands on the setting).
     const room = el.clientHeight - pad * 2 - body.offsetHeight;
-    const y = (label.top + label.height / 2) - el.getBoundingClientRect().top - pad - title.offsetHeight / 2;
+    const y = (label.top + label.height / 2) - el.getBoundingClientRect().top - pad - (title.offsetTop + title.offsetHeight / 2);
     const shift = Math.round(Math.max(0, Math.min(y, room)));
     body.style.transform = `translateY(${shift}px)`;
     // Brace from the top to the bottom of the help text, pointing at the setting's line.
