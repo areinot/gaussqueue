@@ -333,7 +333,11 @@ class InboxItem:
         self.path = path
         self.name = item_name(path)
         self.is_dir = path.is_dir()
-        self.first_seen = time.time()
+        # When it landed in the inbox (survives restarts, so queue order is stable).
+        try:
+            self.first_seen = min(path.stat().st_birthtime, time.time())
+        except (AttributeError, OSError):
+            self.first_seen = time.time()
         self.sig = None
         self.sig_since = time.time()
         self.state = "arriving"
