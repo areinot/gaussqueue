@@ -427,6 +427,22 @@ class DashboardAPITest(unittest.TestCase):
             self.overrides.clear("capA")
             self.status.write(self.cfg)
 
+    def test_dismiss_from_recent(self):
+        hist = self.status.state["history"]
+        hist.append({"name": "gone", "result": "done", "duration": "1m", "finished": "01-03 00:00",
+                     "finished_ts": 123.5, "settings": {"total_steps": 15000, "max_resolution": 1440},
+                     "train_seconds": 60})
+        try:
+            self.status.write(self.cfg)
+            self.assertIn("gone", [h["name"] for h in self.snapshot()["history"]])
+            self.assertEqual(self.post({"name": "gone", "action": "dismiss", "id": "123.5"})[0], 200)
+            self.assertNotIn("gone", [h["name"] for h in self.snapshot()["history"]])
+            self.assertTrue(hist[-1]["dismissed"])                      # hidden, not deleted
+            self.assertEqual(self.post({"name": "x", "action": "dismiss", "id": "nope"})[0], 400)
+        finally:
+            hist.pop()
+            self.status.write(self.cfg)
+
     def test_snapshot_has_estimates_and_presets(self):
         snap = self.snapshot()
         self.assertEqual(set(snap["presets"]), {"preview", "fast", "standard", "high"})

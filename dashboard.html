@@ -142,6 +142,10 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .now .settings { border: 1px solid var(--line); border-radius: 10px; }
 .now.paused .bar > div { background: var(--warn); }
 .history .when { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+.history .when .top { display: flex; align-items: center; gap: 8px; }
+.dismiss { background: none; border: 0; padding: 0 2px; font: inherit; font-size: 17px; line-height: 1;
+  color: var(--muted); cursor: pointer; border-radius: 4px; }
+.dismiss:hover { color: var(--text); background: var(--track); }
 .requeue { font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 6px; cursor: pointer;
   border: 1px solid var(--line); background: var(--panel); color: var(--text); }
 .requeue:hover { background: var(--track); }
@@ -713,7 +717,8 @@ function renderHistory(h) {
         ${captureQuality(r.quality)}
       </div>
       <div class="when">
-        <div class="meta">${esc(r.finished)}</div>
+        <div class="top"><span class="meta">${esc(r.finished)}</span>
+          <button class="dismiss" data-dismiss="${esc(r.id)}" data-name="${esc(r.name)}" title="Remove from Recent (the result stays in the outbox)" aria-label="Remove ${esc(r.name)} from Recent">×</button></div>
         ${r.requeueable && last.presets ? `<button class="requeue" data-requeue="${esc(r.name)}" title="Move the original capture back into the inbox, on hold, to rerun it with different settings">Requeue</button>` : ""}
         ${itemErrors[r.name] && r.requeueable ? `<div class="serr">${esc(itemErrors[r.name])}</div>` : ""}
       </div>
@@ -787,6 +792,8 @@ document.addEventListener("click", (e) => {
   const hb = e.target.closest("[data-help]");
   if (hb) { const n = hb.dataset.help; helpOpen.has(n) ? helpOpen.delete(n) : helpOpen.add(n);
     if (last) { renderQueue(last.queue || []); renderJobs(last.jobs || []); } return; }
+  const dm = e.target.closest("[data-dismiss]");
+  if (dm) { sendItem(dm.dataset.name, {action: "dismiss", id: dm.dataset.dismiss}); return; }
   const rq = e.target.closest("[data-requeue]");
   if (rq) { const n = rq.dataset.requeue; openSettings.add(n); sendItem(n, {action: "requeue"}); return; }
   const tog = e.target.closest("[data-toggle]");

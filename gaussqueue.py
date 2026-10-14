@@ -882,8 +882,10 @@ class Status:
         queue = self.inbox.snapshot(cfg, self.overrides, rate, busy, estimates)
         hist, seen = [], set()
         in_inbox = {i.name for i in list(self.inbox.items.values())}
-        for h in self.state.get("history", [])[-20:][::-1]:
+        shown = [h for h in self.state.get("history", []) if not h.get("dismissed")]
+        for h in shown[-20:][::-1]:
             h = dict(h)
+            h["id"] = history_id(h)
             if "quality" not in h:
                 h["quality"] = self.quality_cache.get(h["name"], "?")
                 if h["quality"] == "?":
@@ -1016,6 +1018,10 @@ def start_dashboard(cfg, paths, status, overrides):
                 name = body.get("name", "")
                 if body.get("action") == "requeue":
                     requeue(status, overrides, name)
+                    status.write(load_config())
+                    return self.send(200, b'{"ok":true}', "application/json")
+                if body.get("action") == "dismiss":
+                    dismiss_history(status.state, str(body.get("id", "")))
                     status.write(load_config())
                     return self.send(200, b'{"ok":true}', "application/json")
                 if not any(i.name == name for i in list(status.inbox.items.values())):
@@ -2281,6 +2287,22 @@ def prune_result(cfg, status, job, worker, colmap_dir, sensor, ply, pct, out_dir
         if pw is None:
             raise RuntimeError("needs an online CUDA worker with gsplat")
     return pw.prune(cfg, job, colmap_dir, sensor, ply, pct, out_dir, beat, trained_here=pw is worker)
+
+
+def history_id(h):
+    """Stable id of a history entry (for dismissing it from the dashboard)."""
+    return str(h.get("finished_ts") or f"{h.get('name')}|{h.get('finished')}")
+
+
+def dismiss_history(state, entry_id):
+    """Hide an entry from Recent. It stays in state.json, so time estimates still use it."""
+    with STATE_LOCK:
+        for h in state.get("history", []):
+            if history_id(h) == entry_id:
+                h["dismissed"] = True
+                save_state(state)
+                return
+    raise ValueError("no such history entry")
 
 
 def record(state, job, result, duration, detail):
