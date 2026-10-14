@@ -102,6 +102,11 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
   border: 1px solid var(--line); background: var(--panel); color: var(--text); }
 .requeue:hover { background: var(--track); }
 @media (max-width: 720px) { .history .when { align-items: flex-start; } }
+.flip { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); cursor: pointer; user-select: none; }
+.flip input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.flipfield { grid-column: span 2; padding-top: 2px; }
+.fields .flip { flex-direction: row; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
+.fields .flip input { width: 15px; height: 15px; padding: 0; border: 0; flex: none; }
 .serr { font-size: 12px; color: var(--bad); min-height: 0; }
 #lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.88); display: none; align-items: center;
   justify-content: center; z-index: 10; cursor: zoom-out; padding: 16px; }
@@ -151,7 +156,6 @@ const FIELD_OPTS = {
   sh_degree: [[0, "0 · flat colour"], [1, "1"], [2, "2"], [3, "3 · full sheen"]],
   max_splats: [500000, 1000000, 1500000, 3000000, 5000000, 10000000, 20000000],
   subsample_frames: [[1, "all"], [2, "every 2nd"], [3, "every 3rd"], [4, "every 4th"]],
-  flip_up: [[0, "as captured"], [1, "flipped (180°)"]],
 };
 const openSettings = new Set();   // queue items whose settings panel is expanded
 const itemErrors = {};            // name -> last error message from the server
@@ -209,7 +213,7 @@ function renderNow(c) {
           ? `<button class="primary" data-act="resume">${changed ? "Restart with new settings" : "Resume"}</button>
              <span class="badge b-paused">paused</span>`
           : `<button data-act="pause">Pause</button>
-             <button data-act="flip" data-value="${pend && pend.flip_up ? 0 : 1}" title="Applied to the output files when training finishes; no restart">${pend && pend.flip_up ? "Output: flipped ✓" : "Flip output upside down"}</button>`}
+             ${flipBox(pend && pend.flip_up)}`}
       </div>
       ${!c.paused && itemErrors[c.name] ? `<div class="serr">${esc(itemErrors[c.name])}</div>` : ""}
       ${c.paused ? `${settingsHTML({name: c.name, settings: pend}, true)}
@@ -234,6 +238,12 @@ function renderNow(c) {
     </div>`);
 }
 
+// "Flip vertical": output-only (rotates the result 180° about X), so it can change any time.
+function flipBox(on) {
+  return `<label class="flip" title="Rotate the result 180° so it's the right way up in most viewers. Applied to the output files after training; never restarts training.">
+    <input type="checkbox" data-set="flip_up"${on ? " checked" : ""}> Flip vertical</label>`;
+}
+
 function selectHTML(key, value, opts) {
   const list = opts.map(o => Array.isArray(o) ? o : [o, key === "max_splats" ? kfmt(o) : String(o)]);
   if (!list.some(([v]) => v === value)) list.push([value, key === "max_splats" ? kfmt(value) : String(value)]);
@@ -256,7 +266,7 @@ function settingsHTML(it, isCurrent) {
         ${field("sh_degree", "Colour detail (SH)", selectHTML("sh_degree", st.sh_degree, FIELD_OPTS.sh_degree))}
         ${field("max_splats", "Splat cap", selectHTML("max_splats", st.max_splats, FIELD_OPTS.max_splats))}
         ${field("subsample_frames", "Frames used", selectHTML("subsample_frames", st.subsample_frames, FIELD_OPTS.subsample_frames))}
-        ${field("flip_up", "Up direction", selectHTML("flip_up", st.flip_up ? 1 : 0, FIELD_OPTS.flip_up))}
+        <div class="flipfield">${flipBox(st.flip_up)}</div>
       </div>
       <div class="actions">
         ${isCurrent ? "" : `<button data-act="run_next">Run next</button>
@@ -363,7 +373,8 @@ document.addEventListener("change", (e) => {
   const f = e.target.closest("[data-set]");
   if (!f) return;
   const name = f.closest("[data-item]").dataset.item;
-  sendItem(name, {action: "set", key: f.dataset.set, value: +f.value});
+  const value = f.type === "checkbox" ? (f.checked ? 1 : 0) : +f.value;
+  sendItem(name, {action: "set", key: f.dataset.set, value});
 });
 document.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && e.target.matches("input[data-set]")) e.target.blur();  // commits via change
@@ -378,9 +389,8 @@ document.addEventListener("click", (e) => {
   const act = e.target.closest("[data-act]");
   if (act) {
     const name = act.closest("[data-item]").dataset.item;
-    let body = {action: act.dataset.act};
+    const body = {action: act.dataset.act};
     if (act.dataset.value !== undefined) body.value = act.dataset.act === "hold" ? act.dataset.value === "true" : act.dataset.value;
-    if (act.dataset.act === "flip") body = {action: "set", key: "flip_up", value: +act.dataset.value};
     sendItem(name, body); return;
   }
   const pick = e.target.closest("[data-pick]");
