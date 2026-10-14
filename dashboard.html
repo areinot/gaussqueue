@@ -643,7 +643,7 @@ function placeHelp(force) {
     const cols = getComputedStyle(grid).gridTemplateColumns.split(" ").filter(Boolean).length;
     if (!force && help.dataset.cols === String(cols)) return;   // already placed for this layout
     help.dataset.cols = String(cols);
-    help.style.gridColumn = "";
+    help.style.gridColumn = help.style.gridRow = help.style.minHeight = "";
     card.classList.toggle("helping", cols > 1);
     if (cols < 2) { card.after(help); return; }
     grid.appendChild(help);   // out of the way while measuring
@@ -655,16 +655,27 @@ function placeHelp(force) {
     for (let n = card.nextElementSibling; n; n = n.nextElementSibling)
       if (n.classList.contains("card") && Math.abs(n.getBoundingClientRect().top - r.top) < 2) end = n;
     end.after(help);
-    help.style.gridColumn = String((col + 1 < cols ? col + 1 : col - 1) + 1);
+    const hcol = col + 1 < cols ? col + 1 : col - 1;
+    help.style.gridColumn = String(hcol + 1);
     help.classList.toggle("on-left", col + 1 >= cols);
-    // Let the second row absorb the open card's extra height, so the first row stays as tall
-    // as its other cards (a spanning item otherwise stretches both rows evenly).
-    let rowH = 0;
-    for (const n of grid.children)
-      if (n !== card && n.classList.contains("card") && Math.abs(n.getBoundingClientRect().top - r.top) < 2)
-        rowH = Math.max(rowH, n.getBoundingClientRect().height);
+    // Cards in the open card's first row (other than it), and whether one sits where the help goes.
+    let rowH = 0, occupied = false;
+    for (const n of grid.children) {
+      if (n === card || !n.classList.contains("card")) continue;
+      const nr = n.getBoundingClientRect();
+      if (Math.abs(nr.top - r.top) >= 2) continue;
+      rowH = Math.max(rowH, nr.height);
+      if (Math.round((nr.left - g.left) / step) === hcol) occupied = true;
+    }
+    if (!occupied) {
+      // Nothing beside the card: the help spans the same two rows, i.e. the card's full height.
+      help.style.gridRow = "span 2";
+      return;
+    }
+    // Under the neighbour: let the second row absorb the open card's extra height, so the first
+    // row stays as tall as its other cards (a spanning item otherwise stretches both rows evenly).
     const gap = parseFloat(getComputedStyle(grid).rowGap) || 0;
-    help.style.minHeight = rowH ? `${Math.max(0, card.getBoundingClientRect().height - rowH - gap)}px` : "";
+    help.style.minHeight = `${Math.max(0, card.getBoundingClientRect().height - rowH - gap)}px`;
   });
 }
 
