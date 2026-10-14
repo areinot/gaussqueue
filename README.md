@@ -1,3 +1,6 @@
+# Note for Humans
+This is some AI vibe-coded foolishness so uh, clone at your own risk.
+
 # GaussQueue
 
 A folder-watching training queue for Gaussian splats on a Mac.
