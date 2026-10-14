@@ -92,11 +92,11 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .helpcard { align-self: stretch; padding: 14px 16px 14px 26px; border-left: 2px solid var(--accent) !important; }
 .helpcard.on-left { padding: 14px 26px 14px 16px; border-left: 1px solid var(--line) !important;
   border-right: 2px solid var(--accent) !important; }  /* edge faces its card */
-/* A pointer in the gutter, from the card to the title of the setting being described. */
-.help .hname { position: relative; }
-.help.beside .hname::before { content: "\25B6"; position: absolute; left: -17px; top: 50%; transform: translateY(-50%);
-  font-size: 9px; color: var(--accent); }
-.helpcard.on-left.beside .hname::before { content: "\25C0"; left: auto; right: -17px; }
+/* A curly brace in the gutter spans the help text, its point at the described setting's line. */
+.help .hbody { position: relative; }
+.help .brace { position: absolute; top: 0; left: -19px; width: 12px; height: 100%; overflow: visible;
+  fill: none; stroke: var(--accent); stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+.helpcard.on-left .brace { left: auto; right: -19px; transform: scaleX(-1); }
 .help { border-left: 1px solid var(--line); padding-left: 24px; font-size: 12.5px; line-height: 1.5;
   color: var(--muted); display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .help .hname { font-size: 13px; font-weight: 600; color: var(--text); }
@@ -482,6 +482,17 @@ function fillHelp() {
   requestAnimationFrame(alignHelp);
 }
 
+// A "{" 12 units wide and h tall whose point is at height tip (anywhere along it): the arms
+// curl in from the right at both ends, the point juts out to the left.
+function bracePath(h, tip) {
+  const x = 6, r1 = Math.min(5, tip / 2), r2 = Math.min(5, (h - tip) / 2);
+  const a = Math.min(4, tip / 2), b = Math.min(4, (h - tip) / 2);   // curl into the point
+  return `M ${x + 5} 0.7 Q ${x} 0.7 ${x} ${r1 + 0.7}` +
+         ` L ${x} ${Math.max(r1 + 0.7, tip - a)} Q ${x} ${tip} ${x - 5} ${tip}` +
+         ` Q ${x} ${tip} ${x} ${Math.min(h - r2 - 0.7, tip + b)}` +
+         ` L ${x} ${h - r2 - 0.7} Q ${x} ${h - 0.7} ${x + 5} ${h - 0.7}`;
+}
+
 // Box of the first visible line of text inside an element (a setting's label).
 function firstTextRect(el) {
   const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT,
@@ -505,7 +516,7 @@ function alignHelp() {
     const beside = el.getBoundingClientRect().left >= panel.getBoundingClientRect().right - 1
                 || el.getBoundingClientRect().right <= panel.getBoundingClientRect().left + 1;
     el.classList.toggle("beside", beside);
-    if (!beside) { body.style.transform = ""; return; }
+    if (!beside) { body.style.transform = ""; body.querySelector(":scope > .brace")?.remove(); return; }
     // Centre the title on the setting's own label text (its first line of text).
     const label = firstTextRect(target) || target.getBoundingClientRect();
     const title = body.querySelector(".hname");
@@ -516,7 +527,21 @@ function alignHelp() {
       el.style.minHeight = `${el.offsetHeight + Math.ceil(y - room)}px`;
       room = y;
     }
-    body.style.transform = `translateY(${Math.round(Math.max(0, Math.min(y, room)))}px)`;
+    const shift = Math.round(Math.max(0, Math.min(y, room)));
+    body.style.transform = `translateY(${shift}px)`;
+    // Brace from the top to the bottom of the help text, pointing at the setting's line.
+    const h = body.offsetHeight;
+    const tip = Math.max(2, Math.min(h - 2, (label.top + label.height / 2) - el.getBoundingClientRect().top - pad - shift));
+    let svg = body.querySelector(":scope > .brace");
+    if (!svg) {
+      svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("class", "brace");
+      svg.setAttribute("aria-hidden", "true");
+      svg.appendChild(document.createElementNS("http://www.w3.org/2000/svg", "path"));
+      body.prepend(svg);
+    }
+    svg.setAttribute("viewBox", `0 0 12 ${h}`);
+    svg.firstChild.setAttribute("d", bracePath(h, tip));
   });
 }
 window.addEventListener("resize", () => requestAnimationFrame(() => { placeHelp(true); alignHelp(); }));
