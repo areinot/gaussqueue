@@ -91,6 +91,7 @@ which leaves your data in place.
 | `inbox_dir` | *(required)* | Captures to train. Processed items move to `inbox/done/` or `inbox/failed/`. |
 | `work_dir` | `~/Library/Application Support/GaussQueue/work` | Unpacked captures and training output. **Keep this out of iCloud.** Note that `~/Documents` *is* in iCloud if "Desktop & Documents Folders" is enabled. Cleaned up after `keep_work_days`. |
 | `outbox_dir` | next to the inbox | One folder per capture: `<name>.ply`, `<name>.sog`, `<name>.spz`, `preview.jpg`, `meta.json`, `train.log`. Nothing else is written here, so it is safe to share. |
+| `share_dir` | *(off)* | Optional. Also copies each result's small, phone-friendly files (`share_files`, default `.sog`, `preview.jpg`, `meta.json`) here, e.g. to iCloud, while the full results stay local in `outbox_dir`. |
 | `status_dir` | next to the inbox | `STATUS.txt` and preview JPGs. Put it in iCloud to check progress from your phone. |
 
 App state (`config.json`, `state.json`, `overrides.json`, `gaussqueue.log`, the Brush

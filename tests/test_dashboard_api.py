@@ -184,6 +184,19 @@ class DashboardAPITest(unittest.TestCase):
         self.assertIn("already in the inbox", body)
         self.assertEqual(self.post({"name": "old", "action": "requeue"})[0], 400)
 
+    def test_share_copies_only_listed_files(self):
+        root = Path(self.tmp.name)
+        res = root / "results" / "capZ"
+        res.mkdir(parents=True)
+        for f in ("capZ.ply", "capZ.sog", "capZ.spz", "preview.jpg", "meta.json", "train.log"):
+            (res / f).write_text(f)
+        cfg = dict(self.cfg, share_dir=str(root / "share"))
+        copied = self.gq.share_result(cfg, res)
+        self.assertEqual(sorted(copied), ["capZ.sog", "meta.json", "preview.jpg"])
+        self.assertEqual(sorted(p.name for p in (root / "share" / "capZ").iterdir()),
+                         ["capZ.sog", "meta.json", "preview.jpg"])
+        self.assertEqual(self.gq.share_result(dict(cfg, share_dir=None), res), [])
+
     def test_snapshot_has_estimates_and_presets(self):
         snap = self.snapshot()
         self.assertEqual(set(snap["presets"]), {"fast", "standard", "high"})

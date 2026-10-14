@@ -42,6 +42,10 @@ DEFAULTS = {
     "outbox_dir": str(APP_HOME / "outbox"),  # finished splats only (safe to share/sync)
     "work_dir": str(APP_HOME / "work"),      # local scratch; keep it out of iCloud
     "status_dir": str(APP_HOME / "status"),  # STATUS.txt + preview JPGs
+    # Optional: also copy the small, phone-friendly files of each result here
+    # (e.g. an iCloud folder) while the full results stay in outbox_dir.
+    "share_dir": None,
+    "share_files": ["sog", "preview.jpg", "meta.json"],
     "attach_dir": "~/Pictures/GaussQueue",   # staging for iMessage image attachments
     "brush": str(APP_HOME / "bin/brush_app"),
     # Compressed copies written next to the .ply (needs SplatTransform; [] = off)
@@ -207,8 +211,9 @@ def load_config():
             return _last_good_config
         raise ConfigError("config.json must set inbox_dir")
     for k in ("inbox_dir", "outbox_dir", "work_dir", "status_dir", "attach_dir", "brush",
-              "splat_transform"):
-        cfg[k] = str(Path(cfg[k]).expanduser())
+              "splat_transform", "share_dir"):
+        if cfg.get(k):
+            cfg[k] = str(Path(cfg[k]).expanduser())
     _last_good_config = cfg
     return cfg
 
@@ -1009,6 +1014,26 @@ def flip_ply(cfg, src, dst, beat=lambda: None):
     return splat_transform(cfg, [src, "-r", FLIP, "-N", dst], dst, beat)
 
 
+def share_result(cfg, result_dir):
+    """Copy the phone-friendly files of one result into share_dir/<name>/.
+    Entries in share_files are either a format ("sog" -> <name>.sog) or a filename."""
+    if not cfg.get("share_dir"):
+        return []
+    name = result_dir.name
+    dest = Path(cfg["share_dir"]) / name
+    dest.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for entry in cfg.get("share_files") or []:
+        fname = f"{name}.{entry}" if "." not in entry else entry
+        src = result_dir / fname
+        if src.is_file():
+            tmp = dest / f".{fname}.partial"
+            shutil.copyfile(src, tmp)
+            tmp.replace(dest / fname)   # never expose a half-copied file to iCloud
+            copied.append(fname)
+    return copied
+
+
 def write_meta(dest, job, files, flipped):
     meta = {"name": job["name"], "finished": dt.datetime.now().isoformat(timespec="seconds"),
             "settings": {k: v for k, v in (job.get("settings") or {}).items() if k != "base"},
@@ -1099,6 +1124,12 @@ def process(cfg, paths, state, status, item, beat):
         files = f"{size_mb:.0f} MB ply" + "".join(f" · {b / 1e6:.0f} MB {f}" for f, b in sizes.items())
         job["files"] = {"ply": int(size_mb * 1e6), **sizes}
         write_meta(dest, job, job["files"], flip)
+        try:
+            shared = share_result(cfg, dest)
+            if shared:
+                log(f"shared {', '.join(shared)} to {cfg['share_dir']}")
+        except Exception as e:
+            cerrors.append(f"share: {e}")
         record(state, job, "done", dur, files + ("  (" + "; ".join(cerrors) + ")" if cerrors else ""))
         log(f"done: {name} in {dur}")
         img = None
@@ -1159,7 +1190,10 @@ def estimate_seconds(st, frames, rate):
 
 def cleanup_jobs(paths, days):
     cutoff = time.time() - days * 86400
+    protected = {paths.outbox.resolve(), paths.inbox.resolve(), paths.status.resolve()}
     for d in paths.jobs.iterdir():
+        if d.resolve() in protected or any(p in d.resolve().parents for p in protected):
+            continue
         if d.is_dir() and d.stat().st_mtime < cutoff:
             shutil.rmtree(d, ignore_errors=True)
             log(f"cleaned local job dir {d.name}")
@@ -1273,6 +1307,7 @@ def flip_results(folders):
         meta["rotation_xyz_degrees"] = [x, 0, 0]
         meta["files"] = {"ply": ply.stat().st_size, **sizes}
         meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+        share_result(cfg, folder)
         print(f"✓ {name}: now rotated {x}° about X"
               + (f" (problems: {'; '.join(errors)})" if errors else ""))
         status |= bool(errors)
@@ -1288,8 +1323,13 @@ def check():
         print(f"✗ config: {e}")
         return 1
     print(f"✓ config: {CONFIG_PATH}")
-    for k in ("inbox_dir", "outbox_dir", "work_dir", "status_dir"):
-        print(f"  {k:<11} {cfg[k]}")
+    for k in ("inbox_dir", "outbox_dir", "work_dir", "status_dir", "share_dir"):
+        if cfg.get(k):
+            print(f"  {k:<11} {cfg[k]}")
+    if Path(cfg["work_dir"]).resolve() in Path(cfg["outbox_dir"]).resolve().parents or \
+            Path(cfg["outbox_dir"]).resolve() == Path(cfg["work_dir"]).resolve():
+        print("✗ outbox_dir is inside work_dir, whose old folders are cleaned up; move it.")
+        ok = False
     if "Mobile Documents" in cfg["work_dir"]:
         print("! work_dir is inside iCloud Drive; training files will upload. Use a local folder.")
     if os.access(cfg["brush"], os.X_OK):
