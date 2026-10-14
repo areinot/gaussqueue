@@ -99,17 +99,35 @@ thing explicit fusion adds is coverage, and the extra coverage taught the model 
 in those directions. It stays available as `gsplat.depth_fusion` (off by default) and
 `gs/fuse.py`.
 
-## Carving known-empty space (experimental, off)
+## Carving known-empty space (on by default)
 
-The same fusion also records which space the LiDAR saw *through*. Two rules used that map:
-every 100 steps, remove splats centred in known-empty space and shorten splats whose long
-axis pokes into it; and make splats beyond the scanned region thin along the line to its
-centre, so distant scenery becomes camera-facing disks instead of needles. On top of the best
-setup (MCMC + depth + flatten) this removed 151k splats and shortened 241k over the run, but
-scored 15.76 dB at 2.4% depth error against 15.85 dB at 1.8% without it. Renders look about
-the same, with slightly calmer sky. With LiDAR depth supervision there are few floaters left
-to remove on this capture. The options stay available (`gsplat.carve`,
-`gsplat.far_flat_weight`) and off by default.
+The fusion also records which space the LiDAR saw *through*. Two rules use that map. Every 100
+steps, splats centred in known-empty space are removed and splats whose long axis pokes into it
+are shortened. Splats beyond the scanned region are made thin along the line to its centre, so
+distant scenery becomes camera-facing disks instead of needles.
+
+Counting splats that sit in known-empty space in each finished result:
+
+| Result | Splats centred in known-empty space | Of those, visible | Spikes poking in |
+|---|--:|--:|--:|
+| Brush + feature points | 128k (4.3%) | 71k | 37k |
+| gsplat MCMC, no depth | 140k (4.7%) | 107k | 25k |
+| gsplat MCMC + depth + flatten | 82k (2.7%) | 59k | 15k |
+| ... + carving | 141 (0.00%) | 9 | 786 |
+
+Depth supervision alone removes about 40% of these floaters; carving removes the rest. The
+held-out scores barely move (15.76 vs 15.85 dB, 2.4% vs 1.8% depth error), because the held-out
+photos sit on the same walking path as the training photos, and floaters near the path look
+fine from it. They show up when you move off the path, as in a viewer. Top row without
+carving, bottom row with it, from viewpoints the capture never visited:
+
+![Off-path views without (top) and with (bottom) carving](trials/offpath.jpg)
+
+From the side (middle), a pale sheet and long white spikes over the water are gone. Costs:
+about 0.1 dB and 0.006 SSIM on path views, about 25% longer training, and a risk of removing
+real splats where the LiDAR sees through things (water, glass). On by default
+(`gsplat.carve`, `gsplat.far_flat_weight`). The space map takes about 15 seconds on the GPU and is
+cached with the pose refinement.
 
 ## Open questions
 

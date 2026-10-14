@@ -175,9 +175,11 @@ before every job, so the worker always runs the code in this repo.
     fusion it agreed with their own close-range LiDAR to a median of 1.3–1.8%. Training on it
     still made held-out depth worse in views facing foliage, so it stays off. Training with
     per-photo depth already fuses the LiDAR implicitly.
-  - **Carve** (`gsplat.carve`, `gsplat.far_flat_weight`; experimental, off). Remove splats in
-    space the LiDAR saw through, shorten ones poking into it, and make splats beyond the
-    scanned region camera-facing disks. See [docs/trials.md](docs/trials.md).
+  - **Carve** (`gsplat.carve`, `gsplat.far_flat_weight`; on). Remove splats in space the LiDAR
+    saw through, shorten ones poking into it, and make splats beyond the scanned region
+    camera-facing disks. This removes floaters that show when you move off the capture path.
+    The LiDAR space map is built on the worker and cached with the pose refinement. See
+    [docs/trials.md](docs/trials.md).
   - **Flatten.** Penalises each splat's thinnest axis so splats lie flat on surfaces.
   - **Densify:** *Default* (classic 3DGS growth), *Abs-grad* (grows more in fine detail) or
     *MCMC* (a fixed budget: it always ends at the splat cap and moves weak splats to where

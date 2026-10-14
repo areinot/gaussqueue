@@ -89,11 +89,13 @@ DEFAULTS = {
     # more) and render it back into each photo for denoised, wider depth coverage. In tests it
     # made held-out depth worse in views facing foliage; training already fuses the per-photo
     # depth implicitly.
-    # carve: remove splats in space the LiDAR saw through (and shorten ones poking into it).
-    # far_flat_weight: make splats beyond the scanned region camera-facing disks.
+    # carve: remove splats in space the LiDAR saw through (and shorten ones poking into it);
+    # removes floaters that show when you move off the capture path. far_flat_weight: make
+    # splats beyond the scanned region camera-facing disks. Both use a map of the LiDAR's
+    # space built on the worker and cached with the pose refinement.
     "gsplat": {"densify": "mcmc", "depth_weight": 0.3, "flat_weight": 10, "max_splats": 6_000_000,
                "sky_points": 50000, "mode": "3dgs", "depth_fusion": False,
-               "carve": False, "far_flat_weight": 0.0},
+               "carve": True, "far_flat_weight": 1.0},
     "depth_supervision": True,   # gsplat: match LiDAR depth where ARKit is confident
     "flatten": True,             # gsplat: push splats flat onto surfaces
     # Post-training pruning (on a CUDA worker): remove this percentage of splats, ranked by
@@ -1173,6 +1175,7 @@ def pose_cache_dir(cfg, colmap_dir, name):
 
 
 FEATURE_POINTS = "points3D_features.txt"
+SPACE_VERSION = "space1"   # bump when gs/fuse.py's space map changes, to invalidate cached maps
 
 
 def build_refined_model(colmap_dir, cache, out):
@@ -1208,6 +1211,7 @@ def refined_model(cfg, colmap_dir, work, beat, job):
     """Refined poses for a capture: from the pose cache if this exact capture was
     refined before, otherwise computed with COLMAP and saved to the cache."""
     cache = pose_cache_dir(cfg, colmap_dir, job["name"])
+    job["pose_cache"] = str(cache)   # other per-capture products (the LiDAR space map) live here too
     want_features = bool(cfg.get("init_feature_points"))
     if ((cache / "images.txt").exists() and (cache / "stats.json").exists()
             and (not want_features or (cache / FEATURE_POINTS).exists())):
@@ -1868,7 +1872,7 @@ class RemoteWorker:
                     depth = self.fuse_depth(cfg, job, d, raw, beat)
                 args += ["--depth-dir", depth, "--eval-depth-dir", raw]
                 if g.get("carve") or g.get("far_flat_weight"):
-                    space = self.fuse_depth(cfg, job, d, raw, beat, grid_only=True)
+                    space = self.space_map(cfg, job, d, raw, beat)
                     if space:
                         args += ["--space", space] + (["--carve"] if g.get("carve") else [])
                         if g.get("far_flat_weight"):
@@ -1953,6 +1957,28 @@ class RemoteWorker:
                 log(f"no metrics from {self.label}: {e}")
         # The worker's copy stays until finish(): pruning may still use it.
         return final
+
+    def space_map(self, cfg, job, d, raw, beat):
+        """The LiDAR space map for carving: from the pose cache when this capture (same refined
+        poses, same held-out split) was mapped before, else built here and cached."""
+        cache = (Path(job["pose_cache"]) / f"{SPACE_VERSION}-h{cfg['eval_split_every']}.npz"
+                 if job.get("pose_cache") and Path(job["pose_cache"]).is_dir() else None)
+        remote = f"{d}/data/space/space.npz"
+        if cache and cache.exists():
+            try:
+                self.ps(f"New-Item -ItemType Directory -Force '{d}/data/space' | Out-Null")
+                self.upload_file(cache, remote)
+                log(f"using cached LiDAR space map for {job['name']}")
+                return remote
+            except Exception as e:
+                log(f"cached space map upload failed: {e}")
+        space = self.fuse_depth(cfg, job, d, raw, beat, grid_only=True)
+        if space and cache:
+            try:
+                self.download(space, cache)
+            except Exception as e:
+                log(f"could not cache the space map: {e}")
+        return space
 
     def fuse_depth(self, cfg, job, d, raw, beat, grid_only=False):
         """Multi-view LiDAR fusion (gs/fuse.py) on the worker. Returns the fused depth folder
