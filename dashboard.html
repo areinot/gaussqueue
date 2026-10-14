@@ -112,9 +112,8 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .help .hsel { color: var(--text); }
 .help .hsel b { font-weight: 600; }
 .help .hnote { font-size: 11.5px; }
-.help .hbody { display: flex; flex-direction: column; gap: 8px; transition: transform .15s ease-out; }
+.help .hbody { display: flex; flex-direction: column; gap: 8px; }
 .help .hkeys { font-size: 11.5px; padding-top: 6px; border-top: 1px solid var(--line); }
-@media (prefers-reduced-motion: reduce) { .help .hbody { transition: none; } }
 [data-help-key].hl { outline: 1px dashed var(--accent); outline-offset: 2px; border-radius: 4px; }
 @media (max-width: 560px) {
   .settings.with-help { grid-template-columns: minmax(0, 1fr); }
