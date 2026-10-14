@@ -34,6 +34,15 @@ structure-from-motion step. Any capture that contains a COLMAP model
 - **Compressed copies.** Each result also gets `.sog` and `.spz` versions made with
   [SplatTransform](https://github.com/playcanvas/splat-transform). They're typically
   10–15× smaller than the `.ply` and much easier to open on a phone (e.g. in SuperSplat).
+- **Sharper poses (optional).** SplatKing's LiDAR export uses ARKit's camera poses as
+  they are, with no bundle adjustment, so small drift blurs the result. With `refine_poses`
+  (also a per-capture checkbox), COLMAP refines them first. It finds SIFT features, matches
+  every pair of photos (or, for big captures, spatial neighbours using the known positions),
+  triangulates, bundle-adjusts poses and points with the intrinsics fixed, and then aligns
+  the result back onto the original frame so the LiDAR points and "up" still line up. On a
+  68-photo capture this took about 1.5 minutes on CPU and halved the mean reprojection error
+  (1.26 → 0.56 px). `meta.json` records the before/after numbers. If refinement fails or makes
+  things worse, the capture trains on the original poses and the problem is reported.
 - **Right way up.** SplatKing/COLMAP captures use +Y as up, but most splat viewers treat
   −Y as up, so results look upside down. With `flip_up` (on in the example config; it can
   also be set per capture, even mid-training), results are rotated 180° about X before
@@ -59,6 +68,7 @@ structure-from-motion step. Any capture that contains a COLMAP model
   It uses the built-in macOS tools `brctl`, `sips`, `caffeinate`, `osascript` and launchd.
 - Python 3.9+. The system `python3` from the Xcode Command Line Tools is fine. There are
   no third-party packages.
+- Optional: [COLMAP](https://colmap.github.io) 4.x for pose refinement (`brew install colmap`).
 - Optional: [Node.js](https://nodejs.org) for the `.sog`/`.spz` compression step
   (`brew install node`). Without it, results are `.ply` only.
 - For iMessage notifications: the Messages app signed in to iMessage on the Mac.
@@ -106,6 +116,7 @@ The exception is `dashboard_port`, which needs a restart.
 |---|---|---|
 | `standard` | 15k steps, 1440 px, SH 3, ≤10M splats | The default preset. *Fast* and *High* are fixed. |
 | `compress` | `["sog", "spz"]` | Compressed formats written next to the `.ply`. Use `[]` to turn this off. If compression fails, the capture still counts as done, and the problem is noted in the history. |
+| `refine_poses` | `false` (example config: `true`) | Refine camera poses with COLMAP before training. A few minutes of CPU per capture. |
 | `flip_up` | `false` (example config: `true`) | Rotate results 180° about X so they're the right way up in SuperSplat and similar viewers. |
 | `keep_previous_results` | `true` | When a requeued capture finishes, keep the earlier result in `previous/`. If `false`, it's overwritten. |
 | `imessage_to` | `""` (off) | Phone number or Apple ID email to text. |

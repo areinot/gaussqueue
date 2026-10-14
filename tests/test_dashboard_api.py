@@ -197,6 +197,23 @@ class DashboardAPITest(unittest.TestCase):
                          ["capZ.sog", "meta.json", "preview.jpg"])
         self.assertEqual(self.gq.share_result(dict(cfg, share_dir=None), res), [])
 
+    def test_refine_poses_is_a_restart_setting(self):
+        gq = self.gq
+        a = gq.effective_settings(self.cfg, {})
+        self.assertEqual(a["refine_poses"], int(bool(self.cfg.get("refine_poses"))))
+        self.assertFalse(gq.same_settings(a, dict(a, refine_poses=1 - a["refine_poses"])))
+        self.assertEqual(self.post({"name": "capA", "action": "set", "key": "refine_poses",
+                                    "value": 1})[0], 200)
+        st = gq.effective_settings(self.cfg, self.overrides.get("capA"))
+        self.assertEqual((st["refine_poses"], st["preset"]), (1, "standard"))
+        # On the running capture it needs a pause, like other training settings.
+        self.status.current = {"name": "capB", "phase": "training", "paused": False}
+        try:
+            self.assertEqual(self.post({"name": "capB", "action": "set", "key": "refine_poses",
+                                        "value": 1})[0], 400)
+        finally:
+            self.status.current = None
+
     def test_snapshot_has_estimates_and_presets(self):
         snap = self.snapshot()
         self.assertEqual(set(snap["presets"]), {"fast", "standard", "high"})

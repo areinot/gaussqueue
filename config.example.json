@@ -22,5 +22,6 @@
     "sog",
     "spz"
   ],
-  "flip_up": true
+  "flip_up": true,
+  "refine_poses": true
 }

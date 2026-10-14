@@ -13,6 +13,7 @@ so most edits apply without a restart. See README.md.
 """
 import datetime as dt
 import http.server
+import math
 import json
 import os
 import re
@@ -53,6 +54,10 @@ DEFAULTS = {
     # Rotate results 180° about X so "up" is up in SuperSplat & co. (SplatKing/COLMAP
     # captures are +Y-up, most splat viewers expect -Y-up). Per-capture override on the dashboard.
     "flip_up": False,
+    # Refine the capture's camera poses with COLMAP (features, matching, bundle
+    # adjustment) before training. Slower, usually sharper. Needs `colmap` on PATH.
+    "refine_poses": False,
+    "colmap": "colmap",
     "splat_transform": str(APP_HOME / "tools/splat-transform/node_modules/.bin/splat-transform"),
     "imessage_to": "",                       # phone number or Apple ID email; empty = off
     "notify_checkpoints": [0.25, 0.5, 0.75], # fractions of training to text a preview at
@@ -77,10 +82,11 @@ DEFAULTS = {
 # Per-item processing settings, editable from the dashboard. "standard" comes
 # from config.json, so editing config still changes the default.
 TRAIN_KEYS = ("total_steps", "max_resolution", "sh_degree", "max_splats", "subsample_frames")
-SETTING_KEYS = TRAIN_KEYS + ("flip_up",)   # flip_up only affects output files
+RESTART_KEYS = TRAIN_KEYS + ("refine_poses",)   # changing these restarts training
+SETTING_KEYS = RESTART_KEYS + ("flip_up",)      # flip_up only affects output files
 SETTING_LIMITS = {"total_steps": (500, 100_000), "max_resolution": (256, 4096),
                   "sh_degree": (0, 3), "max_splats": (50_000, 20_000_000),
-                  "subsample_frames": (1, 20), "flip_up": (0, 1)}
+                  "subsample_frames": (1, 20), "flip_up": (0, 1), "refine_poses": (0, 1)}
 PRESETS = {
     "fast": {"total_steps": 7000, "max_resolution": 1080, "sh_degree": 2,
              "max_splats": 1_500_000, "subsample_frames": 1},
@@ -100,6 +106,7 @@ def effective_settings(cfg, ov):
     base = PRESETS.get(preset) or standard_settings(cfg)
     out = dict(base)
     out["flip_up"] = int(bool(cfg.get("flip_up")))
+    out["refine_poses"] = int(bool(cfg.get("refine_poses")))
     out.update({k: ov[k] for k in SETTING_KEYS if k in ov})
     out["base"] = preset
     out["preset"] = preset if not any(k in ov for k in TRAIN_KEYS) else "custom"
@@ -110,6 +117,7 @@ def settings_summary(st):
     return (f"{st['preset']}: {st['total_steps'] / 1000:g}k steps @ {st['max_resolution']}px, "
             f"SH{st['sh_degree']}, <={st['max_splats'] / 1e6:g}M splats"
             + (f", every {st['subsample_frames']} frames" if st["subsample_frames"] > 1 else "")
+            + (", refined poses" if st.get("refine_poses") else "")
             + (", flipped" if st.get("flip_up") else ""))
 
 
@@ -847,11 +855,180 @@ def latest_step(out_dir, prefix):
     return best
 
 
+def run_cmd(cmd, beat, log_file, timeout=7200):
+    """Run a tool, keeping the dashboard alive; output goes to log_file."""
+    with open(log_file, "a") as lf:
+        lf.write("$ " + " ".join(map(str, cmd)) + "\n")
+        lf.flush()
+        proc = subprocess.Popen([str(c) for c in cmd], stdout=lf, stderr=subprocess.STDOUT)
+        deadline = time.time() + timeout
+        while proc.poll() is None:
+            if time.time() > deadline:
+                proc.kill()
+                raise RuntimeError(f"{Path(str(cmd[0])).name} {cmd[1]} timed out")
+            beat()
+            time.sleep(1)
+    if proc.returncode:
+        raise RuntimeError(f"{Path(str(cmd[0])).name} {cmd[1]} failed (exit {proc.returncode})")
+
+
+def _quat_to_R(qw, qx, qy, qz):
+    return [[1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
+            [2*(qx*qy+qz*qw), 1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
+            [2*(qx*qz-qy*qw), 2*(qy*qz+qx*qw), 1-2*(qx*qx+qy*qy)]]
+
+
+def read_poses(images_txt):
+    """{name: (image line fields, quaternion, camera centre)} from a COLMAP images.txt."""
+    out = {}
+    for line in open(images_txt):
+        p = line.split()
+        if line.startswith("#") or len(p) < 10 or not p[0].isdigit():
+            continue
+        q = list(map(float, p[1:5]))
+        t = list(map(float, p[5:8]))
+        R = _quat_to_R(*q)
+        out[p[9]] = (p, q, [-(R[0][i]*t[0] + R[1][i]*t[1] + R[2][i]*t[2]) for i in range(3)])
+    return out
+
+
+def mean_reprojection(colmap, model):
+    r = subprocess.run([colmap, "model_analyzer", "--path", str(model), "--log_target", "stderr"],
+                       capture_output=True, text=True)
+    m = re.search(r"Mean reprojection error: ([\d.]+)", r.stderr + r.stdout)
+    return float(m.group(1)) if m else None
+
+
+def refine_poses(cfg, colmap_dir, work, beat, job):
+    """Refine ARKit/LiDAR poses with COLMAP and return a new COLMAP folder:
+    SIFT features -> matching (exhaustive, or spatial using the known positions as
+    priors for big captures) -> triangulate with the known poses -> bundle-adjust
+    poses + points (intrinsics fixed) -> similarity-align back onto the original
+    camera centres, so the capture's LiDAR points and "up" still line up.
+    Raises on failure; the caller falls back to the original poses."""
+    import sqlite3
+    import struct
+    colmap = shutil.which(cfg.get("colmap") or "colmap") or cfg.get("colmap")
+    if not colmap or not os.access(colmap, os.X_OK):
+        raise RuntimeError("colmap not found (brew install colmap)")
+    src, images = colmap_dir / "sparse" / "0", colmap_dir / "images"
+    if not (src / "images.txt").exists():
+        raise RuntimeError("pose refinement needs a text COLMAP model (images.txt)")
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    logf, db = work / "colmap.log", work / "database.db"
+    cams = [l.split() for l in open(src / "cameras.txt") if l.strip() and not l.startswith("#")]
+    if len(cams) != 1:
+        raise RuntimeError("pose refinement supports single-camera captures only")
+    model, params = cams[0][1], ",".join(cams[0][4:])
+    orig = read_poses(src / "images.txt")
+    n = len(orig)
+
+    job["phase"] = f"refining poses: features ({n} photos)"
+    beat(force=True)
+    run_cmd([colmap, "feature_extractor", "--database_path", db, "--image_path", images,
+             "--ImageReader.camera_model", model, "--ImageReader.single_camera", 1,
+             "--ImageReader.camera_params", params, "--FeatureExtraction.use_gpu", 0,
+             "--FeatureExtraction.max_image_size", 1600, "--log_target", "stderr"], beat, logf)
+
+    con = sqlite3.connect(db)
+    ids = {nm: (iid, cid) for iid, nm, cid in con.execute("select image_id, name, camera_id from images")}
+    frames = {d: (f, r) for f, r, d in con.execute(
+        "select f.frame_id, f.rig_id, d.data_id from frames f join frame_data d on f.frame_id = d.frame_id")}
+    job["phase"] = "refining poses: matching"
+    beat(force=True)
+    if n <= 120:
+        con.close()
+        run_cmd([colmap, "exhaustive_matcher", "--database_path", db,
+                 "--FeatureMatching.use_gpu", 0, "--log_target", "stderr"], beat, logf)
+    else:  # match each photo with its spatial neighbours, using the known positions
+        cov = struct.pack("<9d", 0.04, 0, 0, 0, 0.04, 0, 0, 0, 0.04)
+        for nm, (_, _, c) in orig.items():
+            iid, cid = ids[nm]
+            con.execute("insert into pose_priors (corr_data_id, corr_sensor_id, corr_sensor_type, "
+                        "position, position_covariance, gravity, coordinate_system) "
+                        "values (?,?,0,?,?,NULL,1)", (iid, cid, struct.pack("<3d", *c), cov))
+        con.commit()
+        con.close()
+        run_cmd([colmap, "spatial_matcher", "--database_path", db, "--FeatureMatching.use_gpu", 0,
+                 "--SpatialMatching.ignore_z", 0, "--SpatialMatching.max_num_neighbors", 30,
+                 "--SpatialMatching.max_distance", 10, "--log_target", "stderr"], beat, logf)
+
+    # Known-pose model with the database's ids (COLMAP 4 also wants rigs + frames).
+    known = work / "known"
+    known.mkdir()
+    cid = next(iter(ids.values()))[1]
+    (known / "cameras.txt").write_text(" ".join([str(cid)] + cams[0][1:]) + "\n")
+    (known / "rigs.txt").write_text(f"1 1 CAMERA {cid}\n")
+    img_lines, frame_lines = [], []
+    for nm, (p, _, _) in orig.items():
+        iid, c = ids[nm]
+        fid, rig = frames[iid]
+        img_lines += [" ".join([str(iid)] + p[1:8] + [str(c), nm]), ""]
+        frame_lines.append(" ".join([str(fid), str(rig)] + p[1:8] + ["1", "CAMERA", str(c), str(iid)]))
+    (known / "images.txt").write_text("\n".join(img_lines) + "\n")
+    (known / "frames.txt").write_text("\n".join(frame_lines) + "\n")
+    (known / "points3D.txt").write_text("")
+
+    job["phase"] = "refining poses: bundle adjustment"
+    beat(force=True)
+    tri, ba, aligned, txt = (work / d for d in ("tri", "ba", "aligned", "txt"))
+    for d in (tri, ba, aligned, txt):
+        d.mkdir()
+    run_cmd([colmap, "point_triangulator", "--database_path", db, "--image_path", images,
+             "--input_path", known, "--output_path", tri, "--refine_intrinsics", 0,
+             "--log_target", "stderr"], beat, logf)
+    before = mean_reprojection(colmap, tri)
+    run_cmd([colmap, "bundle_adjuster", "--input_path", tri, "--output_path", ba,
+             "--BundleAdjustment.refine_focal_length", 0,
+             "--BundleAdjustment.refine_principal_point", 0,
+             "--BundleAdjustment.refine_extra_params", 0,
+             "--BundleAdjustment.refine_sensor_from_rig", 0, "--log_target", "stderr"], beat, logf)
+    after = mean_reprojection(colmap, ba)
+    ref = work / "ref_centres.txt"
+    ref.write_text("".join(f"{nm} {c[0]:.6f} {c[1]:.6f} {c[2]:.6f}\n" for nm, (_, _, c) in orig.items()))
+    run_cmd([colmap, "model_aligner", "--input_path", ba, "--output_path", aligned,
+             "--ref_images_path", ref, "--ref_is_gps", 0, "--alignment_type", "custom",
+             "--alignment_max_error", 0.25, "--log_target", "stderr"], beat, logf)
+    run_cmd([colmap, "model_converter", "--input_path", aligned, "--output_path", txt,
+             "--output_type", "TXT", "--log_target", "stderr"], beat, logf)
+
+    new = read_poses(txt / "images.txt")
+    common = [nm for nm in orig if nm in new]
+    if len(common) < 0.9 * n:
+        raise RuntimeError(f"only {len(common)}/{n} photos survived refinement")
+    shift = sorted(math.dist(orig[nm][2], new[nm][2]) * 100 for nm in common)
+    turn = sorted(math.degrees(2 * math.acos(min(1, abs(sum(a * b for a, b in zip(orig[nm][1], new[nm][1]))))))
+                  for nm in common)
+    stats = {"photos": n, "reprojection_px_before": before, "reprojection_px_after": after,
+             "median_shift_cm": round(shift[len(shift) // 2], 1), "max_shift_cm": round(shift[-1], 1),
+             "median_turn_deg": round(turn[len(turn) // 2], 2), "max_turn_deg": round(turn[-1], 2)}
+    if after is None or (before is not None and after > before * 1.05) or shift[-1] > 200:
+        raise RuntimeError(f"refinement looked worse than the original poses: {stats}")
+
+    # Trainable folder: refined poses, original photos and LiDAR points.
+    out = work / "model"
+    (out / "sparse" / "0").mkdir(parents=True)
+    (out / "images").symlink_to(images.resolve())
+    lines = []
+    for nm in orig:   # write in the original order, poses from the refined model
+        p = new[nm][0] if nm in new else orig[nm][0]
+        lines += [" ".join(p[:8] + [cams[0][0], nm]), ""]
+    (out / "sparse" / "0" / "images.txt").write_text("\n".join(lines) + "\n")
+    (out / "sparse" / "0" / "cameras.txt").write_text(" ".join(cams[0]) + "\n")  # intrinsics unchanged
+    if (src / "points3D.txt").exists():
+        shutil.copyfile(src / "points3D.txt", out / "sparse" / "0" / "points3D.txt")
+    else:
+        shutil.copyfile(txt / "points3D.txt", out / "sparse" / "0" / "points3D.txt")
+    log(f"refined poses for {job['name']}: {stats}")
+    return out, stats
+
+
 RESTART = object()  # train() result: settings changed while paused, run again
 
 
 def same_settings(a, b):
-    return all(a[k] == b[k] for k in TRAIN_KEYS)
+    return all(a.get(k) == b.get(k) for k in RESTART_KEYS)
 
 
 def train(cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
@@ -1039,6 +1216,8 @@ def write_meta(dest, job, files, flipped):
             "settings": {k: v for k, v in (job.get("settings") or {}).items() if k != "base"},
             "frames": job.get("frames"), "files": files,
             "rotation_xyz_degrees": [180, 0, 0] if flipped else [0, 0, 0]}
+    if job.get("refine"):
+        meta["pose_refinement"] = job["refine"]
     (dest / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
 
 
@@ -1065,8 +1244,22 @@ def process(cfg, paths, state, status, item, beat):
         colmap = find_colmap(job_dir / "data")
         out_dir = job_dir / "out"
         pending = lambda: effective_settings(load_config(), status.overrides.get(name))
+        refined = None   # (folder, stats), computed once per job
+        warnings = []
         while True:
-            final = train(cfg, paths, job, colmap, out_dir, beat, pending)
+            source = colmap
+            if job["settings"].get("refine_poses"):
+                if refined is None:
+                    try:
+                        refined = refine_poses(cfg, colmap, job_dir / "refine", beat, job)
+                    except Exception as e:
+                        log(f"pose refinement failed for {name}: {e}")
+                        warnings.append(f"pose refinement skipped: {str(e)[:120]}")
+                        refined = (None, None)
+                if refined[0]:
+                    source = refined[0]
+                job["refine"] = refined[1]
+            final = train(cfg, paths, job, source, out_dir, beat, pending)
             if final is not RESTART:
                 break
             for old in paths.previews.glob(f"{name}_step*.jpg"):
@@ -1079,7 +1272,7 @@ def process(cfg, paths, state, status, item, beat):
         # Output flip is read at the end, so it can be changed while training runs.
         flip = bool(pending().get("flip_up"))
         job["settings"]["flip_up"] = int(flip)
-        result_ply, cerrors = final, []
+        result_ply, cerrors = final, list(warnings)
         if flip:
             job["phase"] = "flipping"
             beat()
@@ -1343,6 +1536,11 @@ def check():
         else:
             print(f"! splat-transform not found ({cfg['splat_transform']}); "
                   "results will be .ply only. install.sh installs it when Node.js is available.")
+    colmap = shutil.which(cfg.get("colmap") or "colmap")
+    if colmap:
+        print(f"✓ colmap: {colmap}" + (" (refine_poses on by default)" if cfg.get("refine_poses") else ""))
+    elif cfg.get("refine_poses"):
+        print("! colmap not found (brew install colmap); captures will train on unrefined poses")
     for tool in ("brctl", "sips", "caffeinate", "osascript"):
         if not shutil.which(tool):
             print(f"✗ missing macOS tool: {tool}")

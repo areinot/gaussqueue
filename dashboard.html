@@ -150,7 +150,7 @@ const kindText = (k, f) => [k && k !== "unknown" ? k : null, f ? `${f} frames` :
 
 const PRESET_LABEL = {fast: "Fast", standard: "Standard", high: "High", custom: "Custom"};
 const kfmt = (n) => n >= 1e6 ? `${+(n/1e6).toFixed(1)}M` : n >= 1000 ? `${+(n/1000).toFixed(1)}k` : String(n);
-const qualityText = (st) => st ? `<b>${PRESET_LABEL[st.preset] || esc(st.preset)}</b> · ${kfmt(st.total_steps)} steps · ${st.max_resolution}px · SH${st.sh_degree} · ≤${kfmt(st.max_splats)} splats${st.subsample_frames > 1 ? ` · every ${st.subsample_frames} frames` : ""}${st.flip_up ? " · flipped" : ""}` : "";
+const qualityText = (st) => st ? `<b>${PRESET_LABEL[st.preset] || esc(st.preset)}</b> · ${kfmt(st.total_steps)} steps · ${st.max_resolution}px · SH${st.sh_degree} · ≤${kfmt(st.max_splats)} splats${st.subsample_frames > 1 ? ` · every ${st.subsample_frames} frames` : ""}${st.refine_poses ? " · refined poses" : ""}${st.flip_up ? " · flipped" : ""}` : "";
 const FIELD_OPTS = {
   max_resolution: [720, 960, 1080, 1280, 1440, 1920, 2560, 3840],
   sh_degree: [[0, "0 · flat colour"], [1, "1"], [2, "2"], [3, "3 · full sheen"]],
@@ -205,7 +205,7 @@ function renderNow(c) {
   const stepLabel = (n) => { const m = n.match(/_step(\d+)\.jpg$/); return m ? `${(+m[1]/1000).toFixed(1)}k` : ""; };
   el.className = "panel now" + (c.paused ? " paused" : "");
   const pend = c.pending_settings, run = c.settings;
-  const changed = c.paused && pend && run && ["total_steps", "max_resolution", "sh_degree", "max_splats", "subsample_frames"].some(k => pend[k] !== run[k]);
+  const changed = c.paused && pend && run && ["total_steps", "max_resolution", "sh_degree", "max_splats", "subsample_frames", "refine_poses"].some(k => (pend[k] || 0) !== (run[k] || 0));
   const canPause = c.phase === "training" || c.paused;
   const controls = canPause && last.presets ? `
       <div class="controls" data-item="${esc(c.name)}">
@@ -244,6 +244,12 @@ function flipBox(on) {
     <input type="checkbox" data-set="flip_up"${on ? " checked" : ""}> Flip vertical</label>`;
 }
 
+// "Refine camera poses": COLMAP bundle adjustment before training (changes the input, so it restarts).
+function refineBox(on) {
+  return `<label class="flip" title="Before training, refine the capture's camera poses with COLMAP (feature matching + bundle adjustment). Takes a few minutes; usually sharper, especially for foliage and long walks.">
+    <input type="checkbox" data-set="refine_poses"${on ? " checked" : ""}> Refine camera poses (COLMAP)</label>`;
+}
+
 function selectHTML(key, value, opts) {
   const list = opts.map(o => Array.isArray(o) ? o : [o, key === "max_splats" ? kfmt(o) : String(o)]);
   if (!list.some(([v]) => v === value)) list.push([value, key === "max_splats" ? kfmt(value) : String(value)]);
@@ -266,6 +272,7 @@ function settingsHTML(it, isCurrent) {
         ${field("sh_degree", "Colour detail (SH)", selectHTML("sh_degree", st.sh_degree, FIELD_OPTS.sh_degree))}
         ${field("max_splats", "Splat cap", selectHTML("max_splats", st.max_splats, FIELD_OPTS.max_splats))}
         ${field("subsample_frames", "Frames used", selectHTML("subsample_frames", st.subsample_frames, FIELD_OPTS.subsample_frames))}
+        <div class="flipfield">${refineBox(st.refine_poses)}</div>
         <div class="flipfield">${flipBox(st.flip_up)}</div>
       </div>
       <div class="actions">
