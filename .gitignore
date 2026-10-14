@@ -21,3 +21,14 @@ __pycache__/
 *.pyc
 *.bak
 .DS_Store
+
+# Secrets never belong here: SSH keys and per-machine worker settings live outside
+# the repo (~/.ssh and $GAUSSQUEUE_HOME/config.json).
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*_ed25519
+*_ed25519.pub
+gaussqueue_pc*
+.env
