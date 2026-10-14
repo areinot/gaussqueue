@@ -42,6 +42,7 @@ def parse(argv=None):
     p.add_argument("--strategy", choices=["default", "absgrad", "mcmc", "none"], default="mcmc")
     p.add_argument("--max-splats", type=int, default=3_000_000)
     p.add_argument("--depth-dir")
+    p.add_argument("--eval-depth-dir", help="depth maps for scoring held-out photos (default: --depth-dir)")
     p.add_argument("--depth-weight", type=float, default=0.0)
     p.add_argument("--depth-conf", type=int, default=2)
     p.add_argument("--flat-weight", type=float, default=0.0)
@@ -196,7 +197,7 @@ def train(a, splats=None, log=print):
     tr_ims, te_ims = gsdata.split(images, a.holdout_every)
     tr_ims = tr_ims[::max(1, a.subsample)]
     tv = gsdata.Views(root, tr_ims, a.max_res, dev, a.depth_dir if a.depth_weight > 0 else None)
-    ev = gsdata.Views(root, te_ims, a.max_res, dev, a.depth_dir)
+    ev = gsdata.Views(root, te_ims, a.max_res, dev, a.eval_depth_dir or a.depth_dir)
     centers = tv.centers()
     scene_scale = float((centers - centers.mean(0)).norm(dim=1).max()) * 1.1 or 1.0
     log(f"{len(tv)} training views, {len(ev)} held out, scene scale {scene_scale:.2f}, "

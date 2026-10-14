@@ -78,9 +78,13 @@ DEFAULTS = {
     # "default" (3DGS growth) or "absgrad" (grows more in fine detail). max_splats caps the
     # splat count for gsplat runs whatever the preset says (MCMC always fills its budget, and
     # GPU memory is the limit). sky_points: extra starting splats on a distant sphere for sky.
-    # mode: "3dgs" or "2dgs" (flat disks).
+    # mode: "3dgs" or "2dgs" (flat disks). depth_fusion (experimental, off): before training,
+    # merge every photo's LiDAR depth into one 3D model (closer, more confident readings count
+    # more) and render it back into each photo for denoised, wider depth coverage. In tests it
+    # made held-out depth worse in views facing foliage; training already fuses the per-photo
+    # depth implicitly.
     "gsplat": {"densify": "mcmc", "depth_weight": 0.3, "flat_weight": 10, "max_splats": 6_000_000,
-               "sky_points": 50000, "mode": "3dgs"},
+               "sky_points": 50000, "mode": "3dgs", "depth_fusion": False},
     "depth_supervision": True,   # gsplat: match LiDAR depth where ARKit is confident
     "flatten": True,             # gsplat: push splats flat onto surfaces
     # Post-training pruning (on a CUDA worker): remove this percentage of splats, ranked by
@@ -1583,6 +1587,8 @@ def write_meta(dest, job, files, flipped):
         meta["pose_refinement"] = job["refine"]
     if job.get("metrics"):
         meta["held_out_photos"] = job["metrics"]
+    if job.get("depth_fusion"):
+        meta["depth_fusion"] = job["depth_fusion"]
     if job.get("prune"):
         meta["pruning"] = job["prune"]
     if job.get("quality"):
@@ -1791,7 +1797,11 @@ class RemoteWorker:
                     "--sky-points", g["sky_points"], "--export-every", cfg["checkpoint_every"],
                     "--eval-every", cfg["eval_every"], "--holdout-every", cfg["eval_split_every"]]
             if sensor:   # depth maps: supervision when on, held-out depth error either way
-                args += ["--depth-dir", f"{d}/data/{sensor.name}"]
+                raw = f"{d}/data/{sensor.name}"
+                depth = raw
+                if st.get("depth_supervision") and g.get("depth_fusion"):
+                    depth = self.fuse_depth(cfg, job, d, raw, beat)
+                args += ["--depth-dir", depth, "--eval-depth-dir", raw]
                 if st.get("depth_supervision"):
                     args += ["--depth-weight", g["depth_weight"]]
             if st.get("flatten"):
@@ -1873,6 +1883,26 @@ class RemoteWorker:
         # The worker's copy stays until finish(): pruning may still use it.
         return final
 
+    def fuse_depth(self, cfg, job, d, raw, beat):
+        """Multi-view LiDAR fusion (gs/fuse.py) on the worker; returns the depth folder to train
+        on, or the raw one if fusion fails. Held-out photos are left out of the fusion."""
+        job["phase"] = f"fusing LiDAR depth on {self.label}"
+        beat(force=True)
+        cwd = self.gsplat["scripts"]
+        args = [f"{cwd}/fuse.py", f"{d}/data", "--depth-dir", raw, "--out", f"{d}/data/fused",
+                "--exclude-every", cfg["eval_split_every"]]
+        log(f"run on {self.label}: fuse {' '.join(map(str, args))}")
+        try:
+            code = self.run(self.gsplat["python"], args, cwd, d, "fuse", beat)
+            if code:
+                raise RuntimeError(f"exit {code} {self.failure(d, 'fuse')}")
+            out = self.ps(f"Get-Content '{d}/data/fused/fusion.json' -Raw", check=False)
+            job["depth_fusion"] = {k: v for k, v in json.loads(out).items() if k != "frames"}
+            return f"{d}/data/fused"
+        except Exception as e:
+            log(f"depth fusion failed on {self.label}, using raw LiDAR: {e}")
+            return raw
+
     def prune(self, cfg, job, colmap_dir, sensor, ply, pct, out_dir, beat, trained_here):
         """Prune a trained result on this worker. Returns (local pruned .ply, report)."""
         name, st = job["name"], job["settings"]
@@ -1897,7 +1927,8 @@ class RemoteWorker:
                 "--score", pc["score"], "--keep", round(1 - pct / 100, 4),
                 "--finetune", pc["finetune_steps"], "--eval-res", st["max_resolution"], "--holdout-every", 0]
         if sensor:
-            args += ["--depth-dir", f"{d}/data/{sensor.name}"]
+            fused = trained_here and job.get("depth_fusion")   # fine-tune on the fused depth too
+            args += ["--depth-dir", f"{d}/data/fused" if fused else f"{d}/data/{sensor.name}"]
             if st.get("depth_supervision"):
                 args += ["--depth-weight", g["depth_weight"]]
         if st.get("flatten"):

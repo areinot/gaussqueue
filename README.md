@@ -168,6 +168,13 @@ before every job, so the worker always runs the code in this repo.
   - **LiDAR depth supervision.** SplatKing saves a depth map and a confidence map with every
     photo. Rendered depth is pulled toward the LiDAR depth only where ARKit is confident (near
     surfaces, up to about 5 m), so sky and distant scenery are left to the photos.
+  - **Depth fusion** (`gsplat.depth_fusion`, experimental, off by default). Before training,
+    every photo's depth map is merged into one 3D model (a TSDF volume on the GPU, with closer
+    and more confident readings counting more), then rendered back into each photo. On a test
+    capture this raised depth coverage from 20% to 32% of pixels, and on photos left out of the
+    fusion it agreed with their own close-range LiDAR to a median of 1.3–1.8%. Training on it
+    still made held-out depth worse in views facing foliage, so it stays off. Training with
+    per-photo depth already fuses the LiDAR implicitly.
   - **Flatten.** Penalises each splat's thinnest axis so splats lie flat on surfaces.
   - **Densify:** *Default* (classic 3DGS growth), *Abs-grad* (grows more in fine detail) or
     *MCMC* (a fixed budget: it always ends at the splat cap and moves weak splats to where
@@ -188,6 +195,9 @@ before every job, so the worker always runs the code in this repo.
   reaches about 5 m. Without the feature points, distant trees, buildings and sky have no
   starting splats, and training covers them with large blurry splats near the camera. This
   applies to Brush too.
+
+What these options do on a real outdoor capture (scores on held-out photos, sample renders
+and depth maps): [docs/trials.md](docs/trials.md).
 
 Set up the worker once (Windows, PowerShell):
 
@@ -241,7 +251,7 @@ The exception is `dashboard_port`, which needs a restart.
 | `refine_poses` | `false` (example config: `true`) | Refine camera poses with COLMAP before training. A few minutes of CPU per capture. |
 | `init_feature_points` | `true` | Also start training from COLMAP's triangulated feature points (needs `refine_poses`). See [gsplat trainer and pruning](#gsplat-trainer-and-pruning-cuda-workers-optional). |
 | `trainer` | `"brush"` | `"gsplat"` trains on CUDA workers that have it. Per-capture override on the dashboard. |
-| `gsplat` | `{"densify": "mcmc", "depth_weight": 0.3, "flat_weight": 10, "max_splats": 6000000, "sky_points": 50000, "mode": "3dgs"}` | gsplat options. `max_splats` caps gsplat runs whatever the preset says (MCMC always fills its budget; GPU memory is the limit). `mode` can be `"2dgs"` (flat disks). |
+| `gsplat` | `{"densify": "mcmc", "depth_weight": 0.3, "flat_weight": 10, "max_splats": 6000000, "sky_points": 50000, "mode": "3dgs", "depth_fusion": false}` | gsplat options. `max_splats` caps gsplat runs whatever the preset says (MCMC always fills its budget; GPU memory is the limit). `mode` can be `"2dgs"` (flat disks). |
 | `depth_supervision` / `flatten` | `true` / `true` | Defaults for the per-capture gsplat checkboxes. |
 | `prune_pct` | `0` (off) | Remove this % of splats after training. Per-capture override. |
 | `prune` | `{"score": "lightgaussian", "finetune_steps": 3000}` | Pruning score (`lightgaussian` or `pup`) and fine-tuning length. |
