@@ -76,6 +76,10 @@ DEFAULTS = {
     # When a capture is requeued and rerun, move the earlier result into
     # <outbox>/<name>/previous/ instead of overwriting it.
     "keep_previous_results": True,
+    # "Publish snapshot" turns the latest checkpoint of a running capture into a result.
+    # While something is training, snapshots are only processed when at least this much
+    # memory is free (they wait for the run to finish otherwise).
+    "snapshot_min_free_pct": 25,
 }
 
 
@@ -236,10 +240,14 @@ def load_state():
         return {"history": []}
 
 
+STATE_LOCK = threading.RLock()
+
+
 def save_state(state):
-    tmp = STATE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2))
-    tmp.replace(STATE_PATH)
+    with STATE_LOCK:
+        tmp = STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        tmp.replace(STATE_PATH)
 
 
 def fmt_dur(seconds):
@@ -727,6 +735,7 @@ class Status:
         self.paths, self.state, self.inbox, self.overrides = paths, state, inbox, overrides
         self.current = None   # dict describing the active job
         self.quality_cache = {}
+        self.snapshots = None   # set in main()
         self.snapshot = {}    # served as JSON by the dashboard
 
     def write(self, cfg):
@@ -752,6 +761,8 @@ class Status:
             current = {k: c.get(k) for k in
                        ("name", "phase", "step", "total", "started", "eta", "preview",
                         "kind", "frames", "thumb", "settings", "paused", "paused_at", "quality", "photo_px")}
+            if self.snapshots:
+                current["snapshots"] = self.snapshots.for_job(c["name"])
             current["pending_settings"] = effective_settings(cfg, self.overrides.get(c["name"]))
             current["previews"] = sorted(p.name for p in
                                          self.paths.previews.glob(f"{c['name']}_step*.jpg"))
@@ -879,6 +890,12 @@ def start_dashboard(cfg, paths, status, overrides):
                 cur = status.current
                 action = body.get("action")
                 if cur and cur["name"] == name:
+                    if action == "snapshot":
+                        if cur.get("phase") not in ("training", "paused"):
+                            raise ValueError("snapshots are only possible while training")
+                        step = status.snapshots.request(cur)
+                        return self.send(200, json.dumps({"ok": True, "step": step}).encode(),
+                                         "application/json")
                     if action in ("pause", "resume"):
                         if cur.get("phase") not in ("training", "paused"):
                             raise ValueError("can only pause while training")
@@ -891,8 +908,8 @@ def start_dashboard(cfg, paths, status, overrides):
                     output_only = action == "set" and body.get("key") == "flip_up"
                     if not cur.get("paused") and not output_only:
                         raise ValueError("pause training before changing its settings")
-                elif action in ("pause", "resume"):
-                    raise ValueError("only the running capture can be paused")
+                elif action in ("pause", "resume", "snapshot"):
+                    raise ValueError("only the running capture can be paused or snapshotted")
                 overrides.apply(name, body)
                 status.write(load_config())
                 self.send(200, b'{"ok":true}', "application/json")
@@ -1421,6 +1438,7 @@ def process(cfg, paths, state, status, item, beat):
         if not job.get("quality"):
             job["quality"] = find_capture_quality(job_dir / "data")
         out_dir = job_dir / "out"
+        job["out_dir"], job["job_dir"] = str(out_dir), str(job_dir)
         pending = lambda: effective_settings(load_config(), status.overrides.get(name))
         refined = None   # (folder, stats), computed once per job
         warnings = []
@@ -1528,16 +1546,169 @@ def process(cfg, paths, state, status, item, beat):
 
 
 def record(state, job, result, duration, detail):
-    state.setdefault("history", []).append({
-        "name": job["name"], "result": result, "duration": duration, "detail": detail,
-        "finished": f"{dt.datetime.now():%m-%d %H:%M}", "finished_ts": time.time(),
-        "preview": job.get("preview"), "thumb": job.get("thumb"),
-        "kind": job.get("kind"), "frames": job.get("frames"),
-        "settings": job.get("settings"), "train_seconds": job.get("train_seconds"),
-        "file": job.get("file"),
-        "files": job.get("files"), "quality": job.get("quality")})
-    state["history"] = state["history"][-50:]
-    save_state(state)
+    with STATE_LOCK:
+        state.setdefault("history", []).append({
+            "name": job["name"], "result": result, "duration": duration, "detail": detail,
+            "finished": f"{dt.datetime.now():%m-%d %H:%M}", "finished_ts": time.time(),
+            "preview": job.get("preview"), "thumb": job.get("thumb"),
+            "kind": job.get("kind"), "frames": job.get("frames"),
+            "settings": job.get("settings"), "train_seconds": job.get("train_seconds"),
+            "file": job.get("file"),
+            "files": job.get("files"), "quality": job.get("quality")})
+        state["history"] = state["history"][-50:]
+        save_state(state)
+
+
+# ---------------------------------------------------------------- snapshots
+
+def memory_free_pct():
+    r = subprocess.run(["memory_pressure"], capture_output=True, text=True)
+    m = re.search(r"free percentage: (\d+)%", r.stdout)
+    return int(m.group(1)) if m else 0
+
+
+class Snapshots:
+    """Mid-training snapshots. request() hard-links the latest checkpoint aside (instant,
+    no extra disk or memory); a worker thread turns queued snapshots into normal results
+    (<name>-step<N>) only when that can't squeeze the running training job."""
+
+    def __init__(self, paths, state, status):
+        self.paths, self.state, self.status = paths, state, status
+        self.wake = threading.Event()
+        with STATE_LOCK:
+            for snap in state.setdefault("snapshots", []):
+                if snap["state"] == "processing":   # interrupted by a restart
+                    snap["state"] = "queued"
+
+    def for_job(self, name):
+        with STATE_LOCK:
+            return [dict(s) for s in self.state.get("snapshots", []) if s["name"] == name][-6:]
+
+    def pending(self):
+        with STATE_LOCK:
+            return sum(s["state"] in ("queued", "processing") for s in self.state.get("snapshots", []))
+
+    def request(self, job):
+        out_dir = Path(job.get("out_dir") or "")
+        step = latest_step(out_dir, "export") if out_dir.is_dir() else None
+        if not step:
+            raise ValueError("no checkpoint yet (Brush saves one every checkpoint_every steps)")
+        with STATE_LOCK:
+            if any(s["name"] == job["name"] and s["step"] == step and s["state"] != "failed"
+                   for s in self.state["snapshots"]):
+                raise ValueError(f"step {step:,} is already snapshotted; wait for the next checkpoint")
+        keep = Path(job["job_dir"]) / "snapshots" / f"export_{step}.ply"
+        keep.parent.mkdir(parents=True, exist_ok=True)
+        if not keep.exists():
+            try:
+                os.link(out_dir / f"export_{step}.ply", keep)   # same volume: instant
+            except OSError:
+                shutil.copyfile(out_dir / f"export_{step}.ply", keep)
+        preview = f"{job['name']}_step{step:05d}.jpg"
+        snap = {"name": job["name"], "step": step, "total": job.get("total"), "src": str(keep),
+                "state": "queued", "requested": time.time(), "error": None,
+                "settings": dict(job.get("settings") or {}), "frames": job.get("frames"),
+                "quality": job.get("quality"), "thumb": job.get("thumb"),
+                "preview": preview if (self.paths.previews / preview).exists() else job.get("preview")}
+        with STATE_LOCK:
+            self.state["snapshots"].append(snap)
+            self.state["snapshots"] = self.state["snapshots"][-30:]
+            save_state(self.state)
+        log(f"snapshot queued: {job['name']} step {step}")
+        self.wake.set()
+        return step
+
+    def safe_to_run(self, cfg):
+        c = self.status.current
+        if not c:
+            return True, ""
+        if c.get("phase") in ("compressing", "flipping") or "refining" in str(c.get("phase")):
+            return False, "waiting for the running capture's own processing"
+        free = memory_free_pct()
+        need = int(cfg.get("snapshot_min_free_pct", 25))
+        if free >= need:
+            return True, ""
+        return False, f"waiting for memory ({free}% free, needs {need}%) or for training to finish"
+
+    def run_forever(self):
+        while True:
+            self.wake.wait(20)
+            self.wake.clear()
+            try:
+                cfg = load_config()
+                with STATE_LOCK:
+                    queued = [s for s in self.state.get("snapshots", []) if s["state"] == "queued"]
+                if not queued:
+                    continue
+                ok, why = self.safe_to_run(cfg)
+                with STATE_LOCK:
+                    for s in queued:
+                        s["waiting"] = why
+                if ok:
+                    self.process(cfg, queued[0])
+            except Exception as e:
+                log(f"snapshot worker error: {e}\n{traceback.format_exc()}")
+
+    def process(self, cfg, snap):
+        with STATE_LOCK:
+            snap["state"], snap["waiting"] = "processing", ""
+            save_state(self.state)
+        label = f"{snap['name']}-step{snap['step']}"
+        t0 = time.time()
+        work = self.paths.jobs / snap["name"] / "snapshots" / label
+        try:
+            src = Path(snap["src"])
+            if not src.exists():
+                raise RuntimeError("checkpoint file is gone")
+            shutil.rmtree(work, ignore_errors=True)
+            work.mkdir(parents=True)
+            flip = bool(snap["settings"].get("flip_up"))
+            ply, errors = src, []
+            if flip:
+                err = flip_ply(cfg, src, work / f"{label}.ply")
+                if err:
+                    errors.append(f"flip: {err}")
+                    flip = False
+                else:
+                    ply = work / f"{label}.ply"
+            sizes, more = compress(cfg, ply, work, label, lambda: None)
+            errors += more
+            dest = self.paths.outbox / label
+            dest.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ply, dest / f"{label}.ply")
+            for fmt in sizes:
+                shutil.copyfile(work / f"{label}.{fmt}", dest / f"{label}.{fmt}")
+            if snap.get("preview") and (self.paths.previews / snap["preview"]).exists():
+                shutil.copyfile(self.paths.previews / snap["preview"], dest / "preview.jpg")
+            files = {"ply": (dest / f"{label}.ply").stat().st_size, **sizes}
+            job = {"name": label, "settings": snap["settings"], "frames": snap["frames"],
+                   "quality": snap["quality"], "preview": snap.get("preview"), "thumb": snap.get("thumb"),
+                   "files": files}
+            write_meta(dest, job, files, flip)
+            meta = json.loads((dest / "meta.json").read_text())
+            meta["snapshot"] = {"of": snap["name"], "step": snap["step"], "total_steps": snap["total"]}
+            (dest / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+            share_result(cfg, dest)
+            detail = (f"step {snap['step']:,}/{(snap['total'] or 0):,} · "
+                      + f"{files['ply'] / 1e6:.0f} MB ply" + "".join(f" · {b / 1e6:.0f} MB {f}" for f, b in sizes.items())
+                      + (f"  ({'; '.join(errors)})" if errors else ""))
+            record(self.state, job, "snapshot", fmt_dur(time.time() - t0), detail)
+            with STATE_LOCK:
+                snap["state"] = "done"
+                save_state(self.state)
+            src.unlink(missing_ok=True)
+            shutil.rmtree(work, ignore_errors=True)
+            log(f"snapshot done: {label}")
+            img = None
+            if snap.get("preview") and (self.paths.previews / snap["preview"]).exists():
+                img = self.paths.attach / snap["preview"]
+                shutil.copyfile(self.paths.previews / snap["preview"], img)
+            imessage(cfg, f"📸 {label}: snapshot ready ({detail})", img)
+        except Exception as e:
+            log(f"snapshot failed: {label}: {e}\n{traceback.format_exc()}")
+            with STATE_LOCK:
+                snap["state"], snap["error"] = "failed", str(e)[:160]
+                save_state(self.state)
 
 
 def current_rate(job, state):
@@ -1601,6 +1772,8 @@ def main():
     inbox = Inbox(paths)
     overrides = Overrides()
     status = Status(paths, state, inbox, overrides)
+    status.snapshots = Snapshots(paths, state, status)
+    threading.Thread(target=status.snapshots.run_forever, daemon=True).start()
     start_dashboard(cfg, paths, status, overrides)
     log(f"GaussQueue started, watching {paths.inbox}")
     last_beat = [0.0]
@@ -1628,7 +1801,8 @@ def main():
                 process(cfg, paths, state, status, ready[0], beat)
                 continue  # rescan immediately
             cleanup_jobs(paths, cfg["keep_work_days"])
-            reload_if_changed()
+            if not status.snapshots.pending():   # never reload mid-snapshot
+                reload_if_changed()
         except Exception as e:
             log(f"loop error: {e}\n{traceback.format_exc()}")
         time.sleep(cfg["poll_seconds"])

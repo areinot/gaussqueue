@@ -59,7 +59,9 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 99px;
   border: 1px solid currentColor; text-transform: uppercase; letter-spacing: .04em; }
 .b-queued { color: var(--accent); } .b-arriving { color: var(--warn); }
-.b-done { color: var(--ok); } .b-FAILED { color: var(--bad); }
+.b-done { color: var(--ok); } .b-FAILED { color: var(--bad); } .b-snapshot { color: var(--accent); }
+.snaps { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 2px; }
+.snaps .s-done { color: var(--ok); } .snaps .s-failed { color: var(--bad); }
 .history .row { display: grid; grid-template-columns: 96px minmax(0, 1fr) auto; gap: 14px; align-items: center;
   padding: 10px 12px; border-top: 1px solid var(--line); }
 .history .row:first-child { border-top: 0; }
@@ -219,11 +221,19 @@ function renderNow(c) {
       <div class="controls" data-item="${esc(c.name)}">
         ${c.paused
           ? `<button class="primary" data-act="resume">${changed ? "Restart with new settings" : "Resume"}</button>
-             <span class="badge b-paused">paused</span>`
+             <span class="badge b-paused">paused</span>
+             <button data-act="snapshot" title="Turn the latest checkpoint into a result you can open now (as <name>-step<N>).">Publish snapshot</button>`
           : `<button data-act="pause">Pause</button>
+             <button data-act="snapshot" title="Turn the latest checkpoint into a result you can open now (as <name>-step<N>). Training keeps going; processing waits until it can't slow the run.">Publish snapshot</button>
              ${flipBox(pend && pend.flip_up)}`}
       </div>
       ${!c.paused && itemErrors[c.name] ? `<div class="serr">${esc(itemErrors[c.name])}</div>` : ""}
+      ${(c.snapshots || []).length ? `<div class="snaps">${c.snapshots.map(sn => {
+          const label = sn.state === "done" ? "✓ ready in the outbox"
+            : sn.state === "processing" ? "processing…"
+            : sn.state === "failed" ? `failed: ${esc(sn.error || "")}`
+            : `queued${sn.waiting ? `: ${esc(sn.waiting)}` : ""}`;
+          return `<div class="s-${esc(sn.state)}">📸 step ${(sn.step || 0).toLocaleString()}: ${label}</div>`; }).join("")}</div>` : ""}
       ${c.paused ? `${settingsHTML({name: c.name, settings: pend, photo_px: c.photo_px}, true)}
         <div class="meta">${changed ? "Changed settings restart training from step 0 (the capture stays on local disk)." : "Change settings to restart from step 0 with them, or resume where it stopped."}</div>` : ""}` : "";
   // Time-dependent values (elapsed, ETA) are left as empty slots and filled by tick().

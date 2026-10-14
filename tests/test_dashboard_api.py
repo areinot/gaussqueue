@@ -263,6 +263,31 @@ class DashboardAPITest(unittest.TestCase):
         self.assertEqual((st["total_steps"], st["max_resolution"]), (3000, 720))
         self.assertEqual(gq.Inbox.photo_size_from("# c\n1 PINHOLE 1920 1440 1 1 1 1\n"), 1920)
 
+    def test_snapshot_requests(self):
+        gq, root = self.gq, Path(self.tmp.name)
+        snaps = gq.Snapshots(self.inbox.paths, self.status.state, self.status)
+        self.status.snapshots = snaps
+        out = root / "work" / "capA" / "out"
+        out.mkdir(parents=True)
+        job = {"name": "capA", "phase": "training", "paused": False, "total": 3000,
+               "out_dir": str(out), "job_dir": str(out.parent), "settings": {}}
+        self.status.current = job
+        try:
+            code, body = self.post({"name": "capA", "action": "snapshot"})
+            self.assertEqual(code, 400)
+            self.assertIn("no checkpoint yet", body)
+            (out / "export_500.ply").write_text("ply")
+            code, body = self.post({"name": "capA", "action": "snapshot"})
+            self.assertEqual(code, 200)
+            self.assertEqual(body["step"], 500)
+            self.assertTrue((out.parent / "snapshots" / "export_500.ply").exists())  # set aside
+            self.assertEqual(snaps.pending(), 1)
+            self.assertIn("already snapshotted", self.post({"name": "capA", "action": "snapshot"})[1])
+            self.assertEqual(self.post({"name": "capB", "action": "snapshot"})[0], 400)
+        finally:
+            self.status.current = None
+            self.status.state["snapshots"] = []
+
     def test_snapshot_has_estimates_and_presets(self):
         snap = self.snapshot()
         self.assertEqual(set(snap["presets"]), {"preview", "fast", "standard", "high"})

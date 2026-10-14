@@ -65,6 +65,11 @@ structure-from-motion step. Any capture that contains a COLMAP model
   minutes. It shows whether a capture holds together (no ghosting, right way up, decent
   coverage) before you commit to hours of training. It can't predict fine detail. The
   resolution choices only go up to the capture's own photo size, since photos are never upscaled.
+- **Mid-training snapshots.** *Publish snapshot* on the running capture turns its latest
+  checkpoint into a normal result, `<name>-step<N>`: flipped `.ply`, `.sog`/`.spz`,
+  preview and `meta.json`, plus the phone copies. Training keeps going. The checkpoint is
+  hard-linked aside instantly. Processing waits until at least `snapshot_min_free_pct`
+  (default 25 %) of memory is free, or until training finishes, so it can't squeeze the run.
 - **Pause and tweak.** Pause the running capture: Brush is frozen in place
   (`SIGSTOP`) and the Mac is allowed to sleep. Resume to carry on where it stopped,
   or change its settings while it's paused and resume to restart it from step 0 with
