@@ -17,5 +17,9 @@
     "subsample_frames": 1
   },
   "settle_seconds": 30,
-  "keep_work_days": 7
+  "keep_work_days": 7,
+  "compress": [
+    "sog",
+    "spz"
+  ]
 }

@@ -31,6 +31,9 @@ structure-from-motion step. Any capture that contains a COLMAP model
 - **Per-capture quality settings.** Fast / Standard / High presets, or set the steps,
   resolution, SH degree, splat cap and frame subsampling yourself. Captures can also be
   held or moved to the front. Each queued capture shows an estimated duration.
+- **Compressed copies.** Each result also gets `.sog` and `.spz` versions made with
+  [SplatTransform](https://github.com/playcanvas/splat-transform). They're typically
+  10–15× smaller than the `.ply` and much easier to open on a phone (e.g. in SuperSplat).
 - **Pause and tweak.** Pause the running capture: Brush is frozen in place
   (`SIGSTOP`) and the Mac is allowed to sleep. Resume to carry on where it stopped,
   or change its settings while it's paused and resume to restart it from step 0 with
@@ -47,6 +50,8 @@ structure-from-motion step. Any capture that contains a COLMAP model
   It uses the built-in macOS tools `brctl`, `sips`, `caffeinate`, `osascript` and launchd.
 - Python 3.9+. The system `python3` from the Xcode Command Line Tools is fine. There are
   no third-party packages.
+- Optional: [Node.js](https://nodejs.org) for the `.sog`/`.spz` compression step
+  (`brew install node`). Without it, results are `.ply` only.
 - For iMessage notifications: the Messages app signed in to iMessage on the Mac.
 
 ## Install
@@ -59,7 +64,8 @@ scripts/install.sh --inbox "~/Library/Mobile Documents/com~apple~CloudDocs/Gauss
 
 `install.sh`:
 
-1. downloads Brush v0.3.0 and verifies its SHA-256,
+1. downloads Brush v0.3.0 and verifies its SHA-256, then, if Node.js is present,
+   installs SplatTransform 3.10.1 into a private folder (not a global npm install),
 2. writes `~/Library/Application Support/GaussQueue/config.json` from
    [`config.example.json`](config.example.json). By default the outbox and status
    folders go next to the inbox. Pass `--outbox`, `--status` or `--work` to put them elsewhere.
@@ -75,7 +81,7 @@ which leaves your data in place.
 |---|---|---|
 | `inbox_dir` | *(required)* | Captures to train. Processed items move to `inbox/done/` or `inbox/failed/`. |
 | `work_dir` | `~/Library/Application Support/GaussQueue/work` | Unpacked captures and training output. **Keep this out of iCloud.** Note that `~/Documents` *is* in iCloud if "Desktop & Documents Folders" is enabled. Cleaned up after `keep_work_days`. |
-| `outbox_dir` | next to the inbox | One folder per capture: `<name>.ply`, `preview.jpg`, `train.log`. Nothing else is written here, so it is safe to share. |
+| `outbox_dir` | next to the inbox | One folder per capture: `<name>.ply`, `<name>.sog`, `<name>.spz`, `preview.jpg`, `train.log`. Nothing else is written here, so it is safe to share. |
 | `status_dir` | next to the inbox | `STATUS.txt` and preview JPGs. Put it in iCloud to check progress from your phone. |
 
 App state (`config.json`, `state.json`, `overrides.json`, `gaussqueue.log`, the Brush
@@ -89,6 +95,7 @@ The exception is `dashboard_port`, which needs a restart.
 | Key | Default | |
 |---|---|---|
 | `standard` | 15k steps, 1440 px, SH 3, ≤10M splats | The default preset. *Fast* and *High* are fixed. |
+| `compress` | `["sog", "spz"]` | Compressed formats written next to the `.ply`. Use `[]` to turn this off. If compression fails, the capture still counts as done, and the problem is noted in the history. |
 | `imessage_to` | `""` (off) | Phone number or Apple ID email to text. |
 | `notify_checkpoints` | `[0.25, 0.5, 0.75]` | Fractions of training that trigger a progress text. |
 | `settle_seconds` | `30` | How long an inbox item must stay unchanged before it's trained. |

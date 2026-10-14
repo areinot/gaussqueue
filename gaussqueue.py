@@ -44,6 +44,9 @@ DEFAULTS = {
     "status_dir": str(APP_HOME / "status"),  # STATUS.txt + preview JPGs
     "attach_dir": "~/Pictures/GaussQueue",   # staging for iMessage image attachments
     "brush": str(APP_HOME / "bin/brush_app"),
+    # Compressed copies written next to the .ply (needs SplatTransform; [] = off)
+    "compress": ["sog", "spz"],
+    "splat_transform": str(APP_HOME / "tools/splat-transform/node_modules/.bin/splat-transform"),
     "imessage_to": "",                       # phone number or Apple ID email; empty = off
     "notify_checkpoints": [0.25, 0.5, 0.75], # fractions of training to text a preview at
     "poll_seconds": 5,
@@ -194,7 +197,8 @@ def load_config():
             log("config.json has no inbox_dir, keeping previous config")
             return _last_good_config
         raise ConfigError("config.json must set inbox_dir")
-    for k in ("inbox_dir", "outbox_dir", "work_dir", "status_dir", "attach_dir", "brush"):
+    for k in ("inbox_dir", "outbox_dir", "work_dir", "status_dir", "attach_dir", "brush",
+              "splat_transform"):
         cfg[k] = str(Path(cfg[k]).expanduser())
     _last_good_config = cfg
     return cfg
@@ -903,6 +907,42 @@ def train(cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
     return final
 
 
+COMPRESS_FORMATS = ("sog", "spz")
+
+
+def compress(cfg, ply, out_dir, name, beat):
+    """Write <name>.<fmt> for each configured format with SplatTransform.
+    Returns ({fmt: bytes}, [error strings]); failures never fail the job."""
+    formats = [f for f in cfg.get("compress") or [] if f in COMPRESS_FORMATS]
+    if not formats:
+        return {}, []
+    tool = cfg["splat_transform"]
+    if not os.access(tool, os.X_OK):
+        return {}, [f"compression skipped: SplatTransform not found at {tool}"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sizes, errors = {}, []
+    for fmt in formats:
+        dst = out_dir / f"{name}.{fmt}"
+        # -N drops NaN/degenerate splats, which some viewers choke on
+        proc = subprocess.Popen([tool, "--no-tty", "-q", "-w", str(ply), "-N", str(dst)],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        deadline = time.time() + 1800
+        while proc.poll() is None and time.time() < deadline:
+            beat()
+            time.sleep(1)
+        if proc.poll() is None:
+            proc.kill()
+            errors.append(f"{fmt}: timed out")
+            continue
+        out = proc.stdout.read().strip()
+        if proc.returncode or not dst.exists():
+            errors.append(f"{fmt}: {(out.splitlines() or ['failed'])[-1][:120]}")
+            log(f"compress {fmt} failed for {name}: {out[-500:]}")
+            continue
+        sizes[fmt] = dst.stat().st_size
+    return sizes, errors
+
+
 def process(cfg, paths, state, status, item, beat):
     name = item.name
     job_dir = paths.jobs / name
@@ -934,11 +974,17 @@ def process(cfg, paths, state, status, item, beat):
             imessage(cfg, f"🔁 {name}: restarting with new settings "
                           f"({settings_summary(job['settings'])})")
 
+        job["phase"] = "compressing"
+        beat()
+        sizes, cerrors = compress(cfg, final, job_dir / "compressed", name, beat)
+
         job["phase"] = "uploading result to iCloud"
         beat()
         dest = paths.outbox / name
         dest.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(final, dest / f"{name}.ply")
+        for fmt in sizes:   # built locally, copied whole, so the outbox never sees partial files
+            shutil.copyfile(job_dir / "compressed" / f"{name}.{fmt}", dest / f"{name}.{fmt}")
         shutil.copyfile(job_dir / "train.log", dest / "train.log")
         if job.get("preview"):
             shutil.copyfile(paths.previews / job["preview"], dest / "preview.jpg")
@@ -948,13 +994,16 @@ def process(cfg, paths, state, status, item, beat):
         shutil.move(str(item.path), paths.done / item.path.name)
         dur = fmt_dur(time.time() - t0)
         size_mb = (dest / f"{name}.ply").stat().st_size / 1e6
-        record(state, job, "done", dur, f"{size_mb:.0f} MB")
+        files = f"{size_mb:.0f} MB ply" + "".join(f" · {b / 1e6:.0f} MB {f}" for f, b in sizes.items())
+        job["files"] = {"ply": int(size_mb * 1e6), **sizes}
+        record(state, job, "done", dur, files + ("  (" + "; ".join(cerrors) + ")" if cerrors else ""))
         log(f"done: {name} in {dur}")
         img = None
         if job.get("preview"):
             img = paths.attach / job["preview"]
             shutil.copyfile(paths.previews / job["preview"], img)
-        imessage(cfg, f"✅ {name}: done in {dur}. {name}.ply ({size_mb:.0f} MB) is in the outbox", img)
+        imessage(cfg, f"✅ {name}: done in {dur}. In the outbox: {files}"
+                      + (f". Compression problem: {'; '.join(cerrors)}" if cerrors else ""), img)
     except Exception as e:
         if not item.path.exists():
             # Pulled out of the inbox (moved, renamed, re-zipped): not a failure.
@@ -979,7 +1028,8 @@ def record(state, job, result, duration, detail):
         "finished": f"{dt.datetime.now():%m-%d %H:%M}", "finished_ts": time.time(),
         "preview": job.get("preview"), "thumb": job.get("thumb"),
         "kind": job.get("kind"), "frames": job.get("frames"),
-        "settings": job.get("settings"), "train_seconds": job.get("train_seconds")})
+        "settings": job.get("settings"), "train_seconds": job.get("train_seconds"),
+        "files": job.get("files")})
     state["history"] = state["history"][-50:]
     save_state(state)
 
@@ -1093,6 +1143,12 @@ def check():
     else:
         print(f"✗ brush not found/executable: {cfg['brush']}")
         ok = False
+    if cfg.get("compress"):
+        if os.access(cfg["splat_transform"], os.X_OK):
+            print(f"✓ splat-transform: {cfg['splat_transform']} (compress: {', '.join(cfg['compress'])})")
+        else:
+            print(f"! splat-transform not found ({cfg['splat_transform']}); "
+                  "results will be .ply only. install.sh installs it when Node.js is available.")
     for tool in ("brctl", "sips", "caffeinate", "osascript"):
         if not shutil.which(tool):
             print(f"✗ missing macOS tool: {tool}")

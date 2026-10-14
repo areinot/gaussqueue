@@ -5,6 +5,8 @@
 #                      [--no-brush] [--no-start]
 #
 # - Downloads a pinned Brush release (checksum-verified) into $GAUSSQUEUE_HOME/bin
+# - If Node.js is available, installs a pinned SplatTransform (for .sog/.spz output)
+#   into $GAUSSQUEUE_HOME/tools (a private npm prefix, not a global install)
 # - Writes $GAUSSQUEUE_HOME/config.json from config.example.json if there isn't one
 #   (existing configs are never overwritten; the --dir flags only apply to new ones)
 # - Renders the launchd plist and (re)starts the agent
@@ -15,6 +17,7 @@ set -euo pipefail
 BRUSH_VERSION="v0.3.0"
 BRUSH_ASSET="brush-app-aarch64-apple-darwin.tar.xz"
 BRUSH_SHA256="65b2631398c839be3c1d4d7160fe2326389dec87830aac0710985e6690a1048c"
+SPLAT_TRANSFORM_VERSION="3.10.1"   # @playcanvas/splat-transform, for .sog/.spz output
 LABEL="com.gaussqueue.agent"
 
 REPO="${0:A:h:h}"
@@ -56,6 +59,20 @@ if (( want_brush )) && [[ ! -x "$APP_HOME/bin/brush_app" ]]; then
   tar -xf "$tmp/brush.tar.xz" -C "$tmp"
   install -m 755 "$tmp"/brush-app-*/brush_app "$APP_HOME/bin/brush_app"
   echo "Installed Brush to $APP_HOME/bin/brush_app"
+fi
+
+# --- SplatTransform (optional compression) ----------------------------------
+ST_DIR="$APP_HOME/tools/splat-transform"
+if command -v npm >/dev/null; then
+  have="$("$ST_DIR/node_modules/.bin/splat-transform" --version 2>/dev/null | awk '{print $2}' || true)"
+  if [[ "$have" != "v$SPLAT_TRANSFORM_VERSION" ]]; then
+    echo "Installing SplatTransform $SPLAT_TRANSFORM_VERSION…"
+    mkdir -p "$ST_DIR"
+    npm install --no-fund --no-audit --silent --prefix "$ST_DIR" \
+      "@playcanvas/splat-transform@$SPLAT_TRANSFORM_VERSION"
+  fi
+else
+  echo "Node.js not found: skipping SplatTransform; results will be .ply only (brew install node, then rerun)."
 fi
 
 # --- config ------------------------------------------------------------------
