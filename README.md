@@ -34,6 +34,11 @@ structure-from-motion step. Any capture that contains a COLMAP model
 - **Compressed copies.** Each result also gets `.sog` and `.spz` versions made with
   [SplatTransform](https://github.com/playcanvas/splat-transform). They're typically
   10–15× smaller than the `.ply` and much easier to open on a phone (e.g. in SuperSplat).
+- **Right way up.** SplatKing/COLMAP captures use +Y as up, but most splat viewers treat
+  −Y as up, so results look upside down. With `flip_up` (on in the example config; it can
+  also be set per capture, even mid-training), results are rotated 180° about X before
+  compression. The rotation covers the view-dependent colour data too. `meta.json` records
+  what was applied.
 - **Pause and tweak.** Pause the running capture: Brush is frozen in place
   (`SIGSTOP`) and the Mac is allowed to sleep. Resume to carry on where it stopped,
   or change its settings while it's paused and resume to restart it from step 0 with
@@ -81,7 +86,7 @@ which leaves your data in place.
 |---|---|---|
 | `inbox_dir` | *(required)* | Captures to train. Processed items move to `inbox/done/` or `inbox/failed/`. |
 | `work_dir` | `~/Library/Application Support/GaussQueue/work` | Unpacked captures and training output. **Keep this out of iCloud.** Note that `~/Documents` *is* in iCloud if "Desktop & Documents Folders" is enabled. Cleaned up after `keep_work_days`. |
-| `outbox_dir` | next to the inbox | One folder per capture: `<name>.ply`, `<name>.sog`, `<name>.spz`, `preview.jpg`, `train.log`. Nothing else is written here, so it is safe to share. |
+| `outbox_dir` | next to the inbox | One folder per capture: `<name>.ply`, `<name>.sog`, `<name>.spz`, `preview.jpg`, `meta.json`, `train.log`. Nothing else is written here, so it is safe to share. |
 | `status_dir` | next to the inbox | `STATUS.txt` and preview JPGs. Put it in iCloud to check progress from your phone. |
 
 App state (`config.json`, `state.json`, `overrides.json`, `gaussqueue.log`, the Brush
@@ -96,6 +101,7 @@ The exception is `dashboard_port`, which needs a restart.
 |---|---|---|
 | `standard` | 15k steps, 1440 px, SH 3, ≤10M splats | The default preset. *Fast* and *High* are fixed. |
 | `compress` | `["sog", "spz"]` | Compressed formats written next to the `.ply`. Use `[]` to turn this off. If compression fails, the capture still counts as done, and the problem is noted in the history. |
+| `flip_up` | `false` (example config: `true`) | Rotate results 180° about X so they're the right way up in SuperSplat and similar viewers. |
 | `imessage_to` | `""` (off) | Phone number or Apple ID email to text. |
 | `notify_checkpoints` | `[0.25, 0.5, 0.75]` | Fractions of training that trigger a progress text. |
 | `settle_seconds` | `30` | How long an inbox item must stay unchanged before it's trained. |
@@ -111,6 +117,15 @@ permission to control Messages. Image attachments are staged in
 some other locations. If you text the same Apple ID that the Mac is signed in with, the
 phone may receive the message silently. Texting a different handle, such as your phone
 number, makes sure it alerts.
+
+### Fixing results you already have
+
+```bash
+python3 gaussqueue.py --flip "<outbox>/<capture>" ["<outbox>/<capture2>" …]
+```
+
+This rotates the `.ply` in place, rebuilds the `.sog`/`.spz` from it, and toggles the
+rotation recorded in `meta.json`. Running it twice restores the original orientation.
 
 ## Dashboard API
 

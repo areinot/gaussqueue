@@ -142,6 +142,28 @@ class DashboardAPITest(unittest.TestCase):
         finally:
             self.status.current = None
 
+    def test_flip_is_output_only(self):
+        gq = self.gq
+        # Presets and reset leave the flip choice alone.
+        self.post({"name": "capA", "action": "set", "key": "flip_up", "value": 1})
+        self.post({"name": "capA", "action": "preset", "value": "fast"})
+        st = gq.effective_settings(self.cfg, self.overrides.get("capA"))
+        self.assertEqual((st["flip_up"], st["preset"]), (1, "fast"))
+        self.post({"name": "capA", "action": "reset"})
+        self.assertEqual(gq.effective_settings(self.cfg, self.overrides.get("capA"))["flip_up"], 1)
+        # Changing only the flip never forces a training restart.
+        a = gq.effective_settings(self.cfg, {})
+        self.assertTrue(gq.same_settings(a, dict(a, flip_up=1 - a["flip_up"])))
+        # The running capture can be flipped without pausing; other edits can't.
+        self.status.current = {"name": "capB", "phase": "training", "paused": False}
+        try:
+            self.assertEqual(self.post({"name": "capB", "action": "set", "key": "flip_up",
+                                        "value": 1})[0], 200)
+            self.assertEqual(self.post({"name": "capB", "action": "set", "key": "sh_degree",
+                                        "value": 1})[0], 400)
+        finally:
+            self.status.current = None
+
     def test_snapshot_has_estimates_and_presets(self):
         snap = self.snapshot()
         self.assertEqual(set(snap["presets"]), {"fast", "standard", "high"})

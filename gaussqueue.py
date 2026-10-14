@@ -46,6 +46,9 @@ DEFAULTS = {
     "brush": str(APP_HOME / "bin/brush_app"),
     # Compressed copies written next to the .ply (needs SplatTransform; [] = off)
     "compress": ["sog", "spz"],
+    # Rotate results 180° about X so "up" is up in SuperSplat & co. (SplatKing/COLMAP
+    # captures are +Y-up, most splat viewers expect -Y-up). Per-capture override on the dashboard.
+    "flip_up": False,
     "splat_transform": str(APP_HOME / "tools/splat-transform/node_modules/.bin/splat-transform"),
     "imessage_to": "",                       # phone number or Apple ID email; empty = off
     "notify_checkpoints": [0.25, 0.5, 0.75], # fractions of training to text a preview at
@@ -66,10 +69,11 @@ DEFAULTS = {
 
 # Per-item processing settings, editable from the dashboard. "standard" comes
 # from config.json, so editing config still changes the default.
-SETTING_KEYS = ("total_steps", "max_resolution", "sh_degree", "max_splats", "subsample_frames")
+TRAIN_KEYS = ("total_steps", "max_resolution", "sh_degree", "max_splats", "subsample_frames")
+SETTING_KEYS = TRAIN_KEYS + ("flip_up",)   # flip_up only affects output files
 SETTING_LIMITS = {"total_steps": (500, 100_000), "max_resolution": (256, 4096),
                   "sh_degree": (0, 3), "max_splats": (50_000, 20_000_000),
-                  "subsample_frames": (1, 20)}
+                  "subsample_frames": (1, 20), "flip_up": (0, 1)}
 PRESETS = {
     "fast": {"total_steps": 7000, "max_resolution": 1080, "sh_degree": 2,
              "max_splats": 1_500_000, "subsample_frames": 1},
@@ -80,7 +84,7 @@ PRESETS = {
 def standard_settings(cfg):
     st = dict(DEFAULTS["standard"])
     st.update(cfg.get("standard") or {})
-    return {k: int(st[k]) for k in SETTING_KEYS}
+    return {k: int(st[k]) for k in TRAIN_KEYS}
 
 
 def effective_settings(cfg, ov):
@@ -88,16 +92,18 @@ def effective_settings(cfg, ov):
     preset = ov.get("preset") or "standard"
     base = PRESETS.get(preset) or standard_settings(cfg)
     out = dict(base)
+    out["flip_up"] = int(bool(cfg.get("flip_up")))
     out.update({k: ov[k] for k in SETTING_KEYS if k in ov})
     out["base"] = preset
-    out["preset"] = preset if not any(k in ov for k in SETTING_KEYS) else "custom"
+    out["preset"] = preset if not any(k in ov for k in TRAIN_KEYS) else "custom"
     return out
 
 
 def settings_summary(st):
     return (f"{st['preset']}: {st['total_steps'] / 1000:g}k steps @ {st['max_resolution']}px, "
             f"SH{st['sh_degree']}, <={st['max_splats'] / 1e6:g}M splats"
-            + (f", every {st['subsample_frames']} frames" if st["subsample_frames"] > 1 else ""))
+            + (f", every {st['subsample_frames']} frames" if st["subsample_frames"] > 1 else "")
+            + (", flipped" if st.get("flip_up") else ""))
 
 
 class Overrides:
@@ -125,7 +131,7 @@ class Overrides:
             ov = self.data.setdefault(name, {})
             action = body.get("action")
             if action == "reset":
-                for k in ("preset",) + SETTING_KEYS:
+                for k in ("preset",) + TRAIN_KEYS:
                     ov.pop(k, None)
             elif action == "run_next":
                 ov["priority"] = time.time()
@@ -137,7 +143,7 @@ class Overrides:
             elif action == "preset":
                 if body.get("value") not in PRESETS:
                     raise ValueError("unknown preset")
-                for k in SETTING_KEYS:
+                for k in TRAIN_KEYS:
                     ov.pop(k, None)
                 ov["preset"] = body["value"]
             elif action == "set":
@@ -714,7 +720,8 @@ def start_dashboard(cfg, paths, status, overrides):
                         return self.send(200, b'{"ok":true}', "application/json")
                     if action in ("run_next", "hold"):
                         raise ValueError("already processing")
-                    if not cur.get("paused"):
+                    output_only = action == "set" and body.get("key") == "flip_up"
+                    if not cur.get("paused") and not output_only:
                         raise ValueError("pause training before changing its settings")
                 elif action in ("pause", "resume"):
                     raise ValueError("only the running capture can be paused")
@@ -796,7 +803,7 @@ RESTART = object()  # train() result: settings changed while paused, run again
 
 
 def same_settings(a, b):
-    return all(a[k] == b[k] for k in SETTING_KEYS)
+    return all(a[k] == b[k] for k in TRAIN_KEYS)
 
 
 def train(cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
@@ -912,39 +919,59 @@ def train(cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
 
 
 COMPRESS_FORMATS = ("sog", "spz")
+FLIP = "180,0,0"   # degrees about X, Y, Z
 
 
-def compress(cfg, ply, out_dir, name, beat):
-    """Write <name>.<fmt> for each configured format with SplatTransform.
-    Returns ({fmt: bytes}, [error strings]); failures never fail the job."""
-    formats = [f for f in cfg.get("compress") or [] if f in COMPRESS_FORMATS]
-    if not formats:
-        return {}, []
+def splat_transform(cfg, args, dst, beat=lambda: None, timeout=1800):
+    """Run SplatTransform; returns None on success or a short error string."""
     tool = cfg["splat_transform"]
     if not os.access(tool, os.X_OK):
-        return {}, [f"compression skipped: SplatTransform not found at {tool}"]
+        return f"SplatTransform not found at {tool}"
+    proc = subprocess.Popen([tool, "--no-tty", "-q", "-w"] + [str(a) for a in args],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    deadline = time.time() + timeout
+    while proc.poll() is None and time.time() < deadline:
+        beat()
+        time.sleep(1)
+    if proc.poll() is None:
+        proc.kill()
+        return "timed out"
+    out = proc.stdout.read().strip()
+    if proc.returncode or not Path(dst).exists():
+        log(f"splat-transform {' '.join(map(str, args))} failed: {out[-500:]}")
+        return (out.splitlines() or ["failed"])[-1][:120]
+    return None
+
+
+def compress(cfg, ply, out_dir, name, beat, formats=None):
+    """Write <name>.<fmt> for each configured format with SplatTransform.
+    Returns ({fmt: bytes}, [error strings]); failures never fail the job."""
+    if formats is None:
+        formats = [f for f in cfg.get("compress") or [] if f in COMPRESS_FORMATS]
     out_dir.mkdir(parents=True, exist_ok=True)
     sizes, errors = {}, []
     for fmt in formats:
         dst = out_dir / f"{name}.{fmt}"
         # -N drops NaN/degenerate splats, which some viewers choke on
-        proc = subprocess.Popen([tool, "--no-tty", "-q", "-w", str(ply), "-N", str(dst)],
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        deadline = time.time() + 1800
-        while proc.poll() is None and time.time() < deadline:
-            beat()
-            time.sleep(1)
-        if proc.poll() is None:
-            proc.kill()
-            errors.append(f"{fmt}: timed out")
-            continue
-        out = proc.stdout.read().strip()
-        if proc.returncode or not dst.exists():
-            errors.append(f"{fmt}: {(out.splitlines() or ['failed'])[-1][:120]}")
-            log(f"compress {fmt} failed for {name}: {out[-500:]}")
-            continue
-        sizes[fmt] = dst.stat().st_size
+        err = splat_transform(cfg, [ply, "-N", dst], dst, beat)
+        if err:
+            errors.append(f"{fmt}: {err}")
+        else:
+            sizes[fmt] = dst.stat().st_size
     return sizes, errors
+
+
+def flip_ply(cfg, src, dst, beat=lambda: None):
+    """Rotate a splat 180° about X (turns a +Y-up scene -Y-up and vice versa)."""
+    return splat_transform(cfg, [src, "-r", FLIP, "-N", dst], dst, beat)
+
+
+def write_meta(dest, job, files, flipped):
+    meta = {"name": job["name"], "finished": dt.datetime.now().isoformat(timespec="seconds"),
+            "settings": {k: v for k, v in (job.get("settings") or {}).items() if k != "base"},
+            "frames": job.get("frames"), "files": files,
+            "rotation_xyz_degrees": [180, 0, 0] if flipped else [0, 0, 0]}
+    (dest / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
 
 
 def process(cfg, paths, state, status, item, beat):
@@ -978,15 +1005,31 @@ def process(cfg, paths, state, status, item, beat):
             imessage(cfg, f"🔁 {name}: restarting with new settings "
                           f"({settings_summary(job['settings'])})")
 
+        # Output flip is read at the end, so it can be changed while training runs.
+        flip = bool(pending().get("flip_up"))
+        job["settings"]["flip_up"] = int(flip)
+        result_ply, cerrors = final, []
+        if flip:
+            job["phase"] = "flipping"
+            beat()
+            flipped = job_dir / "compressed" / f"{name}.ply"
+            flipped.parent.mkdir(parents=True, exist_ok=True)
+            err = flip_ply(cfg, final, flipped, beat)
+            if err:
+                cerrors.append(f"flip: {err}")
+                flip = False
+            else:
+                result_ply = flipped
         job["phase"] = "compressing"
         beat()
-        sizes, cerrors = compress(cfg, final, job_dir / "compressed", name, beat)
+        sizes, more = compress(cfg, result_ply, job_dir / "compressed", name, beat)
+        cerrors += more
 
         job["phase"] = "uploading result to iCloud"
         beat()
         dest = paths.outbox / name
         dest.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(final, dest / f"{name}.ply")
+        shutil.copyfile(result_ply, dest / f"{name}.ply")
         for fmt in sizes:   # built locally, copied whole, so the outbox never sees partial files
             shutil.copyfile(job_dir / "compressed" / f"{name}.{fmt}", dest / f"{name}.{fmt}")
         shutil.copyfile(job_dir / "train.log", dest / "train.log")
@@ -1000,6 +1043,7 @@ def process(cfg, paths, state, status, item, beat):
         size_mb = (dest / f"{name}.ply").stat().st_size / 1e6
         files = f"{size_mb:.0f} MB ply" + "".join(f" · {b / 1e6:.0f} MB {f}" for f, b in sizes.items())
         job["files"] = {"ply": int(size_mb * 1e6), **sizes}
+        write_meta(dest, job, job["files"], flip)
         record(state, job, "done", dur, files + ("  (" + "; ".join(cerrors) + ")" if cerrors else ""))
         log(f"done: {name} in {dur}")
         img = None
@@ -1129,6 +1173,56 @@ def main():
         time.sleep(cfg["poll_seconds"])
 
 
+def flip_results(folders):
+    """`--flip DIR...`: rotate existing results 180° about X in place (the .ply,
+    then regenerate any .sog/.spz next to it) and toggle meta.json. Flipping
+    twice restores the original orientation."""
+    cfg = load_config()
+    tmp = APP_HOME / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    status = 0
+    for folder in map(Path, folders):
+        name = folder.name
+        ply = folder / f"{name}.ply"
+        if not ply.exists():
+            print(f"✗ {folder}: no {name}.ply")
+            status = 1
+            continue
+        for f in folder.iterdir():  # make sure iCloud placeholders are real files
+            if is_dataless(f):
+                request_download(f)
+        while any(is_dataless(f) for f in folder.iterdir()):
+            time.sleep(2)
+        meta_path = folder / "meta.json"
+        try:
+            meta = json.loads(meta_path.read_text())
+        except Exception:
+            meta = {"name": name, "rotation_xyz_degrees": [0, 0, 0]}
+        print(f"↻ {name}: rotating {ply.stat().st_size / 1e6:.0f} MB .ply…", flush=True)
+        out = tmp / f"{name}.ply"
+        err = flip_ply(cfg, ply, out)
+        if err:
+            print(f"✗ {name}: {err}")
+            status = 1
+            continue
+        formats = [f for f in COMPRESS_FORMATS
+                   if (folder / f"{name}.{f}").exists() or f in (cfg.get("compress") or [])]
+        sizes, errors = compress(cfg, out, tmp, name, lambda: None, formats)
+        shutil.copyfile(out, ply)   # replace originals only after everything built
+        out.unlink()
+        for fmt in sizes:
+            shutil.copyfile(tmp / f"{name}.{fmt}", folder / f"{name}.{fmt}")
+            (tmp / f"{name}.{fmt}").unlink()
+        x = (meta.get("rotation_xyz_degrees", [0, 0, 0])[0] + 180) % 360
+        meta["rotation_xyz_degrees"] = [x, 0, 0]
+        meta["files"] = {"ply": ply.stat().st_size, **sizes}
+        meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+        print(f"✓ {name}: now rotated {x}° about X"
+              + (f" (problems: {'; '.join(errors)})" if errors else ""))
+        status |= bool(errors)
+    return status
+
+
 def check():
     """`--check`: validate config and tools; used by install.sh."""
     ok = True
@@ -1165,6 +1259,8 @@ def check():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--check":
         sys.exit(check())
+    elif len(sys.argv) > 2 and sys.argv[1] == "--flip":
+        sys.exit(flip_results(sys.argv[2:]))
     elif len(sys.argv) > 1 and sys.argv[1] == "--notify-test":
         cfg = load_config()
         paths = Paths(cfg)
