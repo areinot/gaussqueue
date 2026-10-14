@@ -19,7 +19,6 @@
   "settle_seconds": 30,
   "keep_work_days": 7,
   "compress": [
-    "sog",
     "spz"
   ],
   "flip_up": true,

@@ -47,11 +47,11 @@ DEFAULTS = {
     # Optional: also copy the small, phone-friendly files of each result here
     # (e.g. an iCloud folder) while the full results stay in outbox_dir.
     "share_dir": None,
-    "share_files": ["sog", "preview.jpg", "meta.json"],
+    "share_files": ["spz", "preview.jpg", "meta.json"],
     "attach_dir": "~/Pictures/GaussQueue",   # staging for iMessage image attachments
     "brush": str(APP_HOME / "bin/brush_app"),
-    # Compressed copies written next to the .ply (needs SplatTransform; [] = off)
-    "compress": ["sog", "spz"],
+    # Compressed copies written next to the .ply ([] = off)
+    "compress": ["spz"],
     # SPZ 4 (SplatTransform's default) isn't gzip-wrapped and many apps load it as empty;
     # 3 is the widely supported classic format.
     "spz_version": 3,
@@ -1392,7 +1392,7 @@ def train(cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
     return final
 
 
-COMPRESS_FORMATS = ("sog", "spz")
+COMPRESS_FORMATS = ("spz",)
 FLIP = "180,0,0"   # degrees about X, Y, Z
 
 
@@ -1441,7 +1441,8 @@ def run_native(cfg, args, dst, beat=lambda: None, timeout=3600):
 
 
 def compress(cfg, ply, out_dir, name, beat, formats=None):
-    """Write <name>.<fmt> for each configured format with SplatTransform.
+    """Write <name>.<fmt> for each configured format (natively with gq_spz when installed,
+    otherwise with SplatTransform).
     Returns ({fmt: bytes}, [error strings]); failures never fail the job."""
     if formats is None:
         formats = [f for f in cfg.get("compress") or [] if f in COMPRESS_FORMATS]
@@ -1450,12 +1451,11 @@ def compress(cfg, ply, out_dir, name, beat, formats=None):
     for fmt in formats:
         dst = out_dir / f"{name}.{fmt}"
         version = int(cfg.get("spz_version", 3))
-        if fmt == "spz" and native_spz(cfg):   # native: no WebAssembly memory ceiling
+        if native_spz(cfg):   # native: no WebAssembly memory ceiling
             err = run_native(cfg, [ply, dst, "--spz-version", version], dst, beat)
         else:
             # -N drops NaN/degenerate splats, which some viewers choke on
-            extra = ["--spz-version", version] if fmt == "spz" else []
-            err = splat_transform(cfg, [ply, "-N"] + extra + [dst], dst, beat)
+            err = splat_transform(cfg, [ply, "-N", "--spz-version", version, dst], dst, beat)
         if err:
             errors.append(f"{fmt}: {err}")
         else:
@@ -1474,7 +1474,7 @@ def flip_ply(cfg, src, dst, beat=lambda: None):
 
 def share_result(cfg, result_dir):
     """Copy the phone-friendly files of one result into share_dir/<name>/.
-    Entries in share_files are either a format ("sog" -> <name>.sog) or a filename."""
+    Entries in share_files are either a format ("spz" -> <name>.spz) or a filename."""
     if not cfg.get("share_dir"):
         return []
     name = result_dir.name
@@ -2219,7 +2219,7 @@ def main():
 
 def flip_results(folders):
     """`--flip DIR...`: rotate existing results 180° about X in place (the .ply,
-    then regenerate any .sog/.spz next to it) and toggle meta.json. Flipping
+    then regenerate the .spz next to it) and toggle meta.json. Flipping
     twice restores the original orientation."""
     cfg = load_config()
     tmp = APP_HOME / "tmp"
@@ -2291,7 +2291,7 @@ def check():
     else:
         print(f"✗ brush not found/executable: {cfg['brush']}")
         ok = False
-    if cfg.get("compress"):
+    if cfg.get("compress") and not native_spz(cfg):
         if os.access(cfg["splat_transform"], os.X_OK):
             print(f"✓ splat-transform: {cfg['splat_transform']} (compress: {', '.join(cfg['compress'])})")
         else:

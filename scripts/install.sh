@@ -5,7 +5,7 @@
 #                      [--no-brush] [--no-start]
 #
 # - Downloads a pinned Brush release (checksum-verified) into $GAUSSQUEUE_HOME/bin
-# - If Node.js is available, installs a pinned SplatTransform (for .sog/.spz output)
+# - If Node.js is available, installs a pinned SplatTransform (fallback .spz encoder/flip)
 #   into $GAUSSQUEUE_HOME/tools (a private npm prefix, not a global install)
 # - Writes $GAUSSQUEUE_HOME/config.json from config.example.json if there isn't one
 #   (existing configs are never overwritten; the --dir flags only apply to new ones)
@@ -17,7 +17,7 @@ set -euo pipefail
 BRUSH_VERSION="v0.3.0"
 BRUSH_ASSET="brush-app-aarch64-apple-darwin.tar.xz"
 BRUSH_SHA256="65b2631398c839be3c1d4d7160fe2326389dec87830aac0710985e6690a1048c"
-SPLAT_TRANSFORM_VERSION="3.10.1"   # @playcanvas/splat-transform, for .sog/.spz output
+SPLAT_TRANSFORM_VERSION="3.10.1"   # @playcanvas/splat-transform, fallback .spz encoder
 LABEL="com.gaussqueue.agent"
 
 REPO="${0:A:h:h}"

@@ -37,9 +37,8 @@ structure-from-motion step. Any capture that contains a COLMAP model
 - **Per-capture quality settings.** Preview / Fast / Standard / High presets, or set the steps,
   resolution, SH degree, splat cap and frame subsampling yourself. Captures can also be
   held or moved to the front. Each queued capture shows an estimated duration.
-- **Compressed copies.** Each result also gets `.sog` and `.spz` versions made with
-  [SplatTransform](https://github.com/playcanvas/splat-transform). They're typically
-  10–15× smaller than the `.ply` and much easier to open on a phone (e.g. in SuperSplat).
+- **Compressed copies.** Each result also gets an `.spz` (SPZ v3 by default). It's typically
+  10–15× smaller than the `.ply` and much easier to open on a phone.
 - **Sharper poses (optional).** SplatKing's LiDAR export uses ARKit's camera poses as
   they are, with no bundle adjustment, so small drift blurs the result. With `refine_poses`
   (also a per-capture checkbox), COLMAP refines them first. It finds SIFT features, matches
@@ -66,7 +65,7 @@ structure-from-motion step. Any capture that contains a COLMAP model
   coverage) before you commit to hours of training. It can't predict fine detail. The
   resolution choices only go up to the capture's own photo size, since photos are never upscaled.
 - **Mid-training snapshots.** *Publish snapshot* on the running capture turns its latest
-  checkpoint into a normal result, `<name>-step<N>`: flipped `.ply`, `.sog`/`.spz`,
+  checkpoint into a normal result, `<name>-step<N>`: flipped `.ply`, `.spz`,
   preview and `meta.json`, plus the phone copies. Training keeps going. The checkpoint is
   hard-linked aside instantly. Processing waits until at least `snapshot_min_free_pct`
   (default 25 %) of memory is free, or until training finishes, so it can't squeeze the run.
@@ -92,8 +91,8 @@ structure-from-motion step. Any capture that contains a COLMAP model
   [Niantic's spz library](https://github.com/nianticlabs/spz). When it's installed,
   GaussQueue uses it for `.spz` output and for flips. SplatTransform's SPZ encoder is
   WebAssembly with a 4 GB memory ceiling, and it aborts on large (~10M-splat) captures.
-- Optional: [Node.js](https://nodejs.org) for the `.sog`/`.spz` compression step
-  (`brew install node`). Without it, results are `.ply` only.
+- Optional: [Node.js](https://nodejs.org) (`brew install node`) for SplatTransform, the
+  fallback `.spz` encoder when gq_spz isn't built. With neither, results are `.ply` only.
 - For iMessage notifications: the Messages app signed in to iMessage on the Mac.
 
 ## Install
@@ -164,8 +163,8 @@ can be requeued.
 |---|---|---|
 | `inbox_dir` | *(required)* | Captures to train. Processed items move to `inbox/done/` or `inbox/failed/`. |
 | `work_dir` | `~/Library/Application Support/GaussQueue/work` | Unpacked captures and training output. **Keep this out of iCloud.** Note that `~/Documents` *is* in iCloud if "Desktop & Documents Folders" is enabled. Cleaned up after `keep_work_days`. |
-| `outbox_dir` | next to the inbox | One folder per capture: `<name>.ply`, `<name>.sog`, `<name>.spz`, `preview.jpg`, `meta.json`, `train.log`. Nothing else is written here, so it is safe to share. |
-| `share_dir` | *(off)* | Optional. Also copies each result's small, phone-friendly files (`share_files`, default `.sog`, `preview.jpg`, `meta.json`) here, e.g. to iCloud, while the full results stay local in `outbox_dir`. |
+| `outbox_dir` | next to the inbox | One folder per capture: `<name>.ply`, `<name>.spz`, `preview.jpg`, `meta.json`, `train.log`. Nothing else is written here, so it is safe to share. |
+| `share_dir` | *(off)* | Optional. Also copies each result's small, phone-friendly files (`share_files`, default `.spz`, `preview.jpg`, `meta.json`) here, e.g. to iCloud, while the full results stay local in `outbox_dir`. |
 | `status_dir` | next to the inbox | `STATUS.txt` and preview JPGs. Put it in iCloud to check progress from your phone. |
 
 App state (`config.json`, `state.json`, `overrides.json`, `gaussqueue.log`, the Brush
@@ -180,7 +179,7 @@ The exception is `dashboard_port`, which needs a restart.
 |---|---|---|
 | `standard` | 15k steps, 1440 px, SH 3, ≤10M splats | The default preset. *Fast* and *High* are fixed. |
 | `spz_version` | `3` | SPZ format version. Version 4, SplatTransform's default, isn't gzip-wrapped, and many apps load it as empty. Version 3 is the classic format that most apps support. |
-| `compress` | `["sog", "spz"]` | Compressed formats written next to the `.ply`. Use `[]` to turn this off. If compression fails, the capture still counts as done, and the problem is noted in the history. |
+| `compress` | `["spz"]` | Compressed formats written next to the `.ply`. Use `[]` to turn this off. If compression fails, the capture still counts as done, and the problem is noted in the history. |
 | `refine_poses` | `false` (example config: `true`) | Refine camera poses with COLMAP before training. A few minutes of CPU per capture. |
 | `flip_up` | `false` (example config: `true`) | Rotate results 180° about X so they're the right way up in SuperSplat and similar viewers. |
 | `keep_previous_results` | `true` | When a requeued capture finishes, keep the earlier result in `previous/`. If `false`, it's overwritten. |
@@ -206,7 +205,7 @@ number, makes sure it alerts.
 python3 gaussqueue.py --flip "<outbox>/<capture>" ["<outbox>/<capture2>" …]
 ```
 
-This rotates the `.ply` in place, rebuilds the `.sog`/`.spz` from it, and toggles the
+This rotates the `.ply` in place, rebuilds the `.spz` from it, and toggles the
 rotation recorded in `meta.json`. Running it twice restores the original orientation.
 
 ## Dashboard API

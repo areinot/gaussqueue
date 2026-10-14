@@ -192,9 +192,9 @@ class DashboardAPITest(unittest.TestCase):
             (res / f).write_text(f)
         cfg = dict(self.cfg, share_dir=str(root / "share"))
         copied = self.gq.share_result(cfg, res)
-        self.assertEqual(sorted(copied), ["capZ.sog", "meta.json", "preview.jpg"])
+        self.assertEqual(sorted(copied), ["capZ.spz", "meta.json", "preview.jpg"])
         self.assertEqual(sorted(p.name for p in (root / "share" / "capZ").iterdir()),
-                         ["capZ.sog", "meta.json", "preview.jpg"])
+                         ["capZ.spz", "meta.json", "preview.jpg"])
         self.assertEqual(self.gq.share_result(dict(cfg, share_dir=None), res), [])
 
     def test_refine_poses_is_a_restart_setting(self):
