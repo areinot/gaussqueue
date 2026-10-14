@@ -188,13 +188,13 @@ class DashboardAPITest(unittest.TestCase):
         root = Path(self.tmp.name)
         res = root / "results" / "capZ"
         res.mkdir(parents=True)
-        for f in ("capZ.ply", "capZ.sog", "capZ.spz", "preview.jpg", "meta.json", "train.log"):
+        for f in ("capZ.ply", "capZ.sog", "capZ.v3.spz", "capZ.v4.spz", "preview.jpg", "meta.json", "train.log"):
             (res / f).write_text(f)
         cfg = dict(self.cfg, share_dir=str(root / "share"))
         copied = self.gq.share_result(cfg, res)
-        self.assertEqual(sorted(copied), ["capZ.spz", "meta.json", "preview.jpg"])
-        self.assertEqual(sorted(p.name for p in (root / "share" / "capZ").iterdir()),
-                         ["capZ.spz", "meta.json", "preview.jpg"])
+        want = ["capZ.v3.spz", "capZ.v4.spz", "meta.json", "preview.jpg"]
+        self.assertEqual(sorted(copied), want)
+        self.assertEqual(sorted(p.name for p in (root / "share" / "capZ").iterdir()), want)
         self.assertEqual(self.gq.share_result(dict(cfg, share_dir=None), res), [])
 
     def test_refine_poses_is_a_restart_setting(self):
@@ -393,13 +393,19 @@ class DashboardAPITest(unittest.TestCase):
         fake.chmod(0o755)
         ply = root / "in.ply"
         ply.write_text("ply")
-        cfg = dict(self.cfg, spz_native=str(fake), spz_version=3)
-        sizes, errors = gq.compress(cfg, ply, root / "cmp", "t", lambda: None, ["spz"])
-        self.assertEqual((sizes, errors), ({"spz": 1}, []))
+        cfg = dict(self.cfg, spz_native=str(fake))
+        sizes, errors = gq.compress(cfg, ply, root / "cmp", "t", lambda: None, ["spz"], [3, 4])
+        self.assertEqual((sizes, errors), ({"v3.spz": 1, "v4.spz": 1}, []))
         self.assertIsNone(gq.flip_ply(cfg, ply, root / "flipped.ply"))
         calls = log.read_text().splitlines()
-        self.assertIn("t.spz --spz-version 3", calls[0])
-        self.assertTrue(calls[1].endswith("flipped.ply --flip"))
+        self.assertIn("t.v3.spz --spz-version 3", calls[0])
+        self.assertIn("t.v4.spz --spz-version 4", calls[1])
+        self.assertTrue(calls[2].endswith("flipped.ply --flip"))
+        # settings: v3 on by default, v4 opt-in; both are output-only
+        st = gq.effective_settings(self.cfg, {})
+        self.assertEqual((st["spz_v3"], st["spz_v4"]), (1, 0))
+        self.assertEqual(gq.spz_versions(dict(st, spz_v4=1)), [3, 4])
+        self.assertIn("spz_v4", gq.OUTPUT_KEYS)
         # Not installed -> falls back (no native call recorded).
         self.assertIsNone(gq.native_spz(dict(cfg, spz_native=str(root / "missing"))))
 

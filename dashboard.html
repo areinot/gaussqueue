@@ -153,6 +153,7 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .flip { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); cursor: pointer; user-select: none; }
 .flip input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); cursor: pointer; }
 .flipfield { grid-column: span 2; padding-top: 2px; }
+.spzbox { display: inline-flex; align-items: center; gap: 12px; font-size: 13px; color: var(--text); }
 .fields .flip { flex-direction: row; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
 .fields .flip input { width: 15px; height: 15px; padding: 0; border: 0; flex: none; }
 .cq { display: flex; flex-direction: column; gap: 3px; }
@@ -223,7 +224,7 @@ const kindText = (k, f) => [k && k !== "unknown" ? k : null, f ? `${f} frames` :
 
 const PRESET_LABEL = {preview: "Preview", fast: "Fast", standard: "Standard", high: "High", custom: "Custom"};
 const kfmt = (n) => n >= 1e6 ? `${+(n/1e6).toFixed(1)}M` : n >= 1000 ? `${+(n/1000).toFixed(1)}k` : String(n);
-const qualityText = (st) => st ? `<b>${PRESET_LABEL[st.preset] || esc(st.preset)}</b> · ${kfmt(st.total_steps)} steps · ${st.max_resolution}px · SH${st.sh_degree} · ≤${kfmt(st.max_splats)} splats${st.subsample_frames > 1 ? ` · every ${st.subsample_frames} frames` : ""}${st.refine_poses ? " · refined poses" : ""}${st.trainer === "gsplat" ? ` · gsplat ${esc(st.densify || "")}${st.depth_supervision ? " +depth" : ""}${st.flatten ? " +flat" : ""}` : ""}${st.prune_pct ? ` · prune ${st.prune_pct}%` : ""}${st.flip_up ? " · flipped" : ""}${st.start_view ? " · starts at first photo" : ""}` : "";
+const qualityText = (st) => st ? `<b>${PRESET_LABEL[st.preset] || esc(st.preset)}</b> · ${kfmt(st.total_steps)} steps · ${st.max_resolution}px · SH${st.sh_degree} · ≤${kfmt(st.max_splats)} splats${st.subsample_frames > 1 ? ` · every ${st.subsample_frames} frames` : ""}${st.refine_poses ? " · refined poses" : ""}${st.trainer === "gsplat" ? ` · gsplat ${esc(st.densify || "")}${st.depth_supervision ? " +depth" : ""}${st.flatten ? " +flat" : ""}` : ""}${st.prune_pct ? ` · prune ${st.prune_pct}%` : ""}${st.flip_up ? " · flipped" : ""}${st.start_view ? " · starts at first photo" : ""}${(() => { const v = [3, 4].filter(n => st[`spz_v${n}`]); return v.join() === "3" ? "" : ` · spz ${v.length ? v.map(n => "v" + n).join("+") : "off"}`; })()}` : "";
 const FIELD_OPTS = {
   max_resolution: [720, 960, 1080, 1280, 1440, 1920, 2560, 3840],
   sh_degree: [[0, "0 · flat colour"], [1, "1"], [2, "2"], [3, "3 · full sheen"]],
@@ -298,7 +299,7 @@ function jobPanel(c) {
              <button data-act="snapshot" title="Turn the latest checkpoint into a result you can open now (as <name>-step<N>).">Publish snapshot</button>`
           : `${pauseBtn}
              <button data-act="snapshot" title="Turn the latest checkpoint into a result you can open now (as <name>-step<N>). Training keeps going; processing waits until it can't slow the run.">Publish snapshot</button>
-             ${flipBox(pend && pend.flip_up)} ${startViewBox(pend && pend.start_view)}`}
+             ${flipBox(pend && pend.flip_up)} ${startViewBox(pend && pend.start_view)} ${spzBoxes(pend)}`}
       </div>
       ${!c.paused && itemErrors[c.name] ? `<div class="serr">${esc(itemErrors[c.name])}</div>` : ""}
       ${(c.snapshots || []).length ? `<div class="snaps">${c.snapshots.map(sn => {
@@ -379,6 +380,13 @@ function flipBox(on) {
 function startViewBox(on) {
   return `<label class="flip" title="Move the result so its origin is where you took the first photo, turned (left/right only) to face that photo's direction. Viewers that start at the origin open on your first shot. Applied to the output files after training; never restarts training.">
     <input type="checkbox" data-set="start_view"${on ? " checked" : ""}> Start at first photo</label>`;
+}
+
+// SPZ versions written (output-only): <name>.v3.spz and/or <name>.v4.spz.
+function spzBoxes(st) {
+  const box = (v) => `<label class="flip" title="Write ${v === 3 ? "SPZ v3 (gzip; opens nearly everywhere)" : "SPZ v4 (zstd; newer, only recent apps read it)"} as <name>.v${v}.spz. Output only; never restarts training.">
+    <input type="checkbox" data-set="spz_v${v}"${st && st[`spz_v${v}`] ? " checked" : ""}> v${v}</label>`;
+  return `<span class="spzbox">SPZ ${box(3)} ${box(4)}</span>`;
 }
 
 // "Refine camera poses": COLMAP bundle adjustment before training (changes the input, so it restarts).
@@ -468,6 +476,11 @@ const HELP = {
     val: (v) => +v ? `Removes ${v}%: keeps ${100 - v}% of the splats. In tests even 90% kept the same score; the finest texture goes first.` : "Off: keeps every splat."},
   flip_up: {name: "Flip vertical", what: "Turns the result 180° so it's the right way up in viewers that expect -Y up. Output only; never restarts training.",
     opts: {1: "On: right way up in SuperSplat and most viewers.", 0: "Off: kept in SplatKing's +Y-up orientation."}},
+  spz: {name: "SPZ files", what: "Compressed copies for viewers and phones, written next to the .ply as <name>.v3.spz and <name>.v4.spz. Output only.",
+    val: (v) => ({"3": "v3 only: gzip-wrapped, opens in nearly every splat app.",
+                  "4": "v4 only: zstd, faster to load, but only recent apps read it (Niantic tools, PlayCanvas, Postshot).",
+                  "3+4": "Both: v3 for compatibility, v4 for apps that support it.",
+                  "": "None: only the .ply is written."})[v]},
   start_view: {name: "Start at first photo", what: "Moves the result so its origin is where you took the first photo, turned (left/right only) to face that photo's direction. Viewers that start at the origin open on your first shot. Output only.",
     opts: {1: "On: opens at your first photo, horizon level.", 0: "Off: original capture coordinates."}},
 };
@@ -475,6 +488,7 @@ const HELP = {
 function helpValue(key, st, it) {
   if (key === "run_on") return it.run_on || "auto";
   if (key === "preset") return st.preset;
+  if (key === "spz") return [3, 4].filter(v => st[`spz_v${v}`]).join("+");
   return st[key];
 }
 
@@ -601,6 +615,7 @@ function settingsHTML(it, isCurrent) {
         ${gsplatHTML(st)}
         <div class="flipfield" data-help-key="flip_up">${flipBox(st.flip_up)}</div>
         <div class="flipfield" data-help-key="start_view">${startViewBox(st.start_view)}</div>
+        <div class="flipfield" data-help-key="spz">${spzBoxes(st)}</div>
       </div>
       <div class="actions">
         ${isCurrent ? "" : `<button data-act="run_next">Run next</button>

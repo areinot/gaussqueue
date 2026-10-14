@@ -37,8 +37,9 @@ structure-from-motion step. Any capture that contains a COLMAP model
 - **Per-capture quality settings.** Preview / Fast / Standard / High presets, or set the steps,
   resolution, SH degree, splat cap and frame subsampling yourself. Captures can also be
   held or moved to the front. Each queued capture shows an estimated duration.
-- **Compressed copies.** Each result also gets an `.spz` (SPZ v3 by default). It's typically
-  10–15× smaller than the `.ply` and much easier to open on a phone.
+- **Compressed copies.** Each result also gets `<name>.v3.spz`, and `<name>.v4.spz` if you tick
+  SPZ v4 (per-capture checkboxes). They're typically 10–15× smaller than the `.ply` and much
+  easier to open on a phone. v3 opens nearly everywhere; v4 only in recent apps.
 - **Sharper poses (optional).** SplatKing's LiDAR export uses ARKit's camera poses as
   they are, with no bundle adjustment, so small drift blurs the result. With `refine_poses`
   (also a per-capture checkbox), COLMAP refines them first. It finds SIFT features, matches
@@ -236,8 +237,8 @@ python gs/prune.py out/export_30000.ply <capture> --out pruned --keep 0.3 --fine
 |---|---|---|
 | `inbox_dir` | *(required)* | Captures to train. Processed items move to `inbox/done/` or `inbox/failed/`. |
 | `work_dir` | `~/Library/Application Support/GaussQueue/work` | Unpacked captures and training output. **Keep this out of iCloud.** Note that `~/Documents` *is* in iCloud if "Desktop & Documents Folders" is enabled. Cleaned up after `keep_work_days`. |
-| `outbox_dir` | next to the inbox | One folder per capture: `<name>.ply`, `<name>.spz`, `preview.jpg`, `meta.json`, `train.log`. Nothing else is written here, so it is safe to share. |
-| `share_dir` | *(off)* | Optional. Also copies each result's small, phone-friendly files (`share_files`, default `.spz`, `preview.jpg`, `meta.json`) here, e.g. to iCloud, while the full results stay local in `outbox_dir`. |
+| `outbox_dir` | next to the inbox | One folder per capture: `<name>.ply`, `<name>.v3.spz` (and `<name>.v4.spz` if chosen), `preview.jpg`, `meta.json`, `train.log`. Nothing else is written here, so it is safe to share. |
+| `share_dir` | *(off)* | Optional. Also copies each result's small, phone-friendly files (`share_files`, default the `.spz` files, `preview.jpg`, `meta.json`) here, e.g. to iCloud, while the full results stay local in `outbox_dir`. |
 | `status_dir` | next to the inbox | `STATUS.txt` and preview JPGs. Put it in iCloud to check progress from your phone. |
 
 App state (`config.json`, `state.json`, `overrides.json`, `gaussqueue.log`, the Brush
@@ -251,7 +252,7 @@ The exception is `dashboard_port`, which needs a restart.
 | Key | Default | |
 |---|---|---|
 | `standard` | 15k steps, 1440 px, SH 3, ≤10M splats | The default preset. *Fast* and *High* are fixed. |
-| `spz_version` | `3` | SPZ format version. Version 4, SplatTransform's default, isn't gzip-wrapped, and many apps load it as empty. Version 3 is the classic format that most apps support. |
+| `spz_versions` | `[3]` | SPZ versions written for each result, as `<name>.v3.spz` / `<name>.v4.spz` (per-capture checkboxes on the dashboard). v3 is gzip-wrapped and opens nearly everywhere; v4 (zstd) is newer and faster to load, but only recent readers support it. |
 | `compress` | `["spz"]` | Compressed formats written next to the `.ply`. Use `[]` to turn this off. If compression fails, the capture still counts as done, and the problem is noted in the history. |
 | `refine_poses` | `false` (example config: `true`) | Refine camera poses with COLMAP before training. A few minutes of CPU per capture. |
 | `init_feature_points` | `true` | Also start training from COLMAP's triangulated feature points (needs `refine_poses`). See [gsplat trainer and pruning](#gsplat-trainer-and-pruning-cuda-workers-optional). |

@@ -13,6 +13,7 @@ so most edits apply without a restart. See README.md.
 """
 import base64
 import datetime as dt
+import glob
 import http.server
 import math
 import json
@@ -53,9 +54,10 @@ DEFAULTS = {
     "brush": str(APP_HOME / "bin/brush_app"),
     # Compressed copies written next to the .ply ([] = off)
     "compress": ["spz"],
-    # SPZ 4 (SplatTransform's default) isn't gzip-wrapped and many apps load it as empty;
-    # 3 is the widely supported classic format.
-    "spz_version": 3,
+    # SPZ versions written for each result (per-capture checkboxes), as <name>.v3.spz and
+    # <name>.v4.spz. v3 is gzip-wrapped and opens nearly everywhere; v4 (zstd) is newer and
+    # faster to load, but only recent readers support it (Niantic tools, PlayCanvas, Postshot).
+    "spz_versions": [3],
     # Native PLY->SPZ/flip tool built from tools/spz-native (Niantic's spz library). Used for
     # .spz and for the flip when present: no WebAssembly 4 GB ceiling, much less memory.
     "spz_native": str(APP_HOME / "bin/gq_spz"),
@@ -141,13 +143,13 @@ DEFAULTS = {
 TRAIN_KEYS = ("total_steps", "max_resolution", "sh_degree", "max_splats", "subsample_frames")
 GSPLAT_KEYS = ("trainer", "densify", "depth_supervision", "flatten")
 RESTART_KEYS = TRAIN_KEYS + ("refine_poses",) + GSPLAT_KEYS   # changing these restarts training
-OUTPUT_KEYS = ("flip_up", "start_view", "prune_pct")   # only affect the output files
+OUTPUT_KEYS = ("flip_up", "start_view", "prune_pct", "spz_v3", "spz_v4")   # only affect the output files
 SETTING_KEYS = RESTART_KEYS + OUTPUT_KEYS
 SETTING_LIMITS = {"total_steps": (500, 100_000), "max_resolution": (256, 4096),
                   "sh_degree": (0, 3), "max_splats": (50_000, 20_000_000),
                   "subsample_frames": (1, 20), "flip_up": (0, 1), "refine_poses": (0, 1),
                   "depth_supervision": (0, 1), "flatten": (0, 1), "prune_pct": (0, 95),
-                  "start_view": (0, 1)}
+                  "start_view": (0, 1), "spz_v3": (0, 1), "spz_v4": (0, 1)}
 SETTING_CHOICES = {"trainer": ("brush", "gsplat"), "densify": ("mcmc", "default", "absgrad")}
 PRESETS = {
     # Quick look: is the scene coherent, oriented right, covered? Not for judging detail.
@@ -172,6 +174,8 @@ def effective_settings(cfg, ov):
     out = dict(base)
     out["flip_up"] = int(bool(cfg.get("flip_up")))
     out["start_view"] = int(bool(cfg.get("start_view", True)))
+    for v in (3, 4):
+        out[f"spz_v{v}"] = int(v in (cfg.get("spz_versions") or []))
     out["refine_poses"] = int(bool(cfg.get("refine_poses")))
     out["trainer"] = cfg.get("trainer") if cfg.get("trainer") in SETTING_CHOICES["trainer"] else "brush"
     densify = sub_config(cfg, "gsplat")["densify"]
@@ -200,7 +204,8 @@ def settings_summary(st):
                + (" +flat" if st.get("flatten") else "") if gs else "")
             + (f", prune {st['prune_pct']}%" if st.get("prune_pct") else "")
             + (", flipped" if st.get("flip_up") else "")
-            + (", starts at first photo" if st.get("start_view") else ""))
+            + (", starts at first photo" if st.get("start_view") else "")
+            + (f", spz {'+'.join(f'v{v}' for v in spz_versions(st)) or 'off'}" if spz_versions(st) != [3] else ""))
 
 
 class Overrides:
@@ -1568,26 +1573,35 @@ def run_native(cfg, args, dst, beat=lambda: None, timeout=3600):
     return None
 
 
-def compress(cfg, ply, out_dir, name, beat, formats=None):
-    """Write <name>.<fmt> for each configured format (natively with gq_spz when installed,
-    otherwise with SplatTransform).
-    Returns ({fmt: bytes}, [error strings]); failures never fail the job."""
+def spz_versions(st):
+    """SPZ versions a capture's settings ask for, e.g. [3] or [3, 4]."""
+    return [v for v in (3, 4) if st.get(f"spz_v{v}")]
+
+
+def compress(cfg, ply, out_dir, name, beat, formats=None, versions=None):
+    """Write the compressed copies: <name>.v3.spz / <name>.v4.spz for the SPZ versions asked
+    for (natively with gq_spz when installed, otherwise with SplatTransform). An output may
+    also be given as ("spz", version) for an old-style <name>.spz.
+    Returns ({file suffix: bytes}, [error strings]); failures never fail the job."""
     if formats is None:
         formats = [f for f in cfg.get("compress") or [] if f in COMPRESS_FORMATS]
+    if versions is None:
+        versions = [int(v) for v in cfg.get("spz_versions") or [3]]
+    outputs = [(f"v{v}.spz", v) for v in versions] if "spz" in formats else []
+    outputs += [o for o in formats if isinstance(o, tuple)]
     out_dir.mkdir(parents=True, exist_ok=True)
     sizes, errors = {}, []
-    for fmt in formats:
-        dst = out_dir / f"{name}.{fmt}"
-        version = int(cfg.get("spz_version", 3))
+    for suffix, version in outputs:
+        dst = out_dir / f"{name}.{suffix}"
         if native_spz(cfg):   # native: no WebAssembly memory ceiling
             err = run_native(cfg, [ply, dst, "--spz-version", version], dst, beat)
         else:
             # -N drops NaN/degenerate splats, which some viewers choke on
             err = splat_transform(cfg, [ply, "-N", "--spz-version", version, dst], dst, beat)
         if err:
-            errors.append(f"{fmt}: {err}")
+            errors.append(f"{suffix}: {err}")
         else:
-            sizes[fmt] = dst.stat().st_size
+            sizes[suffix] = dst.stat().st_size
     return sizes, errors
 
 
@@ -1652,15 +1666,21 @@ def flip_ply(cfg, src, dst, beat=lambda: None):
 
 def share_result(cfg, result_dir):
     """Copy the phone-friendly files of one result into share_dir/<name>/.
-    Entries in share_files are either a format ("spz" -> <name>.spz) or a filename."""
+    Entries in share_files are either a format ("spz" -> <name>.v3.spz, <name>.v4.spz and any
+    old-style <name>.spz) or a filename."""
     if not cfg.get("share_dir"):
         return []
     name = result_dir.name
     dest = Path(cfg["share_dir"]) / name
     dest.mkdir(parents=True, exist_ok=True)
     copied = []
+    names = []
     for entry in cfg.get("share_files") or []:
-        fname = f"{name}.{entry}" if "." not in entry else entry
+        if entry == "spz":
+            names += sorted(f.name for f in result_dir.glob(f"{glob.escape(name)}.v*.spz")) + [f"{name}.spz"]
+        else:
+            names.append(f"{name}.{entry}" if "." not in entry else entry)
+    for fname in names:
         src = result_dir / fname
         if src.is_file():
             tmp = dest / f".{fname}.partial"
@@ -2198,7 +2218,10 @@ def process(cfg, paths, state, status, item, beat, worker=None):
                                  "forward": cfg.get("start_view_forward", "+z")}
         job["phase"] = "compressing"
         beat()
-        sizes, more = compress(cfg, result_ply, job_dir / "compressed", name, beat)
+        versions = spz_versions(pending())
+        for v in (3, 4):
+            job["settings"][f"spz_v{v}"] = int(v in versions)
+        sizes, more = compress(cfg, result_ply, job_dir / "compressed", name, beat, versions=versions)
         cerrors += more
 
         job["phase"] = "uploading result to iCloud"
@@ -2479,7 +2502,8 @@ class Snapshots:
                     flip = False
                 elif flip or view:
                     ply = work / f"{label}.ply"
-            sizes, more = compress(cfg, ply, work, label, lambda: None)
+            versions = spz_versions(snap["settings"]) if any(k.startswith("spz_v") for k in snap["settings"]) else None
+            sizes, more = compress(cfg, ply, work, label, lambda: None, versions=versions)
             errors += more
             dest = self.paths.outbox / label
             dest.mkdir(parents=True, exist_ok=True)
@@ -2711,9 +2735,13 @@ def flip_results(folders):
             print(f"✗ {name}: {err}")
             status = 1
             continue
-        formats = [f for f in COMPRESS_FORMATS
-                   if (folder / f"{name}.{f}").exists() or f in (cfg.get("compress") or [])]
-        sizes, errors = compress(cfg, out, tmp, name, lambda: None, formats)
+        # rebuild whichever SPZ files the result has (the configured ones if it has none)
+        found = [v for v in (3, 4) if (folder / f"{name}.v{v}.spz").exists()]
+        legacy = (folder / f"{name}.spz").exists()
+        if not found and not legacy:
+            found = [int(v) for v in cfg.get("spz_versions") or [3]]
+        formats = (["spz"] if found else []) + ([("spz", 3)] if legacy else [])
+        sizes, errors = compress(cfg, out, tmp, name, lambda: None, formats, found)
         shutil.copyfile(out, ply)   # replace originals only after everything built
         out.unlink()
         for fmt in sizes:
