@@ -74,10 +74,12 @@ DEFAULTS = {
     # a "gsplat" entry, see workers below). Per-capture override on the dashboard.
     "trainer": "brush",
     # gsplat options. depth_supervision and flatten are per-capture toggles; the weights tune
-    # them. densify: "default" (3DGS growth), "absgrad" (grows more in fine detail) or "mcmc"
-    # (fixed budget: always ends at the splat cap). sky_points: extra starting splats on a
-    # distant sphere for sky. mode: "3dgs" or "2dgs" (flat disks).
-    "gsplat": {"densify": "default", "depth_weight": 0.3, "flat_weight": 10,
+    # them. densify: "mcmc" (fixed budget: always ends at the splat cap; best in our tests),
+    # "default" (3DGS growth) or "absgrad" (grows more in fine detail). max_splats caps the
+    # splat count for gsplat runs whatever the preset says (MCMC always fills its budget, and
+    # GPU memory is the limit). sky_points: extra starting splats on a distant sphere for sky.
+    # mode: "3dgs" or "2dgs" (flat disks).
+    "gsplat": {"densify": "mcmc", "depth_weight": 0.3, "flat_weight": 10, "max_splats": 6_000_000,
                "sky_points": 50000, "mode": "3dgs"},
     "depth_supervision": True,   # gsplat: match LiDAR depth where ARKit is confident
     "flatten": True,             # gsplat: push splats flat onto surfaces
@@ -129,7 +131,7 @@ SETTING_LIMITS = {"total_steps": (500, 100_000), "max_resolution": (256, 4096),
                   "sh_degree": (0, 3), "max_splats": (50_000, 20_000_000),
                   "subsample_frames": (1, 20), "flip_up": (0, 1), "refine_poses": (0, 1),
                   "depth_supervision": (0, 1), "flatten": (0, 1), "prune_pct": (0, 95)}
-SETTING_CHOICES = {"trainer": ("brush", "gsplat"), "densify": ("default", "absgrad", "mcmc")}
+SETTING_CHOICES = {"trainer": ("brush", "gsplat"), "densify": ("mcmc", "default", "absgrad")}
 PRESETS = {
     # Quick look: is the scene coherent, oriented right, covered? Not for judging detail.
     "preview": {"total_steps": 3000, "max_resolution": 720, "sh_degree": 1,
@@ -155,7 +157,7 @@ def effective_settings(cfg, ov):
     out["refine_poses"] = int(bool(cfg.get("refine_poses")))
     out["trainer"] = cfg.get("trainer") if cfg.get("trainer") in SETTING_CHOICES["trainer"] else "brush"
     densify = sub_config(cfg, "gsplat")["densify"]
-    out["densify"] = densify if densify in SETTING_CHOICES["densify"] else "default"
+    out["densify"] = densify if densify in SETTING_CHOICES["densify"] else "mcmc"
     out["depth_supervision"] = int(bool(cfg.get("depth_supervision", True)))
     out["flatten"] = int(bool(cfg.get("flatten", True)))
     out["prune_pct"] = int(cfg.get("prune_pct") or 0)
@@ -1783,8 +1785,9 @@ class RemoteWorker:
             what, exe, cwd = "gsplat", self.gsplat["python"], self.gsplat["scripts"]
             args = [f"{cwd}/train.py", f"{d}/data", "--out", f"{d}/out", "--steps", total,
                     "--max-res", st["max_resolution"], "--sh-degree", st["sh_degree"],
-                    "--max-splats", st["max_splats"], "--subsample", st["subsample_frames"],
-                    "--strategy", st.get("densify") or "default", "--mode", g["mode"],
+                    "--max-splats", min(int(st["max_splats"]), int(g["max_splats"])),
+                    "--subsample", st["subsample_frames"],
+                    "--strategy", st.get("densify") or "mcmc", "--mode", g["mode"],
                     "--sky-points", g["sky_points"], "--export-every", cfg["checkpoint_every"],
                     "--eval-every", cfg["eval_every"], "--holdout-every", cfg["eval_split_every"]]
             if sensor:   # depth maps: supervision when on, held-out depth error either way

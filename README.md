@@ -241,7 +241,7 @@ The exception is `dashboard_port`, which needs a restart.
 | `refine_poses` | `false` (example config: `true`) | Refine camera poses with COLMAP before training. A few minutes of CPU per capture. |
 | `init_feature_points` | `true` | Also start training from COLMAP's triangulated feature points (needs `refine_poses`). See [gsplat trainer and pruning](#gsplat-trainer-and-pruning-cuda-workers-optional). |
 | `trainer` | `"brush"` | `"gsplat"` trains on CUDA workers that have it. Per-capture override on the dashboard. |
-| `gsplat` | `{"densify": "default", "depth_weight": 0.3, "flat_weight": 10, "sky_points": 50000, "mode": "3dgs"}` | gsplat options. `mode` can be `"2dgs"` (flat disks). |
+| `gsplat` | `{"densify": "mcmc", "depth_weight": 0.3, "flat_weight": 10, "max_splats": 6000000, "sky_points": 50000, "mode": "3dgs"}` | gsplat options. `max_splats` caps gsplat runs whatever the preset says (MCMC always fills its budget; GPU memory is the limit). `mode` can be `"2dgs"` (flat disks). |
 | `depth_supervision` / `flatten` | `true` / `true` | Defaults for the per-capture gsplat checkboxes. |
 | `prune_pct` | `0` (off) | Remove this % of splats after training. Per-capture override. |
 | `prune` | `{"score": "lightgaussian", "finetune_steps": 3000}` | Pruning score (`lightgaussian` or `pup`) and fine-tuning length. |

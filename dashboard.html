@@ -348,7 +348,7 @@ function gsplatHTML(st) {
         <div class="flipfield runon" title="Brush runs on any machine. gsplat (CUDA) adds LiDAR depth supervision, flat splats and MCMC; it only runs on machines that have it.">Trainer
           ${choiceHTML("trainer", st.trainer || "brush", [["brush", "Brush"], ["gsplat", "gsplat (CUDA)"]])}</div>
         ${gs ? `<div class="flipfield runon" title="How splats are added during training. Default: classic 3DGS growth. Abs-grad: grows more in fine detail. MCMC: fixed budget, always ends at the splat cap.">Densify
-          ${choiceHTML("densify", st.densify || "default", [["default", "Default"], ["absgrad", "Abs-grad"], ["mcmc", "MCMC (fixed budget)"]])}</div>
+          ${choiceHTML("densify", st.densify || "mcmc", [["mcmc", "MCMC (fixed budget)"], ["default", "Default"], ["absgrad", "Abs-grad"]])}</div>
         <div class="flipfield">${check("depth_supervision", "LiDAR depth", "Match the LiDAR depth maps where the iPhone is confident (near surfaces). Sky and far scenery are left to the photos.")}</div>
         <div class="flipfield">${check("flatten", "Flatten splats", "Push splats flat onto surfaces: crisper walls and ground, fewer floaters.")}</div>` : ""}
         <div class="flipfield runon" title="After training, remove this share of splats (the ones that matter least to the photos) and fine-tune the rest. Runs on a CUDA machine; the unpruned result is kept in the work folder.">Prune

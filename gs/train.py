@@ -290,6 +290,7 @@ def train(a, splats=None, log=print):
 
     gsdata.save_ply(out / f"export_{a.steps}.ply", dict(params))
     metrics = {"steps": a.steps, "splats": len(params["means"]), "train_seconds": round(time.time() - t0, 1),
+               "peak_gpu_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
                "views_train": len(tv), "views_test": len(ev), "settings": vars(a)}
     if len(ev):
         metrics["test"] = evaluate(params, ev, sh_degree, a.mode, a.antialiased, out / "test_renders")
