@@ -88,6 +88,9 @@ SETTING_LIMITS = {"total_steps": (500, 100_000), "max_resolution": (256, 4096),
                   "sh_degree": (0, 3), "max_splats": (50_000, 20_000_000),
                   "subsample_frames": (1, 20), "flip_up": (0, 1), "refine_poses": (0, 1)}
 PRESETS = {
+    # Quick look: is the scene coherent, oriented right, covered? Not for judging detail.
+    "preview": {"total_steps": 3000, "max_resolution": 720, "sh_degree": 1,
+                "max_splats": 1_000_000, "subsample_frames": 1},
     "fast": {"total_steps": 7000, "max_resolution": 1080, "sh_degree": 2,
              "max_splats": 1_500_000, "subsample_frames": 1},
     "standard": None,  # from config["standard"]
@@ -425,6 +428,7 @@ class InboxItem:
         self.thumb_note = None
         self.thumb_tries = 0
         self.quality = None   # SplatKing capture ratings, if present
+        self.photo_px = None  # longest side of the capture's photos (from cameras.txt)
         self.quality_tries = 0
 
     def signature(self):
@@ -450,7 +454,8 @@ class InboxItem:
         return {"name": self.name, "file": self.path.name, "is_dir": self.is_dir,
                 "state": self.state, "kind": self.kind, "frames": self.frames,
                 "size": self.size, "first_seen": self.first_seen,
-                "thumb": self.thumb, "thumb_note": self.thumb_note, "quality": self.quality}
+                "thumb": self.thumb, "thumb_note": self.thumb_note, "quality": self.quality,
+                "photo_px": self.photo_px}
 
 
 class Inbox:
@@ -544,6 +549,7 @@ class Inbox:
         """Read SplatKing's splatpack.json straight from the zip/folder (small file)."""
         item.quality_tries += 1
         try:
+            self.read_photo_size(item)
             if item.is_dir:
                 f = next(item.path.rglob("splatpack.json"), None)
                 if f is None:
@@ -567,6 +573,31 @@ class Inbox:
                 item.quality_tries = 99
         except (zipfile.BadZipFile, OSError, ValueError):
             pass
+
+    @staticmethod
+    def photo_size_from(text):
+        for line in text.splitlines():
+            p = line.split()
+            if line.startswith("#") or len(p) < 4 or not p[0].isdigit():
+                continue
+            return max(int(p[2]), int(p[3]))
+        return None
+
+    def read_photo_size(self, item):
+        if item.photo_px:
+            return
+        if item.is_dir:
+            f = next(item.path.rglob("sparse/0/cameras.txt"), None)
+            if f is None or is_dataless(f):
+                if f is not None:
+                    request_download(f)
+                return
+            item.photo_px = self.photo_size_from(f.read_text())
+        elif not is_dataless(item.path):
+            with zipfile.ZipFile(item.path) as z:
+                names = [n for n in z.namelist() if n.endswith("sparse/0/cameras.txt")]
+                if names:
+                    item.photo_px = self.photo_size_from(z.read(names[0]).decode(errors="replace"))
 
     def describe(self, item):
         if item.kind is not None:
@@ -720,7 +751,7 @@ class Status:
         if c:
             current = {k: c.get(k) for k in
                        ("name", "phase", "step", "total", "started", "eta", "preview",
-                        "kind", "frames", "thumb", "settings", "paused", "paused_at", "quality")}
+                        "kind", "frames", "thumb", "settings", "paused", "paused_at", "quality", "photo_px")}
             current["pending_settings"] = effective_settings(cfg, self.overrides.get(c["name"]))
             current["previews"] = sorted(p.name for p in
                                          self.paths.previews.glob(f"{c['name']}_step*.jpg"))
@@ -978,6 +1009,67 @@ def mean_reprojection(colmap, model):
                        capture_output=True, text=True)
     m = re.search(r"Mean reprojection error: ([\d.]+)", r.stderr + r.stdout)
     return float(m.group(1)) if m else None
+
+
+REFINE_VERSION = "1"   # bump when the refinement method changes, to invalidate the cache
+POSE_CACHE = APP_HOME / "pose_cache"
+
+
+def pose_cache_dir(cfg, colmap_dir, name):
+    """Cache folder for a capture's refined poses. The key covers the capture's
+    original poses + intrinsics, the method version and the COLMAP version, so a
+    different capture or method never reuses stale results."""
+    import hashlib
+    src = colmap_dir / "sparse" / "0"
+    h = hashlib.sha256(REFINE_VERSION.encode())
+    for f in ("cameras.txt", "images.txt"):
+        h.update((src / f).read_bytes())
+    colmap = shutil.which(cfg.get("colmap") or "colmap") or ""
+    if colmap:
+        r = subprocess.run([colmap, "-h"], capture_output=True, text=True)
+        h.update((r.stdout.splitlines() or [""])[0].encode())
+    return POSE_CACHE / f"{name}-{h.hexdigest()[:16]}"
+
+
+def build_refined_model(colmap_dir, cache, out):
+    """A trainable COLMAP folder: cached refined poses, original photos, LiDAR points."""
+    src = colmap_dir / "sparse" / "0"
+    shutil.rmtree(out, ignore_errors=True)
+    (out / "sparse" / "0").mkdir(parents=True)
+    (out / "images").symlink_to((colmap_dir / "images").resolve())
+    for f in ("images.txt", "cameras.txt"):
+        shutil.copyfile(cache / f, out / "sparse" / "0" / f)
+    pts = src / "points3D.txt" if (src / "points3D.txt").exists() else cache / "points3D.txt"
+    shutil.copyfile(pts, out / "sparse" / "0" / "points3D.txt")
+    return out
+
+
+def save_pose_cache(cache, model, stats):
+    tmp = cache.with_name(cache.name + ".partial")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    for f in ("images.txt", "cameras.txt"):
+        shutil.copyfile(model / "sparse" / "0" / f, tmp / f)
+    (tmp / "stats.json").write_text(json.dumps(
+        dict(stats, saved=dt.datetime.now().isoformat(timespec="seconds")), indent=2) + "\n")
+    shutil.rmtree(cache, ignore_errors=True)
+    tmp.rename(cache)
+
+
+def refined_model(cfg, colmap_dir, work, beat, job):
+    """Refined poses for a capture: from the pose cache if this exact capture was
+    refined before, otherwise computed with COLMAP and saved to the cache."""
+    cache = pose_cache_dir(cfg, colmap_dir, job["name"])
+    if (cache / "images.txt").exists() and (cache / "stats.json").exists():
+        stats = json.loads((cache / "stats.json").read_text())
+        log(f"using cached pose refinement for {job['name']} ({cache.name})")
+        return build_refined_model(colmap_dir, cache, work / "model"), dict(stats, cached=True)
+    model, stats = refine_poses(cfg, colmap_dir, work, beat, job)
+    try:
+        save_pose_cache(cache, model, stats)
+    except OSError as e:
+        log(f"could not save pose cache for {job['name']}: {e}")
+    return model, stats
 
 
 def refine_poses(cfg, colmap_dir, work, beat, job):
@@ -1310,7 +1402,7 @@ def process(cfg, paths, state, status, item, beat):
     job_dir.mkdir(parents=True, exist_ok=True)
     job = {"name": name, "phase": "downloading from iCloud", "step": None,
            "kind": item.kind, "frames": item.frames, "thumb": item.thumb,
-           "file": item.path.name, "quality": item.quality,
+           "file": item.path.name, "quality": item.quality, "photo_px": item.photo_px,
            "settings": effective_settings(cfg, status.overrides.get(name))}
     for old in paths.previews.glob(f"{name}_step*.jpg"):  # from an earlier run
         old.unlink()
@@ -1337,7 +1429,7 @@ def process(cfg, paths, state, status, item, beat):
             if job["settings"].get("refine_poses"):
                 if refined is None:
                     try:
-                        refined = refine_poses(cfg, colmap, job_dir / "refine", beat, job)
+                        refined = refined_model(cfg, colmap, job_dir / "refine", beat, job)
                     except Exception as e:
                         log(f"pose refinement failed for {name}: {e}")
                         warnings.append(f"pose refinement skipped: {str(e)[:120]}")

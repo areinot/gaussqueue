@@ -34,7 +34,7 @@ structure-from-motion step. Any capture that contains a COLMAP model
   text and `meta.json`.
 - **Dashboard** at `http://127.0.0.1:8765`. It shows live progress, the checkpoint
   previews (renders from a camera held out of training), the queue and recent results.
-- **Per-capture quality settings.** Fast / Standard / High presets, or set the steps,
+- **Per-capture quality settings.** Preview / Fast / Standard / High presets, or set the steps,
   resolution, SH degree, splat cap and frame subsampling yourself. Captures can also be
   held or moved to the front. Each queued capture shows an estimated duration.
 - **Compressed copies.** Each result also gets `.sog` and `.spz` versions made with
@@ -49,6 +49,9 @@ structure-from-motion step. Any capture that contains a COLMAP model
   68-photo capture this took about 1.5 minutes on CPU and halved the mean reprojection error
   (1.26 → 0.56 px). `meta.json` records the before/after numbers. If refinement fails or makes
   things worse, the capture trains on the original poses and the problem is reported.
+  Refined poses are cached in `$GAUSSQUEUE_HOME/pose_cache/`, keyed by the capture's original
+  poses, the method version and the COLMAP version. A quick Preview run followed by a High
+  run of the same capture only pays for COLMAP once.
 - **Right way up.** SplatKing/COLMAP captures use +Y as up, but most splat viewers treat
   −Y as up, so results look upside down. With `flip_up` (on in the example config; it can
   also be set per capture, even mid-training), results are rotated 180° about X before
@@ -58,6 +61,10 @@ structure-from-motion step. Any capture that contains a COLMAP model
   **Requeue** button. It moves the original capture back into the inbox, on hold, so you
   can choose new settings and then release the hold. When the rerun finishes, the earlier
   result is moved to `<outbox>/<name>/previous/` instead of being overwritten.
+- **Test runs.** The *Preview* preset (720 px, 3k steps, SH 1, ≤1M splats) takes a few
+  minutes. It shows whether a capture holds together (no ghosting, right way up, decent
+  coverage) before you commit to hours of training. It can't predict fine detail. The
+  resolution choices only go up to the capture's own photo size, since photos are never upscaled.
 - **Pause and tweak.** Pause the running capture: Brush is frozen in place
   (`SIGSTOP`) and the Mac is allowed to sleep. Resume to carry on where it stopped,
   or change its settings while it's paused and resume to restart it from step 0 with

@@ -156,7 +156,7 @@ const clock = (t) => new Date(t*1000).toLocaleTimeString([], {hour: "numeric", m
 const size = (b) => b > 1e9 ? (b/1e9).toFixed(1)+" GB" : (b/1e6).toFixed(0)+" MB";
 const kindText = (k, f) => [k && k !== "unknown" ? k : null, f ? `${f} frames` : null].filter(Boolean).join(" · ");
 
-const PRESET_LABEL = {fast: "Fast", standard: "Standard", high: "High", custom: "Custom"};
+const PRESET_LABEL = {preview: "Preview", fast: "Fast", standard: "Standard", high: "High", custom: "Custom"};
 const kfmt = (n) => n >= 1e6 ? `${+(n/1e6).toFixed(1)}M` : n >= 1000 ? `${+(n/1000).toFixed(1)}k` : String(n);
 const qualityText = (st) => st ? `<b>${PRESET_LABEL[st.preset] || esc(st.preset)}</b> · ${kfmt(st.total_steps)} steps · ${st.max_resolution}px · SH${st.sh_degree} · ≤${kfmt(st.max_splats)} splats${st.subsample_frames > 1 ? ` · every ${st.subsample_frames} frames` : ""}${st.refine_poses ? " · refined poses" : ""}${st.flip_up ? " · flipped" : ""}` : "";
 const FIELD_OPTS = {
@@ -224,7 +224,7 @@ function renderNow(c) {
              ${flipBox(pend && pend.flip_up)}`}
       </div>
       ${!c.paused && itemErrors[c.name] ? `<div class="serr">${esc(itemErrors[c.name])}</div>` : ""}
-      ${c.paused ? `${settingsHTML({name: c.name, settings: pend}, true)}
+      ${c.paused ? `${settingsHTML({name: c.name, settings: pend, photo_px: c.photo_px}, true)}
         <div class="meta">${changed ? "Changed settings restart training from step 0 (the capture stays on local disk)." : "Change settings to restart from step 0 with them, or resume where it stopped."}</div>` : ""}` : "";
   // Time-dependent values (elapsed, ETA) are left as empty slots and filled by tick().
   setHTML(el, `
@@ -291,12 +291,14 @@ function settingsHTML(it, isCurrent) {
   const field = (k, label, inner) => `<label>${label}${inner.replace("<select", `<select class="${cls(k)}"`).replace("<input", `<input class="${cls(k)}"`)}</label>`;
   return `
     <div class="settings" data-item="${esc(it.name)}">
-      <div class="seg">${["fast", "standard", "high"].map(p => `
+      <div class="seg">${["preview", "fast", "standard", "high"].map(p => `
         <button data-act="preset" data-value="${p}" class="${st.preset === p ? "on" : ""}"
           title="${esc(Object.entries(last.presets[p] || {}).map(([k, v]) => `${k}: ${v}`).join(", "))}">${PRESET_LABEL[p]}</button>`).join("")}</div>
       <div class="fields">
         ${field("total_steps", "Training steps", `<input data-set="total_steps" type="number" min="${last.limits.total_steps[0]}" max="${last.limits.total_steps[1]}" step="500" value="${st.total_steps}">`)}
-        ${field("max_resolution", "Max resolution (px)", selectHTML("max_resolution", st.max_resolution, FIELD_OPTS.max_resolution))}
+        ${field("max_resolution", "Max resolution (px)", selectHTML("max_resolution", st.max_resolution,
+            // no point offering more than the capture's own photos (they're never upscaled)
+            it.photo_px ? FIELD_OPTS.max_resolution.filter(v => v <= it.photo_px) : FIELD_OPTS.max_resolution))}
         ${field("sh_degree", "Colour detail (SH)", selectHTML("sh_degree", st.sh_degree, FIELD_OPTS.sh_degree))}
         ${field("max_splats", "Splat cap", selectHTML("max_splats", st.max_splats, FIELD_OPTS.max_splats))}
         ${field("subsample_frames", "Frames used", selectHTML("subsample_frames", st.subsample_frames, FIELD_OPTS.subsample_frames))}

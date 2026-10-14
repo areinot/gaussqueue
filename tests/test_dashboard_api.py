@@ -232,9 +232,40 @@ class DashboardAPITest(unittest.TestCase):
         self.assertEqual(item.quality["pose_jump_pct"], 60)
         z.unlink()
 
+    def test_pose_cache_roundtrip(self):
+        gq, root = self.gq, Path(self.tmp.name)
+        cap = root / "capP" / "COLMAP_Text_Model"
+        (cap / "sparse" / "0").mkdir(parents=True)
+        (cap / "images").mkdir()
+        (cap / "sparse" / "0" / "cameras.txt").write_text("1 PINHOLE 1920 1440 1300 1300 960 720\n")
+        (cap / "sparse" / "0" / "images.txt").write_text("1 1 0 0 0 0 0 0 1 a.jpg\n\n")
+        (cap / "sparse" / "0" / "points3D.txt").write_text("1 0 0 0 0 0 0 -1\n")
+        gq.POSE_CACHE = root / "pose_cache"
+        cache = gq.pose_cache_dir(self.cfg, cap, "capP")
+        self.assertEqual(cache, gq.pose_cache_dir(self.cfg, cap, "capP"))   # stable key
+        model = root / "refined"
+        (model / "sparse" / "0").mkdir(parents=True)
+        (model / "sparse" / "0" / "cameras.txt").write_text("1 PINHOLE 1920 1440 1300 1300 960 720\n")
+        (model / "sparse" / "0" / "images.txt").write_text("1 0.9 0.1 0 0 0.05 0 0 1 a.jpg\n\n")
+        gq.save_pose_cache(cache, model, {"photos": 1})
+        job = {"name": "capP"}
+        out, stats = gq.refined_model(self.cfg, cap, root / "work", lambda **k: None, job)
+        self.assertTrue(stats["cached"])
+        self.assertIn("0.9 0.1", (out / "sparse" / "0" / "images.txt").read_text())
+        self.assertTrue((out / "images").is_symlink())
+        # A different capture (changed poses) gets a different key.
+        (cap / "sparse" / "0" / "images.txt").write_text("1 1 0 0 0 1 0 0 1 a.jpg\n\n")
+        self.assertNotEqual(cache, gq.pose_cache_dir(self.cfg, cap, "capP"))
+
+    def test_preview_preset_and_photo_size(self):
+        gq = self.gq
+        st = gq.effective_settings(self.cfg, {"preset": "preview"})
+        self.assertEqual((st["total_steps"], st["max_resolution"]), (3000, 720))
+        self.assertEqual(gq.Inbox.photo_size_from("# c\n1 PINHOLE 1920 1440 1 1 1 1\n"), 1920)
+
     def test_snapshot_has_estimates_and_presets(self):
         snap = self.snapshot()
-        self.assertEqual(set(snap["presets"]), {"fast", "standard", "high"})
+        self.assertEqual(set(snap["presets"]), {"preview", "fast", "standard", "high"})
         self.assertTrue(all(q["est_seconds"] for q in snap["queue"]))
         self.assertTrue(snap["inbox_dir"].endswith("inbox"))
 
