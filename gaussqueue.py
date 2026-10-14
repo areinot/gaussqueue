@@ -11,6 +11,7 @@ State and config live in $GAUSSQUEUE_HOME (default
 ~/Library/Application Support/GaussQueue). config.json is re-read on every poll,
 so most edits apply without a restart. See README.md.
 """
+import base64
 import datetime as dt
 import http.server
 import math
@@ -80,6 +81,13 @@ DEFAULTS = {
     # While something is training, snapshots are only processed when at least this much
     # memory is free (they wait for the run to finish otherwise).
     "snapshot_min_free_pct": 25,
+    # Training machines. The Mac trains locally unless local_training is false; remote
+    # workers are Windows/Linux PCs reachable over SSH (key auth; host = an ~/.ssh/config
+    # alias), e.g. {"name": "pc", "label": "PC (RTX 4080)", "ssh": "gpu-pc",
+    #  "brush": "D:/gaussqueue/brush/brush_app.exe", "work_dir": "D:/gaussqueue/jobs"}.
+    # "Auto" captures go to an idle remote worker first, then the Mac.
+    "local_training": True,
+    "workers": [],
 }
 
 
@@ -168,6 +176,11 @@ class Overrides:
                 for k in TRAIN_KEYS:
                     ov.pop(k, None)
                 ov["preset"] = body["value"]
+            elif action == "run_on":   # validated against known workers by the API
+                if body.get("value") in (None, "", "auto"):
+                    ov.pop("run_on", None)
+                else:
+                    ov["run_on"] = str(body["value"])
             elif action == "set":
                 key, val = body.get("key"), body.get("value")
                 if key not in SETTING_LIMITS:
@@ -483,7 +496,7 @@ class Inbox:
                 out.append(p)
         return out
 
-    def tick(self, cfg, busy_name=None):
+    def tick(self, cfg, busy=()):
         present = {p.name: p for p in self.entries()}
         with self.lock:
             for gone in set(self.items) - set(present):
@@ -493,7 +506,7 @@ class Inbox:
                     self.items[fname] = InboxItem(p)
                     log(f"inbox: new item {fname}")
         for item in list(self.items.values()):
-            if item.name == busy_name:
+            if item.name in busy:
                 item.state = "processing"
                 continue
             try:
@@ -520,10 +533,10 @@ class Inbox:
         return [i for i in self.order(overrides)
                 if i.state == "queued" and not overrides.get(i.name).get("hold")]
 
-    def snapshot(self, cfg, overrides, rate, busy_name=None):
+    def snapshot(self, cfg, overrides, rate, busy=()):
         out = []
         for i in self.order(overrides):
-            if i.name == busy_name:
+            if i.name in busy:
                 continue
             ov = overrides.get(i.name)
             d = i.to_json()
@@ -531,6 +544,7 @@ class Inbox:
             d["hold"] = bool(ov.get("hold"))
             d["run_next"] = bool(ov.get("priority"))
             d["est_seconds"] = estimate_seconds(d["settings"], d["frames"], rate)
+            d["run_on"] = ov.get("run_on", "auto")
             out.append(d)
         return out
 
@@ -733,14 +747,46 @@ class Inbox:
 class Status:
     def __init__(self, paths, state, inbox, overrides):
         self.paths, self.state, self.inbox, self.overrides = paths, state, inbox, overrides
-        self.current = None   # dict describing the active job
+        self.jobs = {}          # worker name -> job dict (one job per worker)
+        self.workers = {}       # worker name -> Worker, set in main()
         self.quality_cache = {}
         self.snapshots = None   # set in main()
         self.snapshot = {}    # served as JSON by the dashboard
 
+    # Compatibility: "the" current job is the Mac's, else any running one.
+    @property
+    def current(self):
+        return self.jobs.get("mac") or next(iter(list(self.jobs.values())), None)
+
+    @current.setter
+    def current(self, job):
+        if job is None:
+            self.jobs.pop("mac", None)
+        else:
+            self.jobs["mac"] = job
+
+    def job_for(self, name):
+        return next((j for j in list(self.jobs.values()) if j["name"] == name), None)
+
+    def busy_names(self):
+        return {j["name"] for j in list(self.jobs.values())}
+
+    def job_view(self, cfg, c):
+        v = {k: c.get(k) for k in
+             ("name", "phase", "step", "total", "started", "eta", "preview", "kind", "frames",
+              "thumb", "settings", "paused", "paused_at", "quality", "photo_px", "worker")}
+        w = self.workers.get(c.get("worker"))
+        v["worker_label"] = w.label if w else c.get("worker")
+        v["remote"] = bool(w and w.remote)
+        if self.snapshots:
+            v["snapshots"] = self.snapshots.for_job(c["name"])
+        v["pending_settings"] = effective_settings(cfg, self.overrides.get(c["name"]))
+        v["previews"] = sorted(p.name for p in self.paths.previews.glob(f"{c['name']}_step*.jpg"))
+        return v
+
     def write(self, cfg):
         c = self.current
-        busy = c["name"] if c else None
+        busy = self.busy_names()
         rate = current_rate(c, self.state)
         queue = self.inbox.snapshot(cfg, self.overrides, rate, busy)
         hist, seen = [], set()
@@ -756,27 +802,22 @@ class Status:
                                 and find_processed(self.paths, h["name"]) is not None)
             seen.add(h["name"])
             hist.append(h)
-        current = None
-        if c:
-            current = {k: c.get(k) for k in
-                       ("name", "phase", "step", "total", "started", "eta", "preview",
-                        "kind", "frames", "thumb", "settings", "paused", "paused_at", "quality", "photo_px")}
-            if self.snapshots:
-                current["snapshots"] = self.snapshots.for_job(c["name"])
-            current["pending_settings"] = effective_settings(cfg, self.overrides.get(c["name"]))
-            current["previews"] = sorted(p.name for p in
-                                         self.paths.previews.glob(f"{c['name']}_step*.jpg"))
+        order = list(self.workers) or list(self.jobs)
+        jobs = [self.job_view(cfg, self.jobs[w]) for w in order if w in self.jobs]
+        jobs += [self.job_view(cfg, j) for w, j in list(self.jobs.items()) if w not in order]
+        current = jobs[0] if jobs else None
         self.snapshot = {
             "updated": time.time(), "host": socket.gethostname(),
-            "current": current, "queue": queue, "history": hist,
+            "current": current, "jobs": jobs, "queue": queue, "history": hist,
+            "workers": [w.info(self.jobs.get(n)) for n, w in list(self.workers.items())],
             "settings": standard_settings(cfg),
             "inbox_dir": cfg["inbox_dir"],
             "presets": {k: (v or standard_settings(cfg)) for k, v in PRESETS.items()},
             "limits": SETTING_LIMITS,
         }
-        self.write_text(current, queue, hist)
+        self.write_text(jobs, queue, hist)
 
-    def write_text(self, c, queue, hist):
+    def write_text(self, jobs, queue, hist):
         now = dt.datetime.now()
         lines = [
             "GaussQueue status",
@@ -784,8 +825,8 @@ class Status:
             "(If this time is old, the Mac service is not running.)",
             "",
         ]
-        if c:
-            lines.append(f"NOW: {c['name']}")
+        for c in jobs:
+            lines.append(f"NOW on {c.get('worker_label') or 'Mac'}: {c['name']}")
             lines.append(f"  phase:   {c['phase']}")
             if c.get("settings"):
                 lines.append(f"  quality: {settings_summary(c['settings'])}")
@@ -799,7 +840,7 @@ class Status:
                              f" ({fmt_dur(c['eta'] - time.time())} left)")
             if c.get("preview"):
                 lines.append(f"  preview: previews/{c['preview']}")
-        else:
+        if not jobs:
             lines.append("NOW: idle")
         lines.append("")
         lines.append(f"QUEUE ({len(queue)}):")
@@ -887,9 +928,19 @@ def start_dashboard(cfg, paths, status, overrides):
                     return self.send(200, b'{"ok":true}', "application/json")
                 if not any(i.name == name for i in list(status.inbox.items.values())):
                     raise ValueError("no such inbox item")
-                cur = status.current
+                cur = status.job_for(name)
                 action = body.get("action")
-                if cur and cur["name"] == name:
+                if action == "run_on":
+                    if body.get("value") not in ["auto"] + list(status.workers):
+                        raise ValueError("unknown machine")
+                    if cur:
+                        raise ValueError("already processing")
+                    overrides.apply(name, body)
+                    status.write(load_config())
+                    return self.send(200, b'{"ok":true}', "application/json")
+                remote = bool(cur and status.workers.get(cur.get("worker"))
+                              and status.workers[cur.get("worker")].remote)
+                if cur:
                     if action == "snapshot":
                         if cur.get("phase") not in ("training", "paused"):
                             raise ValueError("snapshots are only possible while training")
@@ -897,6 +948,8 @@ def start_dashboard(cfg, paths, status, overrides):
                         return self.send(200, json.dumps({"ok": True, "step": step}).encode(),
                                          "application/json")
                     if action in ("pause", "resume"):
+                        if remote:
+                            raise ValueError("pause isn't available on remote machines yet")
                         if cur.get("phase") not in ("training", "paused"):
                             raise ValueError("can only pause while training")
                         if action == "resume" and not cur.get("paused"):
@@ -1253,7 +1306,7 @@ def train(cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
     job.update(phase="training", step=0, total=total, started=time.time(),
                train_started=time.time(), eta=None, paused=False, paused_at=None,
                request=None)
-    rotate = capture_rotation(colmap_dir.parent)
+    rotate = capture_rotation(out_dir.parent / "data")
     notified = set()
     last_preview_step = None
     last_progress = 0.0
@@ -1413,18 +1466,252 @@ def write_meta(dest, job, files, flipped):
     (dest / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
 
 
-def process(cfg, paths, state, status, item, beat):
+# ---------------------------------------------------------------- training machines
+
+class LocalWorker:
+    """This Mac."""
+    name, label, remote = "mac", "Mac", False
+
+    def __init__(self):
+        self.stats = {}
+
+    def refresh(self):
+        self.stats = {"mem_free_pct": memory_free_pct()}
+
+    def info(self, job):
+        return {"name": self.name, "label": self.label, "remote": False, "online": True,
+                "job": job and {"name": job["name"], "phase": job.get("phase"),
+                                "step": job.get("step"), "total": job.get("total")},
+                **self.stats}
+
+
+class RemoteWorker:
+    """A GPU machine reached over SSH (key auth via an ~/.ssh/config alias). Runs
+    PowerShell on Windows; the Mac uploads the trainable capture, starts Brush,
+    polls progress renders and downloads the result. Pause isn't supported."""
+    remote = True
+
+    def __init__(self, spec):
+        self.spec = dict(spec)
+        self.name = spec["name"]
+        self.label = spec.get("label") or self.name
+        self.ssh = spec["ssh"]
+        self.brush = spec["brush"].replace("\\", "/")
+        self.root = spec["work_dir"].replace("\\", "/").rstrip("/")
+        self.online = False
+        self.checked = 0.0
+        self.stats = {}
+
+    # -- plumbing
+    def _ssh(self, *args):
+        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4", self.ssh, *args]
+
+    def ps(self, script, timeout=120, check=True):
+        """Run a PowerShell script remotely (encoded, so no quoting problems)."""
+        enc = base64.b64encode(("$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'\n"
+                                + script).encode("utf-16-le")).decode()
+        r = subprocess.run(self._ssh("powershell", "-NoProfile", "-NonInteractive",
+                                     "-EncodedCommand", enc),
+                           capture_output=True, text=True, timeout=timeout)
+        if check and r.returncode:
+            lines = (r.stderr or r.stdout).strip().splitlines()
+            raise RuntimeError(f"{self.label}: {lines[-1] if lines else 'ssh failed'}")
+        return r.stdout
+
+    def job_dir(self, name):
+        return f"{self.root}/{name}"
+
+    def download(self, remote_path, local):
+        tmp = Path(str(local) + ".partial")
+        r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", f"{self.ssh}:/{remote_path}", str(tmp)],
+                           capture_output=True, text=True, timeout=3600)
+        if r.returncode:
+            raise RuntimeError(f"download from {self.label} failed: {r.stderr.strip()[:200]}")
+        tmp.replace(local)
+
+    def remove(self, remote_path):
+        self.ps(f"Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '{remote_path}'", check=False)
+
+    # -- status
+    def refresh(self):
+        try:
+            out = self.ps("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total "
+                          "--format=csv,noheader,nounits", timeout=15)
+            util, used, total = [int(x.strip()) for x in out.strip().splitlines()[0].split(",")]
+            self.stats = {"gpu_util": util, "vram_used_mb": used, "vram_total_mb": total}
+            self.online = True
+        except Exception:
+            self.online, self.stats = False, {}
+        self.checked = time.time()
+
+    def info(self, job):
+        return {"name": self.name, "label": self.label, "remote": True, "online": self.online,
+                "job": job and {"name": job["name"], "phase": job.get("phase"),
+                                "step": job.get("step"), "total": job.get("total")},
+                **self.stats}
+
+    # -- checkpoints for snapshots
+    def latest_export(self, name):
+        out = self.ps(f"Get-ChildItem '{self.job_dir(name)}/out' -Filter export_*.ply -ErrorAction "
+                      "SilentlyContinue | ForEach-Object { $_.Name }", check=False)
+        steps = [int(m.group(1)) for m in re.finditer(r"export_(\d+)\.ply", out)]
+        return max(steps) if steps else None
+
+    def keep_export(self, name, step):
+        d = self.job_dir(name)
+        self.ps(f"New-Item -ItemType Directory -Force '{d}/snapshots' | Out-Null; "
+                f"Copy-Item -Force '{d}/out/export_{step}.ply' '{d}/snapshots/export_{step}.ply'",
+                timeout=600)
+        return f"{d}/snapshots/export_{step}.ply"
+
+    # -- the job
+    def train(self, cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
+        name, d = job["name"], self.job_dir(job["name"])
+        st = job["settings"]
+        total = int(st["total_steps"])
+        job.update(phase=f"uploading to {self.label}", step=None, eta=None, paused=False)
+        beat(force=True)
+        self.ps(f"Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '{d}'; "
+                f"New-Item -ItemType Directory -Force '{d}/data','{d}/out' | Out-Null")
+        # Stream the trainable folder (photos + poses; -h follows the images symlink).
+        tar = subprocess.Popen(["tar", "-C", str(colmap_dir), "-chf", "-", "images", "sparse"],
+                               stdout=subprocess.PIPE)
+        up = subprocess.Popen(self._ssh(f'tar -xf - -C "{d}/data"'), stdin=tar.stdout,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        tar.stdout.close()
+        while up.poll() is None:
+            beat()
+            time.sleep(1)
+        tar.wait()
+        if up.returncode or tar.returncode:
+            raise RuntimeError(f"upload to {self.label} failed: {up.stderr.read().decode()[-200:]}")
+
+        args = [f"{d}/data", "--total-steps", total, "--max-resolution", st["max_resolution"],
+                "--sh-degree", st["sh_degree"], "--max-splats", st["max_splats"],
+                "--subsample-frames", st["subsample_frames"],
+                "--export-every", cfg["checkpoint_every"], "--eval-every", cfg["eval_every"],
+                "--eval-split-every", cfg["eval_split_every"], "--eval-save-to-disk",
+                "--export-path", f"{d}/out"] + list(cfg["extra_args"])
+        arglist = ", ".join("'" + str(a).replace("'", "''") + "'" for a in args)
+        script = (f"$p = Start-Process -FilePath '{self.brush}' -ArgumentList @({arglist}) "
+                  f"-WorkingDirectory '{d}' -NoNewWindow -PassThru "
+                  f"-RedirectStandardOutput '{d}/train.log' -RedirectStandardError '{d}/train.err'\n"
+                  f"$null = $p.Handle\n$p.Id | Out-File -Encoding ascii '{d}/pid.txt'\n"
+                  f"$p.WaitForExit()\nexit $p.ExitCode")
+        enc = base64.b64encode(("$ErrorActionPreference='Stop'\n" + script).encode("utf-16-le")).decode()
+        log(f"run on {self.label}: brush {' '.join(map(str, args))}")
+        proc = subprocess.Popen(self._ssh("powershell", "-NoProfile", "-NonInteractive",
+                                          "-EncodedCommand", enc),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        job.update(phase="training", step=0, total=total, started=time.time(),
+                   train_started=time.time(), eta=None)
+        rotate = capture_rotation(out_dir.parent / "data")
+        notified, last_preview_step, last_poll = set(), None, 0.0
+        tmp = APP_HOME / "tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            while proc.poll() is None:
+                time.sleep(1)
+                beat()
+                if time.time() - last_poll < 10:
+                    continue
+                last_poll = time.time()
+                try:
+                    listing = self.ps(f"Get-ChildItem '{d}/out' -Directory -Filter eval_* | "
+                                      "ForEach-Object { $_.Name }", timeout=30, check=False)
+                except subprocess.TimeoutExpired:
+                    continue
+                steps = [int(m.group(1)) for m in re.finditer(r"eval_(\d+)", listing)]
+                if not steps:
+                    continue
+                step = max(steps)
+                job["step"] = step
+                rate = (time.time() - job["started"]) / step
+                job["eta"] = time.time() + rate * (total - step)
+                ckpt = int(cfg["checkpoint_every"])
+                due = any(f not in notified and step >= f * total for f in cfg["notify_checkpoints"])
+                if step != last_preview_step and (step % ckpt == 0 or step == total or due):
+                    names = self.ps(f"Get-ChildItem '{d}/out/eval_{step}' -Filter *.png | Sort-Object Name | "
+                                    "Select-Object -First 1 | ForEach-Object { $_.Name }", check=False).strip()
+                    if names:
+                        try:
+                            local_png = tmp / f"{name}_{step}.png"
+                            self.download(f"{d}/out/eval_{step}/{names}", local_png)
+                            preview = f"{name}_step{step:05d}.jpg"
+                            make_jpeg(local_png, paths.previews / preview, 1280, rotate)
+                            local_png.unlink(missing_ok=True)
+                            job["preview"], last_preview_step = preview, step
+                        except Exception as e:
+                            log(f"preview from {self.label} failed: {e}")
+                crossed = [f for f in cfg["notify_checkpoints"] if f not in notified and step >= f * total]
+                if crossed and last_preview_step == step:
+                    notified.update(crossed)
+                    img = paths.attach / job["preview"]
+                    shutil.copyfile(paths.previews / job["preview"], img)
+                    imessage(cfg, f"🟡 {name} on {self.label}: {100 * step // total}% "
+                                  f"({step:,}/{total:,} steps), "
+                                  f"ETA ~{dt.datetime.fromtimestamp(job['eta']):%H:%M}", img)
+        except BaseException:
+            self.ps(f"$i = Get-Content '{d}/pid.txt' -ErrorAction SilentlyContinue; "
+                    "if ($i) { Stop-Process -Id $i -Force -ErrorAction SilentlyContinue }", check=False)
+            proc.kill()
+            raise
+        if proc.returncode:
+            err = self.ps(f"Get-Content '{d}/train.err','{d}/train.log' -Tail 5 -ErrorAction SilentlyContinue",
+                          check=False)
+            reason = next((l for l in err.splitlines() if "panicked" in l or "rror" in l), "")
+            raise RuntimeError(f"brush on {self.label} exited with {proc.returncode} {reason[:120]}")
+        job["train_seconds"] = time.time() - job["train_started"]
+        job["phase"] = f"downloading result from {self.label}"
+        beat(force=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        final = out_dir / f"export_{total}.ply"
+        self.download(f"{d}/out/export_{total}.ply", final)
+        try:
+            self.download(f"{d}/train.log", out_dir.parent / "train.log")
+        except Exception:
+            (out_dir.parent / "train.log").write_text("")
+        self.remove(d)   # free the worker's disk; the capture is still on the Mac
+        return final
+
+
+def make_workers(cfg):
+    """Configured machines, in scheduling preference order (remote GPUs first)."""
+    ws = [RemoteWorker(spec) for spec in cfg.get("workers") or []]
+    if cfg.get("local_training", True):
+        ws.append(LocalWorker())
+    return {w.name: w for w in ws}
+
+
+def wait_for_mac_memory(cfg, status, job, beat):
+    """Pose refinement uses several GB of RAM; if the Mac is also training, wait for headroom."""
+    need = int(cfg.get("snapshot_min_free_pct", 25))
+    while True:
+        mac = status.jobs.get("mac")
+        if not mac or mac.get("phase") not in ("training", "paused"):
+            return
+        free = memory_free_pct()
+        if free >= need:
+            return
+        job["phase"] = f"waiting for Mac memory to refine poses ({free}% free, needs {need}%)"
+        beat()
+        time.sleep(30)
+
+
+def process(cfg, paths, state, status, item, beat, worker=None):
+    worker = worker or LocalWorker()
     name = item.name
     job_dir = paths.jobs / name
     job_dir.mkdir(parents=True, exist_ok=True)
     job = {"name": name, "phase": "downloading from iCloud", "step": None,
            "kind": item.kind, "frames": item.frames, "thumb": item.thumb,
            "file": item.path.name, "quality": item.quality, "photo_px": item.photo_px,
-           "settings": effective_settings(cfg, status.overrides.get(name))}
+           "settings": effective_settings(cfg, status.overrides.get(name)), "worker": worker.name}
     for old in paths.previews.glob(f"{name}_step*.jpg"):  # from an earlier run
         old.unlink()
-    status.current = job
-    beat()
+    status.jobs[worker.name] = job
+    beat(force=True)
     t0 = time.time()
     imessage(cfg, f"📥 {name}: received, starting"
                   + (f". {quality_text(item.quality)}" if item.quality else ""))
@@ -1446,6 +1733,8 @@ def process(cfg, paths, state, status, item, beat):
             source = colmap
             if job["settings"].get("refine_poses"):
                 if refined is None:
+                    if worker.remote:   # COLMAP runs on the Mac; don't squeeze a Mac training job
+                        wait_for_mac_memory(cfg, status, job, beat)
                     try:
                         refined = refined_model(cfg, colmap, job_dir / "refine", beat, job)
                     except Exception as e:
@@ -1455,7 +1744,10 @@ def process(cfg, paths, state, status, item, beat):
                 if refined[0]:
                     source = refined[0]
                 job["refine"] = refined[1]
-            final = train(cfg, paths, job, source, out_dir, beat, pending)
+            if worker.remote:
+                final = worker.train(cfg, paths, job, source, out_dir, beat, pending)
+            else:
+                final = train(cfg, paths, job, source, out_dir, beat, pending)
             if final is not RESTART:
                 break
             for old in paths.previews.glob(f"{name}_step*.jpg"):
@@ -1525,7 +1817,7 @@ def process(cfg, paths, state, status, item, beat):
         if job.get("preview"):
             img = paths.attach / job["preview"]
             shutil.copyfile(paths.previews / job["preview"], img)
-        imessage(cfg, f"✅ {name}: done in {dur}. In the outbox: {files}"
+        imessage(cfg, f"✅ {name}: done in {dur} on {worker.label}. In the outbox: {files}"
                       + (f". Compression problem: {'; '.join(cerrors)}" if cerrors else ""), img)
     except Exception as e:
         if not item.path.exists():
@@ -1541,8 +1833,8 @@ def process(cfg, paths, state, status, item, beat):
         imessage(cfg, f"❌ {name}: failed after {dur}: {e}")
     finally:
         status.overrides.clear(name)
-        status.current = None
-        beat()
+        status.jobs.pop(worker.name, None)
+        beat(force=True)
 
 
 def record(state, job, result, duration, detail):
@@ -1589,6 +1881,9 @@ class Snapshots:
             return sum(s["state"] in ("queued", "processing") for s in self.state.get("snapshots", []))
 
     def request(self, job):
+        w = self.status.workers.get(job.get("worker"))
+        if w and w.remote:
+            return self.request_remote(job, w)
         out_dir = Path(job.get("out_dir") or "")
         step = latest_step(out_dir, "export") if out_dir.is_dir() else None
         if not step:
@@ -1618,8 +1913,34 @@ class Snapshots:
         self.wake.set()
         return step
 
+    def request_remote(self, job, w):
+        """Remote job: copy the latest checkpoint aside on the remote machine (so the
+        job's own cleanup can't delete it); the worker downloads it when processing."""
+        step = w.latest_export(job["name"])
+        if not step:
+            raise ValueError("no checkpoint yet (Brush saves one every checkpoint_every steps)")
+        with STATE_LOCK:
+            if any(s["name"] == job["name"] and s["step"] == step and s["state"] != "failed"
+                   for s in self.state["snapshots"]):
+                raise ValueError(f"step {step:,} is already snapshotted; wait for the next checkpoint")
+        remote_path = w.keep_export(job["name"], step)
+        preview = f"{job['name']}_step{step:05d}.jpg"
+        snap = {"name": job["name"], "step": step, "total": job.get("total"),
+                "src": f"remote:{w.name}:{remote_path}", "state": "queued",
+                "requested": time.time(), "error": None,
+                "settings": dict(job.get("settings") or {}), "frames": job.get("frames"),
+                "quality": job.get("quality"), "thumb": job.get("thumb"),
+                "preview": preview if (self.paths.previews / preview).exists() else job.get("preview")}
+        with STATE_LOCK:
+            self.state["snapshots"].append(snap)
+            self.state["snapshots"] = self.state["snapshots"][-30:]
+            save_state(self.state)
+        log(f"snapshot queued: {job['name']} step {step} (on {w.label})")
+        self.wake.set()
+        return step
+
     def safe_to_run(self, cfg):
-        c = self.status.current
+        c = self.status.jobs.get("mac")
         if not c:
             return True, ""
         if c.get("phase") in ("compressing", "flipping") or "refining" in str(c.get("phase")):
@@ -1657,6 +1978,18 @@ class Snapshots:
         t0 = time.time()
         work = self.paths.jobs / snap["name"] / "snapshots" / label
         try:
+            if snap["src"].startswith("remote:"):   # fetch the checkpoint from the worker first
+                _, wname, rpath = snap["src"].split(":", 2)
+                w = self.status.workers.get(wname)
+                if not w:
+                    raise RuntimeError(f"machine {wname} is not configured any more")
+                local = self.paths.jobs / snap["name"] / "snapshots" / f"export_{snap['step']}.ply"
+                local.parent.mkdir(parents=True, exist_ok=True)
+                w.download(rpath, local)
+                w.remove(rpath)
+                with STATE_LOCK:
+                    snap["src"] = str(local)
+                    save_state(self.state)
             src = Path(snap["src"])
             if not src.exists():
                 raise RuntimeError("checkpoint file is gone")
@@ -1773,36 +2106,74 @@ def main():
     overrides = Overrides()
     status = Status(paths, state, inbox, overrides)
     status.snapshots = Snapshots(paths, state, status)
+    status.workers = make_workers(cfg)
     threading.Thread(target=status.snapshots.run_forever, daemon=True).start()
+
+    def monitor():   # machine status for the dashboard and the scheduler
+        while True:
+            for w in list(status.workers.values()):
+                try:
+                    w.refresh()
+                except Exception as e:
+                    log(f"status of {w.label}: {e}")
+            time.sleep(20)
+    threading.Thread(target=monitor, daemon=True).start()
     start_dashboard(cfg, paths, status, overrides)
-    log(f"GaussQueue started, watching {paths.inbox}")
+    log(f"GaussQueue started, watching {paths.inbox}; machines: "
+        + ", ".join(w.label for w in status.workers.values()))
     last_beat = [0.0]
+    beat_lock = threading.Lock()
+    running = {}   # worker name -> (thread, capture name)
 
     def beat(force=False):
-        """Called often from every wait loop: keep the inbox (thumbnails!) and
-        status fresh even while a job is training."""
+        """Called often from every job thread's wait loops: keep the inbox (thumbnails!)
+        and status fresh even while jobs are training."""
         if not force and time.time() - last_beat[0] < 2:
             return
-        last_beat[0] = time.time()
-        c = load_config()
+        if not beat_lock.acquire(blocking=force):
+            return   # another thread is already refreshing
         try:
-            inbox.tick(c, status.current["name"] if status.current else None)
-        except Exception as e:
-            log(f"inbox error: {e}")
-        status.write(c)
+            last_beat[0] = time.time()
+            c = load_config()
+            try:
+                busy = status.busy_names() | {n for _, n in list(running.values())}
+                inbox.tick(c, busy)
+            except Exception as e:
+                log(f"inbox error: {e}")
+            status.write(c)
+        finally:
+            beat_lock.release()
+
+    def run_job(cfg, item, worker):
+        try:
+            process(cfg, paths, state, status, item, beat, worker)
+        finally:
+            running.pop(worker.name, None)
 
     while True:
         try:
             cfg = load_config()
             last_beat[0] = 0
-            beat()
-            ready = inbox.ready(overrides)
-            if ready:
-                process(cfg, paths, state, status, ready[0], beat)
-                continue  # rescan immediately
-            cleanup_jobs(paths, cfg["keep_work_days"])
-            if not status.snapshots.pending():   # never reload mid-snapshot
-                reload_if_changed()
+            beat(force=True)
+            for name in [n for n, (t, _) in list(running.items()) if not t.is_alive()]:
+                running.pop(name, None)
+            claimed = {n for _, n in list(running.values())}
+            for w in list(status.workers.values()):   # remote GPUs first, then the Mac
+                if w.name in running or (w.remote and not w.online):
+                    continue
+                item = next((i for i in inbox.ready(overrides) if i.name not in claimed
+                             and overrides.get(i.name).get("run_on", "auto") in ("auto", w.name)), None)
+                if item is None:
+                    continue
+                t = threading.Thread(target=run_job, args=(cfg, item, w), daemon=True)
+                running[w.name] = (t, item.name)
+                claimed.add(item.name)
+                log(f"starting {item.name} on {w.label}")
+                t.start()
+            if not running:
+                cleanup_jobs(paths, cfg["keep_work_days"])
+                if not status.snapshots.pending():   # never reload mid-job or mid-snapshot
+                    reload_if_changed()
         except Exception as e:
             log(f"loop error: {e}\n{traceback.format_exc()}")
         time.sleep(cfg["poll_seconds"])

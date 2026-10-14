@@ -288,6 +288,36 @@ class DashboardAPITest(unittest.TestCase):
             self.status.current = None
             self.status.state["snapshots"] = []
 
+    def test_workers_run_on_and_parallel_jobs(self):
+        gq = self.gq
+        pc = gq.RemoteWorker({"name": "pc", "label": "PC", "ssh": "gpu-pc",
+                              "brush": "C:/b/brush_app.exe", "work_dir": "D:/gq/jobs"})
+        self.status.workers = {"pc": pc, "mac": gq.LocalWorker()}
+        try:
+            # Run on: only known machines are accepted, and it's stored per capture.
+            self.assertEqual(self.post({"name": "capA", "action": "run_on", "value": "pc"})[0], 200)
+            self.assertEqual(self.overrides.get("capA").get("run_on"), "pc")
+            self.assertEqual(self.post({"name": "capA", "action": "run_on", "value": "laptop"})[0], 400)
+            self.post({"name": "capA", "action": "run_on", "value": "auto"})
+            self.assertNotIn("run_on", self.overrides.get("capA"))
+            # Two jobs at once, one per machine; both show up and both count as busy.
+            self.status.jobs = {"pc": {"name": "capA", "phase": "training", "worker": "pc", "step": 10, "total": 100},
+                                "mac": {"name": "capB", "phase": "training", "worker": "mac", "step": 5, "total": 100}}
+            self.status.write(self.cfg)
+            snap = self.snapshot()
+            self.assertEqual([j["name"] for j in snap["jobs"]], ["capA", "capB"])   # remote first
+            self.assertEqual(snap["jobs"][0]["worker_label"], "PC")
+            self.assertTrue(snap["jobs"][0]["remote"])
+            self.assertFalse({"capA", "capB"} & {q["name"] for q in snap["queue"]})   # busy, not queued
+            self.assertEqual({w["name"] for w in snap["workers"]}, {"pc", "mac"})
+            # Pause is refused on the remote machine, allowed on the Mac.
+            self.assertIn("remote", self.post({"name": "capA", "action": "pause"})[1])
+            self.assertEqual(self.post({"name": "capB", "action": "pause"})[0], 200)
+        finally:
+            self.status.jobs = {}
+            self.status.workers = {}
+            self.status.write(self.cfg)
+
     def test_snapshot_has_estimates_and_presets(self):
         snap = self.snapshot()
         self.assertEqual(set(snap["presets"]), {"preview", "fast", "standard", "high"})

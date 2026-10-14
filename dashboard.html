@@ -117,6 +117,20 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .cqtext { font-size: 12px; color: var(--muted); }
 .cqtext .warn { color: var(--bad); font-weight: 600; }
 .history .cq { margin-top: 4px; max-width: 520px; }
+.machines { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+.machine { padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; }
+.machine .mname { font-weight: 600; display: flex; align-items: center; gap: 7px; }
+.machine .mstate { font-size: 13px; overflow-wrap: anywhere; }
+.machine .mbar { height: 5px; background: var(--track); border-radius: 99px; overflow: hidden; }
+.machine .mbar > div { height: 100%; background: var(--accent); }
+.mdot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; }
+.mdot.off { background: var(--muted); } .mdot.busy { background: var(--accent); }
+#now { display: flex; flex-direction: column; gap: 12px; }
+.onbadge { font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 99px; color: var(--accent);
+  border: 1px solid currentColor; text-transform: uppercase; letter-spacing: .04em; margin-left: 6px; vertical-align: 2px; }
+.runon { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.runon select { font: inherit; font-size: 13px; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--bg); color: var(--text); }
 .serr { font-size: 12px; color: var(--bad); min-height: 0; }
 #lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.88); display: none; align-items: center;
   justify-content: center; z-index: 10; cursor: zoom-out; padding: 16px; }
@@ -137,8 +151,11 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
     <div class="live"><span class="dot" id="dot"></span><span id="live">connecting…</span></div>
   </header>
 
+  <h2>Machines</h2>
+  <div id="machines" class="machines"></div>
+
   <h2>Training now</h2>
-  <div id="now" class="panel"><div class="idle">Loading…</div></div>
+  <div id="now"><div class="panel"><div class="idle">Loading…</div></div></div>
 
   <h2 id="queue-h">Inbox</h2>
   <div id="queue"></div>
@@ -151,7 +168,7 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const img = (name, alt) => name ? `<img src="/img/${encodeURIComponent(name)}" alt="${esc(alt)}" data-zoom loading="lazy">` : "";
+const img = (name, alt) => name ? `<img src="/img/${encodeURIComponent(name)}" alt="" data-zoom loading="lazy" onerror="this.remove()">` : "";
 const dur = (s) => { s = Math.max(0, Math.round(s)); const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
   return h ? `${h}h ${String(m).padStart(2,"0")}m` : m ? `${m}m` : `${s}s`; };
 const clock = (t) => new Date(t*1000).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
@@ -170,8 +187,7 @@ const FIELD_OPTS = {
 const openSettings = new Set();   // queue items whose settings panel is expanded
 const itemErrors = {};            // name -> last error message from the server
 
-let selected = null;   // checkpoint preview chosen in the strip (null = latest)
-let lastJob = null;
+const selectedBy = {};  // job name -> checkpoint preview chosen in its strip (absent = latest)
 let last = null;       // latest /api/status payload, for the 1s clock ticker
 
 // Only touch the DOM when a section's markup actually changed. Rebuilding
@@ -195,7 +211,8 @@ function preload(name) {
 
 const heroName = (c) => {
   const previews = c.previews || [];
-  return selected && previews.includes(selected) ? selected : (c.preview || c.thumb);
+  const sel = selectedBy[c.name];
+  return sel && previews.includes(sel) ? sel : (c.preview || c.thumb);
 };
 
 function editing(el) {
@@ -203,27 +220,33 @@ function editing(el) {
   return a && el.contains(a) && (a.tagName === "INPUT" || a.tagName === "SELECT");
 }
 
-function renderNow(c) {
+function renderJobs(jobs) {
   const el = $("now");
   if (editing(el)) return;
-  if (!c) { lastJob = null; selected = null; el.className = "panel";
-    setHTML(el, `<div class="idle">Idle. Drop a capture (zip or folder with a COLMAP model) into <b>${esc(last && last.inbox_dir || "the inbox")}</b>.</div>`); return; }
-  if (c.name !== lastJob) { selected = null; lastJob = c.name; }
+  for (const k of Object.keys(selectedBy)) if (!jobs.some(j => j.name === k)) delete selectedBy[k];
+  if (!jobs.length) {
+    setHTML(el, `<div class="panel"><div class="idle">Idle. Drop a capture (zip or folder with a COLMAP model) into <b>${esc(last && last.inbox_dir || "the inbox")}</b>.</div></div>`);
+    return;
+  }
+  setHTML(el, jobs.map(jobPanel).join(""));
+}
+
+function jobPanel(c) {
   const previews = c.previews || [];
   const hero = heroName(c);
   const pct = c.step != null && c.total ? Math.min(100, 100*c.step/c.total) : 0;
   const stepLabel = (n) => { const m = n.match(/_step(\d+)\.jpg$/); return m ? `${(+m[1]/1000).toFixed(1)}k` : ""; };
-  el.className = "panel now" + (c.paused ? " paused" : "");
   const pend = c.pending_settings, run = c.settings;
   const changed = c.paused && pend && run && ["total_steps", "max_resolution", "sh_degree", "max_splats", "subsample_frames", "refine_poses"].some(k => (pend[k] || 0) !== (run[k] || 0));
   const canPause = c.phase === "training" || c.paused;
+  const pauseBtn = c.remote ? "" : `<button data-act="pause">Pause</button>`;
   const controls = canPause && last.presets ? `
       <div class="controls" data-item="${esc(c.name)}">
         ${c.paused
           ? `<button class="primary" data-act="resume">${changed ? "Restart with new settings" : "Resume"}</button>
              <span class="badge b-paused">paused</span>
              <button data-act="snapshot" title="Turn the latest checkpoint into a result you can open now (as <name>-step<N>).">Publish snapshot</button>`
-          : `<button data-act="pause">Pause</button>
+          : `${pauseBtn}
              <button data-act="snapshot" title="Turn the latest checkpoint into a result you can open now (as <name>-step<N>). Training keeps going; processing waits until it can't slow the run.">Publish snapshot</button>
              ${flipBox(pend && pend.flip_up)}`}
       </div>
@@ -237,10 +260,10 @@ function renderNow(c) {
       ${c.paused ? `${settingsHTML({name: c.name, settings: pend, photo_px: c.photo_px}, true)}
         <div class="meta">${changed ? "Changed settings restart training from step 0 (the capture stays on local disk)." : "Change settings to restart from step 0 with them, or resume where it stopped."}</div>` : ""}` : "";
   // Time-dependent values (elapsed, ETA) are left as empty slots and filled by tick().
-  setHTML(el, `
+  return `<div class="panel now${c.paused ? " paused" : ""}" data-job="${esc(c.name)}">
     <div class="hero">${hero ? img(hero, c.name) : `<span class="meta">no preview yet</span>`}</div>
     <div class="info">
-      <div class="name">${esc(c.name)}</div>
+      <div class="name">${esc(c.name)}${c.worker_label ? `<span class="onbadge">on ${esc(c.worker_label)}</span>` : ""}</div>
       <div class="phase">${esc(c.phase)}${kindText(c.kind, c.frames) ? " · " + esc(kindText(c.kind, c.frames)) : ""}</div>
       ${c.settings ? `<div class="quality">${qualityText(c.settings)}</div>` : ""}
       ${captureQuality(c.quality)}
@@ -252,9 +275,29 @@ function renderNow(c) {
         <div class="stat"><div class="k">ETA</div><div class="v" data-t="eta">—</div></div>
       </div>
       ${previews.length ? `<div class="strip">${previews.map(p => `
-        <figure><img src="/img/${encodeURIComponent(p)}" data-pick="${esc(p)}" class="${p === hero ? "sel" : ""}" alt="">${stepLabel(p)}</figure>`).join("")}</div>
+        <figure><img src="/img/${encodeURIComponent(p)}" data-pick="${esc(p)}" data-job="${esc(c.name)}" class="${p === hero ? "sel" : ""}" alt="">${stepLabel(p)}</figure>`).join("")}</div>
         <div class="meta">Click a checkpoint to show it above; renders are from a camera held out of training.</div>` : ""}
-    </div>`);
+    </div>
+  </div>`;
+}
+
+function renderMachines(ws) {
+  if (!ws || !ws.length) { setHTML($("machines"), ""); return; }
+  setHTML($("machines"), ws.map(w => {
+    const j = w.job;
+    const pct = j && j.step != null && j.total ? Math.min(100, 100 * j.step / j.total) : 0;
+    const state = !w.online ? "offline"
+      : j ? `${esc(j.name)} · ${j.step != null ? `${j.step.toLocaleString()}/${(j.total || 0).toLocaleString()}` : esc(j.phase || "")}`
+      : "idle";
+    const extra = w.remote
+      ? (w.online && w.vram_total_mb ? `GPU ${w.gpu_util}% · ${(w.vram_used_mb / 1024).toFixed(1)}/${(w.vram_total_mb / 1024).toFixed(0)} GB VRAM` : "")
+      : (w.mem_free_pct != null ? `memory ${w.mem_free_pct}% free` : "");
+    return `<div class="panel machine">
+      <div class="mname"><span class="mdot ${!w.online ? "off" : j ? "busy" : ""}"></span>${esc(w.label)}</div>
+      <div class="mstate">${state}</div>
+      ${j ? `<div class="mbar"><div style="width:${pct.toFixed(1)}%"></div></div>` : ""}
+      <div class="meta">${extra}</div>
+    </div>`; }).join(""));
 }
 
 // SplatKing's per-photo capture ratings (from splatpack.json).
@@ -312,6 +355,9 @@ function settingsHTML(it, isCurrent) {
         ${field("sh_degree", "Colour detail (SH)", selectHTML("sh_degree", st.sh_degree, FIELD_OPTS.sh_degree))}
         ${field("max_splats", "Splat cap", selectHTML("max_splats", st.max_splats, FIELD_OPTS.max_splats))}
         ${field("subsample_frames", "Frames used", selectHTML("subsample_frames", st.subsample_frames, FIELD_OPTS.subsample_frames))}
+        ${!isCurrent && last.workers && last.workers.length > 1 ? `<div class="flipfield runon">Run on
+          <select data-runon>${[["auto", "Auto (fastest free)"], ...last.workers.map(w => [w.name, w.label])].map(([v, l]) =>
+            `<option value="${esc(v)}"${(it.run_on || "auto") === v ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></div>` : ""}
         <div class="flipfield">${refineBox(st.refine_poses)}</div>
         <div class="flipfield">${flipBox(st.flip_up)}</div>
       </div>
@@ -386,16 +432,17 @@ function renderHistory(h) {
 // Update clocks in place every second without re-rendering anything.
 function tick() {
   if (!last) return;
-  const now = Date.now()/1000, c = last.current;
+  const now = Date.now()/1000;
   const age = now - last.updated;
   $("dot").classList.toggle("stale", age > 60);
   $("live").textContent = age > 60 ? `stale: last update ${dur(age)} ago` :
     `live · ${last.settings.total_steps.toLocaleString()} steps @ ${last.settings.max_resolution}px`;
   const set = (sel, text) => document.querySelectorAll(sel).forEach(e => { if (e.textContent !== text) e.textContent = text; });
-  if (c) {
+  for (const c of (last.jobs || [])) {
     const t = c.paused && c.paused_at ? c.paused_at : now;
-    set('[data-t="elapsed"]', c.started ? dur(t - c.started) : "—");
-    set('[data-t="eta"]', c.paused ? "paused" : c.eta ? `${clock(c.eta)} (${dur(c.eta - now)})` : "—");
+    const sel = (k) => `[data-job="${CSS.escape(c.name)}"] [data-t="${k}"]`;
+    set(sel("elapsed"), c.started ? dur(t - c.started) : "—");
+    set(sel("eta"), c.paused ? "paused" : c.eta ? `${clock(c.eta)} (${dur(c.eta - now)})` : "—");
   }
   document.querySelectorAll("[data-since]").forEach(e => {
     const t = dur(now - +e.dataset.since);
@@ -407,10 +454,11 @@ async function refresh() {
   try {
     const r = await fetch("/api/status", {cache: "no-store"});
     const s = await r.json();
-    if (s.current) await preload(heroName(s.current));
+    s.jobs = s.jobs || (s.current ? [s.current] : []);
+    await Promise.all(s.jobs.map(j => preload(heroName(j))));
     last = s;
     $("stamp").textContent = new Date().toLocaleTimeString([], {hour: "numeric", minute: "2-digit", second: "2-digit"});
-    renderNow(s.current); renderQueue(s.queue || []); renderHistory(s.history || []);
+    renderMachines(s.workers); renderJobs(s.jobs); renderQueue(s.queue || []); renderHistory(s.history || []);
     tick();
   } catch (e) {
     $("dot").classList.add("stale");
@@ -419,6 +467,8 @@ async function refresh() {
 }
 
 document.addEventListener("change", (e) => {
+  const ro = e.target.closest("[data-runon]");
+  if (ro) { sendItem(ro.closest("[data-item]").dataset.item, {action: "run_on", value: ro.value}); return; }
   const f = e.target.closest("[data-set]");
   if (!f) return;
   const name = f.closest("[data-item]").dataset.item;
@@ -443,7 +493,8 @@ document.addEventListener("click", (e) => {
     sendItem(name, body); return;
   }
   const pick = e.target.closest("[data-pick]");
-  if (pick) { selected = pick.dataset.pick; preload(selected).then(() => last && renderNow(last.current)); return; }
+  if (pick) { selectedBy[pick.dataset.job] = pick.dataset.pick;
+    preload(pick.dataset.pick).then(() => last && renderJobs(last.jobs || [])); return; }
   const z = e.target.closest("[data-zoom]");
   if (z) { $("lightbox").querySelector("img").src = z.src; $("lightbox").classList.add("open"); return; }
   if (e.target.closest("#lightbox")) $("lightbox").classList.remove("open");

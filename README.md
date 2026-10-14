@@ -112,6 +112,47 @@ Re-running is safe; it never overwrites an existing config. To update, run
 `git pull` and then re-run `install.sh`. To remove it, run `scripts/uninstall.sh`,
 which leaves your data in place.
 
+## Remote GPU workers (optional)
+
+A Windows PC with an NVIDIA GPU can do the training while the Mac keeps coordinating.
+The Mac still watches the inbox, refines poses, compresses, publishes and texts. For each
+capture it streams the photos and poses to the PC over SSH, runs Brush there, pulls the
+progress renders back for the dashboard, and downloads the finished `.ply`. Two captures
+can train at once, one on each machine. Captures set to *Auto* go to an idle remote worker
+first, then to the Mac. Each capture can also be pinned with **Run on**. The dashboard's
+*Machines* panel shows each machine's job, GPU load and memory.
+
+Setup on the PC (Windows 10/11, PowerShell as Administrator):
+
+1. Add *OpenSSH Server* (Settings → System → Optional features), then
+   `Start-Service sshd; Set-Service sshd -StartupType Automatic`, and allow TCP 22 in the firewall.
+2. Authorize a key that exists only for this purpose (`ssh-keygen -t ed25519 -f ~/.ssh/gaussqueue_worker`
+   on the Mac). For an administrator account, append the **public** key to
+   `%ProgramData%\ssh\administrators_authorized_keys` and restrict that file with
+   `icacls ... /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F"`.
+3. Download the Brush Windows release, check its SHA-256, and unzip it, e.g. to `D:\gaussqueue\brush`.
+
+On the Mac, add an alias to `~/.ssh/config` (it keeps the address and key out of GaussQueue's config):
+
+```
+Host gpu-pc
+    HostName <pc-address>
+    User <windows-user>
+    IdentityFile ~/.ssh/gaussqueue_worker
+    IdentitiesOnly yes
+```
+
+Then list the machine in `config.json`:
+
+```json
+"workers": [{"name": "pc", "label": "PC (RTX 4080)", "ssh": "gpu-pc",
+             "brush": "D:/gaussqueue/brush/brush_app.exe", "work_dir": "D:/gaussqueue/jobs"}]
+```
+
+Set `"local_training": false` to train only on remote workers. Limitations: *Pause* isn't
+available on remote machines yet. If the SSH connection drops mid-run, the capture fails and
+can be requeued.
+
 ## Folders
 
 | Setting | Default | What goes there |
