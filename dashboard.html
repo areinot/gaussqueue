@@ -85,15 +85,12 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
   color: var(--muted); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
 .helpbtn:hover { background: var(--track); }
 .helpbtn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
-/* A card with help open spans two columns: photo, details and controls stay at their normal
-   size on the left, the help column runs down the right. */
-.grid > .card.wide { grid-column: span 2; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  grid-template-areas: "thumb help" "body help" "set help"; grid-template-rows: auto auto 1fr; }
-.card.wide > .thumb { grid-area: thumb; }
-.card.wide > .body { grid-area: body; }
-.card.wide > .settings { display: contents; }
-.card.wide .scol { grid-area: set; border-top: 1px solid var(--line); padding: 10px 12px 12px; }
-.card.wide .help { grid-area: help; padding: 14px 16px; }
+/* Help open on a queue card: the card stays one column and spans two rows; the help card
+   sits in the next column under the neighbouring card (placed by placeHelp()). */
+.grid { grid-auto-flow: row dense; }
+.grid > .card.helping { grid-row: span 2; }
+.helpcard { align-self: stretch; padding: 14px 16px; border-left: 2px solid var(--accent) !important; }
+.helpcard.on-left { border-left: 1px solid var(--line) !important; border-right: 2px solid var(--accent) !important; }  /* edge faces its card */
 .help { border-left: 1px solid var(--line); padding-left: 12px; font-size: 12.5px; line-height: 1.5;
   color: var(--muted); display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .help .hname { font-size: 13px; font-weight: 600; color: var(--text); }
@@ -105,12 +102,8 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 @media (prefers-reduced-motion: reduce) { .help .hbody { transition: none; } }
 [data-help-key].hl { outline: 1px dashed var(--accent); outline-offset: 2px; border-radius: 4px; }
 @media (max-width: 560px) {
-  .grid > .card.wide { grid-column: auto; display: flex; }
-  .card.wide > .settings { display: grid; }
-  .card.wide .scol { border-top: 0; padding: 0; grid-area: auto; }
-  .card.wide .help { grid-area: auto; padding: 10px 0 0; }
   .settings.with-help { grid-template-columns: minmax(0, 1fr); }
-  .help { border-left: 0; border-top: 1px solid var(--line); padding: 10px 0 0; }
+  .settings.with-help .help { border-left: 0; border-top: 1px solid var(--line); padding: 10px 0 0; }
 }
 .seg { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 .seg button { flex: 1; background: none; border: 0; border-left: 1px solid var(--line); padding: 5px 0;
@@ -477,32 +470,39 @@ function fillHelp() {
     const key = helpKey[name] || "preset";
     const html = helpHTML(key, it.settings, it);
     if (el._html !== html) { el._html = html; el.innerHTML = html; }
-    el.closest(".settings").querySelectorAll("[data-help-key]").forEach(f => f.classList.toggle("hl", f.dataset.helpKey === key));
+    const panel = settingsFor(name);
+    if (panel) panel.querySelectorAll("[data-help-key]").forEach(f => f.classList.toggle("hl", f.dataset.helpKey === key));
   });
   requestAnimationFrame(alignHelp);
 }
 
-// Line each help text up with the setting it describes (side-by-side layout only).
+const settingsFor = (name) => document.querySelector(`.settings[data-item="${CSS.escape(name)}"]`);
+
+// Line each help text up with the setting it describes (when it sits beside the controls).
 function alignHelp() {
   document.querySelectorAll("[data-help-panel]").forEach((el) => {
-    const body = el.firstElementChild, target = el.closest(".settings").querySelector("[data-help-key].hl");
+    const panel = settingsFor(el.dataset.helpPanel);
+    const body = el.firstElementChild, target = panel && panel.querySelector("[data-help-key].hl");
     if (!body || !target) return;
-    if (getComputedStyle(el).borderLeftStyle === "none") { body.style.transform = ""; return; }
+    const beside = el.getBoundingClientRect().left >= panel.getBoundingClientRect().right - 1
+                || el.getBoundingClientRect().right <= panel.getBoundingClientRect().left + 1;
+    if (!beside) { body.style.transform = ""; return; }
     const pad = parseFloat(getComputedStyle(el).paddingTop) || 0;
     const room = el.clientHeight - pad * 2 - body.offsetHeight;
     const y = target.getBoundingClientRect().top - el.getBoundingClientRect().top - pad - 4;
     body.style.transform = `translateY(${Math.max(0, Math.min(y, room))}px)`;
   });
 }
-window.addEventListener("resize", () => requestAnimationFrame(alignHelp));
+window.addEventListener("resize", () => requestAnimationFrame(() => { placeHelp(true); alignHelp(); }));
 
 function settingsHTML(it, isCurrent) {
   const st = it.settings, base = (last.presets || {})[st.base] || {};
   const cls = (k) => st.preset === "custom" && base[k] !== undefined && base[k] !== st[k] ? "changed" : "";
   const field = (k, label, inner) => `<label data-help-key="${k}">${label}${inner.replace("<select", `<select class="${cls(k)}"`).replace("<input", `<input class="${cls(k)}"`)}</label>`;
   const help = helpOpen.has(it.name);
+  const inline = help && isCurrent;   // the running capture's panel has room beside its controls
   return `
-    <div class="settings${help ? " with-help" : ""}" data-item="${esc(it.name)}">
+    <div class="settings${help ? " helping" : ""}${inline ? " with-help" : ""}" data-item="${esc(it.name)}">
      <div class="scol">
       <div class="shead">
         <div class="seg" data-help-key="preset">${["preview", "fast", "standard", "high"].map(p => `
@@ -533,7 +533,7 @@ function settingsHTML(it, isCurrent) {
       </div>
       ${itemErrors[it.name] ? `<div class="serr">${esc(itemErrors[it.name])}</div>` : ""}
      </div>
-     ${help ? `<aside class="help" data-help-panel="${esc(it.name)}" aria-live="polite"></aside>` : ""}
+     ${inline ? `<aside class="help" data-help-panel="${esc(it.name)}" aria-live="polite"></aside>` : ""}
     </div>`;
 }
 
@@ -551,7 +551,7 @@ function renderQueue(q) {
       : queued ? `<span class="badge b-queued">#${pos} in queue</span>`
       : `<span class="badge b-${esc(it.state)}">${esc(it.state)}</span>`;
     return `
-    <div class="panel card${it.hold ? " held" : ""}${helpOpen.has(it.name) && openSettings.has(it.name) ? " wide" : ""}">
+    <div class="panel card${it.hold ? " held" : ""}" data-card="${esc(it.name)}">
       <div class="thumb">${it.thumb ? img(it.thumb, it.name) : `<span class="note">${esc(it.thumb_note || "making thumbnail…")}</span>`}</div>
       <div class="body">
         <div class="name">${esc(it.name)}</div>
@@ -563,8 +563,47 @@ function renderQueue(q) {
         ${editable && it.settings ? `<button class="toggle" data-toggle="${esc(it.name)}">${openSettings.has(it.name) ? "Hide settings" : "Settings"}</button>` : ""}
       </div>
       ${editable && it.settings && openSettings.has(it.name) ? settingsHTML(it) : ""}
-    </div>`; }).join("")}</div>`);
+    </div>
+    ${editable && it.settings && openSettings.has(it.name) && helpOpen.has(it.name)
+      ? `<aside class="panel help helpcard" data-help-panel="${esc(it.name)}" aria-live="polite"></aside>` : ""}`; }).join("")}</div>`);
+  placeHelp();
   fillHelp();
+}
+
+// Put each open help card beside its capture's card: in the next column (the previous one if
+// the card is in the last column), one row down, i.e. under the neighbouring card. The card
+// itself spans two rows; dense auto-placement lets later cards fill in around them.
+function placeHelp(force) {
+  document.querySelectorAll(".grid > .helpcard").forEach((help) => {
+    const grid = help.parentElement;
+    const card = grid.querySelector(`[data-card="${CSS.escape(help.dataset.helpPanel)}"]`);
+    if (!card) return;
+    const cols = getComputedStyle(grid).gridTemplateColumns.split(" ").filter(Boolean).length;
+    if (!force && help.dataset.cols === String(cols)) return;   // already placed for this layout
+    help.dataset.cols = String(cols);
+    help.style.gridColumn = "";
+    card.classList.toggle("helping", cols > 1);
+    if (cols < 2) { card.after(help); return; }
+    grid.appendChild(help);   // out of the way while measuring
+    const g = grid.getBoundingClientRect(), r = card.getBoundingClientRect();
+    const step = r.width + (parseFloat(getComputedStyle(grid).columnGap) || 0);
+    const col = Math.round((r.left - g.left) / step);   // 0-based
+    // the last card that starts on the same row as this one
+    let end = card;
+    for (let n = card.nextElementSibling; n; n = n.nextElementSibling)
+      if (n.classList.contains("card") && Math.abs(n.getBoundingClientRect().top - r.top) < 2) end = n;
+    end.after(help);
+    help.style.gridColumn = String((col + 1 < cols ? col + 1 : col - 1) + 1);
+    help.classList.toggle("on-left", col + 1 >= cols);
+    // Let the second row absorb the open card's extra height, so the first row stays as tall
+    // as its other cards (a spanning item otherwise stretches both rows evenly).
+    let rowH = 0;
+    for (const n of grid.children)
+      if (n !== card && n.classList.contains("card") && Math.abs(n.getBoundingClientRect().top - r.top) < 2)
+        rowH = Math.max(rowH, n.getBoundingClientRect().height);
+    const gap = parseFloat(getComputedStyle(grid).rowGap) || 0;
+    help.style.minHeight = rowH ? `${Math.max(0, card.getBoundingClientRect().height - rowH - gap)}px` : "";
+  });
 }
 
 async function sendItem(name, body) {
@@ -650,7 +689,7 @@ document.addEventListener("keydown", (e) => {
 // The help column describes whatever setting the pointer or keyboard focus is on.
 function followHelp(e) {
   const f = e.target.closest && e.target.closest("[data-help-key]");
-  const s = f && f.closest(".settings.with-help");
+  const s = f && f.closest(".settings.helping");
   if (!s) return;
   const name = s.dataset.item;
   if (helpKey[name] === f.dataset.helpKey) return;
