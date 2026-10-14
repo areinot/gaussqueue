@@ -521,12 +521,10 @@ function alignHelp() {
     const label = firstTextRect(target) || target.getBoundingClientRect();
     const title = body.querySelector(".hname");
     const pad = parseFloat(getComputedStyle(el).paddingTop) || 0;
-    let room = el.clientHeight - pad * 2 - body.offsetHeight;
+    // Aim for the title on the setting's line; near the bottom the text is pushed up instead
+    // (the brace's point still lands on the setting).
+    const room = el.clientHeight - pad * 2 - body.offsetHeight;
     const y = (label.top + label.height / 2) - el.getBoundingClientRect().top - pad - title.offsetHeight / 2;
-    if (y > room && el.classList.contains("helpcard")) {   // grow the help card rather than drift
-      el.style.minHeight = `${el.offsetHeight + Math.ceil(y - room)}px`;
-      room = y;
-    }
     const shift = Math.round(Math.max(0, Math.min(y, room)));
     body.style.transform = `translateY(${shift}px)`;
     // Brace from the top to the bottom of the help text, pointing at the setting's line.
