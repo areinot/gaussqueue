@@ -76,7 +76,42 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .card.held .thumb img { filter: grayscale(.8); opacity: .6; }
 .toggle { align-self: flex-start; background: none; border: 0; padding: 2px 0; color: var(--accent);
   font: inherit; font-size: 12px; cursor: pointer; }
-.settings { border-top: 1px solid var(--line); padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 9px; }
+.settings { border-top: 1px solid var(--line); padding: 10px 12px 12px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+.settings.with-help { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.scol { display: flex; flex-direction: column; gap: 9px; min-width: 0; }
+.shead { display: flex; gap: 6px; align-items: stretch; }
+.shead .seg { flex: 1; }
+.helpbtn { flex: none; width: 28px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel);
+  color: var(--muted); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+.helpbtn:hover { background: var(--track); }
+.helpbtn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+/* A card with help open spans two columns: photo, details and controls stay at their normal
+   size on the left, the help column runs down the right. */
+.grid > .card.wide { grid-column: span 2; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-areas: "thumb help" "body help" "set help"; grid-template-rows: auto auto 1fr; }
+.card.wide > .thumb { grid-area: thumb; }
+.card.wide > .body { grid-area: body; }
+.card.wide > .settings { display: contents; }
+.card.wide .scol { grid-area: set; border-top: 1px solid var(--line); padding: 10px 12px 12px; }
+.card.wide .help { grid-area: help; padding: 14px 16px; }
+.help { border-left: 1px solid var(--line); padding-left: 12px; font-size: 12.5px; line-height: 1.5;
+  color: var(--muted); display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.help .hname { font-size: 13px; font-weight: 600; color: var(--text); }
+.help .hsel { color: var(--text); }
+.help .hsel b { font-weight: 600; }
+.help .hnote { font-size: 11.5px; }
+.help .hbody { display: flex; flex-direction: column; gap: 8px; transition: transform .15s ease-out; }
+.help .hkeys { font-size: 11.5px; padding-top: 6px; border-top: 1px solid var(--line); }
+@media (prefers-reduced-motion: reduce) { .help .hbody { transition: none; } }
+[data-help-key].hl { outline: 1px dashed var(--accent); outline-offset: 2px; border-radius: 4px; }
+@media (max-width: 560px) {
+  .grid > .card.wide { grid-column: auto; display: flex; }
+  .card.wide > .settings { display: grid; }
+  .card.wide .scol { border-top: 0; padding: 0; grid-area: auto; }
+  .card.wide .help { grid-area: auto; padding: 10px 0 0; }
+  .settings.with-help { grid-template-columns: minmax(0, 1fr); }
+  .help { border-left: 0; border-top: 1px solid var(--line); padding: 10px 0 0; }
+}
 .seg { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 .seg button { flex: 1; background: none; border: 0; border-left: 1px solid var(--line); padding: 5px 0;
   font: inherit; font-size: 12px; color: var(--text); cursor: pointer; }
@@ -185,6 +220,8 @@ const FIELD_OPTS = {
   subsample_frames: [[1, "all"], [2, "every 2nd"], [3, "every 3rd"], [4, "every 4th"]],
 };
 const openSettings = new Set();   // queue items whose settings panel is expanded
+const helpOpen = new Set();       // items whose settings show the help column ("?")
+const helpKey = {};               // item -> setting the help column describes (last hovered/focused)
 const itemErrors = {};            // name -> last error message from the server
 
 const selectedBy = {};  // job name -> checkpoint preview chosen in its strip (absent = latest)
@@ -229,6 +266,7 @@ function renderJobs(jobs) {
     return;
   }
   setHTML(el, jobs.map(jobPanel).join(""));
+  fillHelp();
 }
 
 function jobPanel(c) {
@@ -351,13 +389,13 @@ function gsplatHTML(st) {
   const check = (key, label, title) => `<label class="flip" title="${title}">
     <input type="checkbox" data-set="${key}"${st[key] ? " checked" : ""}> ${label}</label>`;
   return `
-        <div class="flipfield runon" title="Brush runs on any machine. gsplat (CUDA) adds LiDAR depth supervision, flat splats and MCMC; it only runs on machines that have it.">Trainer
+        <div class="flipfield runon" data-help-key="trainer" title="Brush runs on any machine. gsplat (CUDA) adds LiDAR depth supervision, flat splats and MCMC; it only runs on machines that have it.">Trainer
           ${choiceHTML("trainer", st.trainer || "brush", [["brush", "Brush"], ["gsplat", "gsplat (CUDA)"]])}</div>
-        ${gs ? `<div class="flipfield runon" title="How splats are added during training. Default: classic 3DGS growth. Abs-grad: grows more in fine detail. MCMC: fixed budget, always ends at the splat cap.">Densify
+        ${gs ? `<div class="flipfield runon" data-help-key="densify" title="How splats are added during training. Default: classic 3DGS growth. Abs-grad: grows more in fine detail. MCMC: fixed budget, always ends at the splat cap.">Densify
           ${choiceHTML("densify", st.densify || "mcmc", [["mcmc", "MCMC (fixed budget)"], ["default", "Default"], ["absgrad", "Abs-grad"]])}</div>
-        <div class="flipfield">${check("depth_supervision", "LiDAR depth", "Match the LiDAR depth maps where the iPhone is confident (near surfaces). Sky and far scenery are left to the photos.")}</div>
-        <div class="flipfield">${check("flatten", "Flatten splats", "Push splats flat onto surfaces: crisper walls and ground, fewer floaters.")}</div>` : ""}
-        <div class="flipfield runon" title="After training, remove this share of splats (the ones that matter least to the photos) and fine-tune the rest. Runs on a CUDA machine; the unpruned result is kept in the work folder.">Prune
+        <div class="flipfield" data-help-key="depth_supervision">${check("depth_supervision", "LiDAR depth", "Match the LiDAR depth maps where the iPhone is confident (near surfaces). Sky and far scenery are left to the photos.")}</div>
+        <div class="flipfield" data-help-key="flatten">${check("flatten", "Flatten splats", "Push splats flat onto surfaces: crisper walls and ground, fewer floaters.")}</div>` : ""}
+        <div class="flipfield runon" data-help-key="prune_pct" title="After training, remove this share of splats (the ones that matter least to the photos) and fine-tune the rest. Runs on a CUDA machine; the unpruned result is kept in the work folder.">Prune
           ${choiceHTML("prune_pct", String(st.prune_pct || 0), [["0", "Off"], ["50", "50%"], ["70", "70%"], ["80", "80%"], ["90", "90%"]])}</div>`;
 }
 
@@ -368,15 +406,110 @@ function selectHTML(key, value, opts) {
   return `<select data-set="${key}">${list.map(([v, l]) => `<option value="${v}"${v === value ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
 }
 
+// One short purpose line per setting, plus what the selected option does. Shown in the
+// help column ("?" on a settings panel); keep each to a sentence or two.
+const HELP = {
+  preset: {name: "Quality preset", what: "A starting point for the training settings below. Changing any field makes it Custom.",
+    opts: {preview: "Quick look: is the scene coherent, the right way up, covered? 3k steps at 720 px; minutes. Not for judging detail.",
+           fast: "7k steps at 1080 px, up to 1.5M splats. A usable result quickly.",
+           standard: "Your everyday default, set in config.json.",
+           high: "30k steps at 1920 px, up to 10M splats. The most detail; about an hour on the PC, several on the Mac.",
+           custom: "You've changed at least one field from the preset."}},
+  total_steps: {name: "Training steps", what: "How long training runs. More steps refine detail, with diminishing returns past about 30k.",
+    val: (v) => `${(+v).toLocaleString()} steps. Time grows roughly in proportion.`},
+  max_resolution: {name: "Max resolution", what: "Photos are scaled down to this width for training. Higher keeps fine texture but costs time and memory; photos are never upscaled.",
+    val: (v) => `Trains on photos up to ${v} px wide.`},
+  sh_degree: {name: "Colour detail (SH)", what: "How much a splat's colour can change with viewing angle: sheen, reflections, glints.",
+    opts: {0: "Flat colour per splat. Smallest files; matte look.", 1: "Gentle view-dependent shading.",
+           2: "Most sheen and reflections.", 3: "Full view-dependent colour (the 3DGS standard). Largest files."}},
+  max_splats: {name: "Splat cap", what: "Upper limit on splats. Brush and Default densify stop growing at it; MCMC always ends exactly at it. gsplat runs are capped at 6M regardless.",
+    val: (v) => `Up to ${kfmt(+v)} splats.`},
+  subsample_frames: {name: "Frames used", what: "Train on every Nth photo. Faster, but less overlap between neighbouring photos, which hurts sharpness.",
+    val: (v) => +v === 1 ? "All photos." : `Every ${v} photos (${Math.round(100 / v)}% of them).`},
+  run_on: {name: "Run on", what: "Which machine trains this capture.",
+    opts: {auto: "Auto: the first free machine, PC first. gsplat captures wait for a machine that has gsplat."},
+    val: (v) => { const w = (last.workers || []).find(x => x.name === v); return w ? `Only ${w.label}.` : ""; }},
+  refine_poses: {name: "Refine camera poses", what: "Before training, COLMAP matches features between photos and corrects the phone's camera poses. Also adds distant feature points as starting splats.",
+    opts: {1: "On: a few minutes on the Mac first; sharper results, especially foliage and long walks.", 0: "Off: trains on ARKit's poses as captured."}},
+  trainer: {name: "Trainer", what: "The program that turns the photos into splats.",
+    opts: {brush: "Brush: runs on the Mac or the PC. No depth supervision.",
+           gsplat: "gsplat (CUDA, PC only): adds LiDAR depth, flatten, MCMC and floater carving. Held-out depth error about 2% vs 45% for Brush in tests."}},
+  densify: {name: "Densify", what: "How splats are added and moved during training.",
+    opts: {mcmc: "MCMC: a fixed budget that always ends at the splat cap, moving weak splats to where they're needed. Best in tests.",
+           default: "Default: classic 3DGS growth. Can hit the cap early and stop growing.",
+           absgrad: "Abs-grad: grows more in fine detail. No better than Default in tests."}},
+  depth_supervision: {name: "LiDAR depth", what: "Pulls rendered depth toward the iPhone's LiDAR wherever it was confident (near surfaces, up to about 5 m). Sky and far scenery are left to the photos.",
+    opts: {1: "On: correct geometry (held-out depth error about 2% instead of 40%), fewer floaters.", 0: "Off: geometry only has to look right from the photos."}},
+  flatten: {name: "Flatten splats", what: "Pushes each splat's thinnest axis toward zero so splats lie flat on surfaces.",
+    opts: {1: "On: crisper walls, ground and stone; slightly less fine texture.", 0: "Off: splats keep any shape."}},
+  prune_pct: {name: "Prune", what: "After training, removes the splats that matter least to the photos, then fine-tunes the rest for 3,000 steps. Runs on the PC; the unpruned result is kept.",
+    val: (v) => +v ? `Removes ${v}%: keeps ${100 - v}% of the splats. In tests even 90% kept the same score; the finest texture goes first.` : "Off: keeps every splat."},
+  flip_up: {name: "Flip vertical", what: "Turns the result 180° so it's the right way up in viewers that expect -Y up. Output only; never restarts training.",
+    opts: {1: "On: right way up in SuperSplat and most viewers.", 0: "Off: kept in SplatKing's +Y-up orientation."}},
+  start_view: {name: "Start at first photo", what: "Moves the result so its origin is where you took the first photo, turned (left/right only) to face that photo's direction. Viewers that start at the origin open on your first shot. Output only.",
+    opts: {1: "On: opens at your first photo, horizon level.", 0: "Off: original capture coordinates."}},
+};
+
+function helpValue(key, st, it) {
+  if (key === "run_on") return it.run_on || "auto";
+  if (key === "preset") return st.preset;
+  return st[key];
+}
+
+function helpHTML(key, st, it) {
+  const h = HELP[key] || HELP.preset;
+  const v = helpValue(HELP[key] ? key : "preset", st, it);
+  const opt = h.opts && h.opts[v] !== undefined ? h.opts[v] : (h.val ? h.val(v) : "");
+  return `<div class="hbody"><div class="hname">${esc(h.name)}</div>
+    <div>${esc(h.what)}</div>
+    ${opt ? `<div class="hsel"><b>Selected:</b> ${esc(opt)}</div>` : ""}
+    <div class="hkeys">Hover or tap a setting to see what it does.</div></div>`;
+}
+
+// Fill each open help column from state (kept out of the panel's markup so the 3 s refresh
+// doesn't rebuild cards, and their images, whenever the described setting changes).
+function fillHelp() {
+  document.querySelectorAll("[data-help-panel]").forEach((el) => {
+    const name = el.dataset.helpPanel;
+    const it = (last.queue || []).find(q => q.name === name)
+      || (last.jobs || []).map(j => ({name: j.name, settings: j.pending_settings || j.settings})).find(j => j.name === name);
+    if (!it || !it.settings) return;
+    const key = helpKey[name] || "preset";
+    const html = helpHTML(key, it.settings, it);
+    if (el._html !== html) { el._html = html; el.innerHTML = html; }
+    el.closest(".settings").querySelectorAll("[data-help-key]").forEach(f => f.classList.toggle("hl", f.dataset.helpKey === key));
+  });
+  requestAnimationFrame(alignHelp);
+}
+
+// Line each help text up with the setting it describes (side-by-side layout only).
+function alignHelp() {
+  document.querySelectorAll("[data-help-panel]").forEach((el) => {
+    const body = el.firstElementChild, target = el.closest(".settings").querySelector("[data-help-key].hl");
+    if (!body || !target) return;
+    if (getComputedStyle(el).borderLeftStyle === "none") { body.style.transform = ""; return; }
+    const pad = parseFloat(getComputedStyle(el).paddingTop) || 0;
+    const room = el.clientHeight - pad * 2 - body.offsetHeight;
+    const y = target.getBoundingClientRect().top - el.getBoundingClientRect().top - pad - 4;
+    body.style.transform = `translateY(${Math.max(0, Math.min(y, room))}px)`;
+  });
+}
+window.addEventListener("resize", () => requestAnimationFrame(alignHelp));
+
 function settingsHTML(it, isCurrent) {
   const st = it.settings, base = (last.presets || {})[st.base] || {};
   const cls = (k) => st.preset === "custom" && base[k] !== undefined && base[k] !== st[k] ? "changed" : "";
-  const field = (k, label, inner) => `<label>${label}${inner.replace("<select", `<select class="${cls(k)}"`).replace("<input", `<input class="${cls(k)}"`)}</label>`;
+  const field = (k, label, inner) => `<label data-help-key="${k}">${label}${inner.replace("<select", `<select class="${cls(k)}"`).replace("<input", `<input class="${cls(k)}"`)}</label>`;
+  const help = helpOpen.has(it.name);
   return `
-    <div class="settings" data-item="${esc(it.name)}">
-      <div class="seg">${["preview", "fast", "standard", "high"].map(p => `
-        <button data-act="preset" data-value="${p}" class="${st.preset === p ? "on" : ""}"
-          title="${esc(Object.entries(last.presets[p] || {}).map(([k, v]) => `${k}: ${v}`).join(", "))}">${PRESET_LABEL[p]}</button>`).join("")}</div>
+    <div class="settings${help ? " with-help" : ""}" data-item="${esc(it.name)}">
+     <div class="scol">
+      <div class="shead">
+        <div class="seg" data-help-key="preset">${["preview", "fast", "standard", "high"].map(p => `
+          <button data-act="preset" data-value="${p}" class="${st.preset === p ? "on" : ""}"
+            title="${esc(Object.entries(last.presets[p] || {}).map(([k, v]) => `${k}: ${v}`).join(", "))}">${PRESET_LABEL[p]}</button>`).join("")}</div>
+        <button class="helpbtn" data-help="${esc(it.name)}" aria-pressed="${help}" title="${help ? "Hide" : "Show"} what each setting does" aria-label="${help ? "Hide" : "Show"} setting help">?</button>
+      </div>
       <div class="fields">
         ${field("total_steps", "Training steps", `<input data-set="total_steps" type="number" min="${last.limits.total_steps[0]}" max="${last.limits.total_steps[1]}" step="500" value="${st.total_steps}">`)}
         ${field("max_resolution", "Max resolution (px)", selectHTML("max_resolution", st.max_resolution,
@@ -385,13 +518,13 @@ function settingsHTML(it, isCurrent) {
         ${field("sh_degree", "Colour detail (SH)", selectHTML("sh_degree", st.sh_degree, FIELD_OPTS.sh_degree))}
         ${field("max_splats", "Splat cap", selectHTML("max_splats", st.max_splats, FIELD_OPTS.max_splats))}
         ${field("subsample_frames", "Frames used", selectHTML("subsample_frames", st.subsample_frames, FIELD_OPTS.subsample_frames))}
-        ${!isCurrent && last.workers && last.workers.length > 1 ? `<div class="flipfield runon">Run on
+        ${!isCurrent && last.workers && last.workers.length > 1 ? `<div class="flipfield runon" data-help-key="run_on">Run on
           <select data-runon>${[["auto", "Auto (fastest free)"], ...last.workers.map(w => [w.name, w.label])].map(([v, l]) =>
             `<option value="${esc(v)}"${(it.run_on || "auto") === v ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></div>` : ""}
-        <div class="flipfield">${refineBox(st.refine_poses)}</div>
+        <div class="flipfield" data-help-key="refine_poses">${refineBox(st.refine_poses)}</div>
         ${gsplatHTML(st)}
-        <div class="flipfield">${flipBox(st.flip_up)}</div>
-        <div class="flipfield">${startViewBox(st.start_view)}</div>
+        <div class="flipfield" data-help-key="flip_up">${flipBox(st.flip_up)}</div>
+        <div class="flipfield" data-help-key="start_view">${startViewBox(st.start_view)}</div>
       </div>
       <div class="actions">
         ${isCurrent ? "" : `<button data-act="run_next">Run next</button>
@@ -399,6 +532,8 @@ function settingsHTML(it, isCurrent) {
         ${st.preset !== "standard" ? `<button data-act="reset">Reset</button>` : ""}
       </div>
       ${itemErrors[it.name] ? `<div class="serr">${esc(itemErrors[it.name])}</div>` : ""}
+     </div>
+     ${help ? `<aside class="help" data-help-panel="${esc(it.name)}" aria-live="polite"></aside>` : ""}
     </div>`;
 }
 
@@ -416,7 +551,7 @@ function renderQueue(q) {
       : queued ? `<span class="badge b-queued">#${pos} in queue</span>`
       : `<span class="badge b-${esc(it.state)}">${esc(it.state)}</span>`;
     return `
-    <div class="panel card${it.hold ? " held" : ""}">
+    <div class="panel card${it.hold ? " held" : ""}${helpOpen.has(it.name) && openSettings.has(it.name) ? " wide" : ""}">
       <div class="thumb">${it.thumb ? img(it.thumb, it.name) : `<span class="note">${esc(it.thumb_note || "making thumbnail…")}</span>`}</div>
       <div class="body">
         <div class="name">${esc(it.name)}</div>
@@ -429,6 +564,7 @@ function renderQueue(q) {
       </div>
       ${editable && it.settings && openSettings.has(it.name) ? settingsHTML(it) : ""}
     </div>`; }).join("")}</div>`);
+  fillHelp();
 }
 
 async function sendItem(name, body) {
@@ -511,8 +647,23 @@ document.addEventListener("change", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && e.target.matches("input[data-set]")) e.target.blur();  // commits via change
 });
+// The help column describes whatever setting the pointer or keyboard focus is on.
+function followHelp(e) {
+  const f = e.target.closest && e.target.closest("[data-help-key]");
+  const s = f && f.closest(".settings.with-help");
+  if (!s) return;
+  const name = s.dataset.item;
+  if (helpKey[name] === f.dataset.helpKey) return;
+  helpKey[name] = f.dataset.helpKey;
+  fillHelp();
+}
+document.addEventListener("mouseover", followHelp);
+document.addEventListener("focusin", followHelp);
 
 document.addEventListener("click", (e) => {
+  const hb = e.target.closest("[data-help]");
+  if (hb) { const n = hb.dataset.help; helpOpen.has(n) ? helpOpen.delete(n) : helpOpen.add(n);
+    if (last) { renderQueue(last.queue || []); renderJobs(last.jobs || []); } return; }
   const rq = e.target.closest("[data-requeue]");
   if (rq) { const n = rq.dataset.requeue; openSettings.add(n); sendItem(n, {action: "requeue"}); return; }
   const tog = e.target.closest("[data-toggle]");
