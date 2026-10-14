@@ -362,6 +362,49 @@ def capture_rotation(root):
 
 # ---------------------------------------------------------------- inbox watcher
 
+def summarize_splatpack(data):
+    """SplatKing's per-photo capture ratings (splatpack.json) -> a compact summary:
+    median score, and how many photos fell into each rating (e.g. "large pose
+    jump" = the phone moved too far between photos, i.e. low overlap)."""
+    pairs = data.get("pairs") or []
+    if not pairs:
+        return None
+    counts, scores = {}, []
+    for pr in pairs:
+        q = pr.get("quality") or {}
+        label = q.get("summary") or "unrated"
+        band = q.get("band") or "?"
+        key = f"{band}|{label}"
+        counts[key] = counts.get(key, 0) + 1
+        if isinstance(q.get("score"), (int, float)):
+            scores.append(q["score"])
+    n = len(pairs)
+    ratings = [{"band": k.split("|", 1)[0], "label": k.split("|", 1)[1], "count": c,
+                "pct": round(100 * c / n)} for k, c in sorted(counts.items(), key=lambda kv: -kv[1])]
+    jump = sum(r["count"] for r in ratings if "pose jump" in r["label"])
+    scores.sort()
+    return {"photos": n, "score": scores[len(scores) // 2] if scores else None,
+            "ratings": ratings, "pose_jump_pct": round(100 * jump / n),
+            "low_overlap": jump / n >= 0.5}
+
+
+def quality_text(q):
+    if not q:
+        return ""
+    top = ", ".join(f"{r['pct']}% {r['label']}" for r in q["ratings"][:3])
+    return (("⚠ low overlap. " if q["low_overlap"] else "")
+            + f"SplatKing score {q['score']}: {top}")
+
+
+def find_capture_quality(root):
+    for f in Path(root).rglob("splatpack.json"):
+        try:
+            return summarize_splatpack(json.loads(f.read_text()))
+        except Exception:
+            return None
+    return None
+
+
 class InboxItem:
     def __init__(self, path):
         self.path = path
@@ -381,6 +424,8 @@ class InboxItem:
         self.thumb = None     # filename in previews/
         self.thumb_note = None
         self.thumb_tries = 0
+        self.quality = None   # SplatKing capture ratings, if present
+        self.quality_tries = 0
 
     def signature(self):
         if not self.is_dir:
@@ -405,7 +450,7 @@ class InboxItem:
         return {"name": self.name, "file": self.path.name, "is_dir": self.is_dir,
                 "state": self.state, "kind": self.kind, "frames": self.frames,
                 "size": self.size, "first_seen": self.first_seen,
-                "thumb": self.thumb, "thumb_note": self.thumb_note}
+                "thumb": self.thumb, "thumb_note": self.thumb_note, "quality": self.quality}
 
 
 class Inbox:
@@ -448,6 +493,8 @@ class Inbox:
             item.state = "queued" if settled else "arriving"
             if item.thumb is None and item.thumb_tries < 20:
                 self.try_thumbnail(item)
+            if item.quality is None and item.quality_tries < 20:
+                self.read_quality(item)
 
     def order(self, overrides):
         """Queue order: 'run next' items first (latest press first), then oldest."""
@@ -492,6 +539,34 @@ class Inbox:
         except Exception as e:
             item.thumb_tries += 1
             item.thumb_note = f"thumbnail failed: {e}"[:120]
+
+    def read_quality(self, item):
+        """Read SplatKing's splatpack.json straight from the zip/folder (small file)."""
+        item.quality_tries += 1
+        try:
+            if item.is_dir:
+                f = next(item.path.rglob("splatpack.json"), None)
+                if f is None:
+                    item.quality_tries = 99
+                    return
+                if is_dataless(f):
+                    request_download(f)
+                    return
+                data = json.loads(f.read_text())
+            else:
+                if is_dataless(item.path):
+                    return   # try_thumbnail already asked iCloud for it
+                with zipfile.ZipFile(item.path) as z:
+                    names = [n for n in z.namelist() if n.endswith("splatpack.json")]
+                    if not names:
+                        item.quality_tries = 99
+                        return
+                    data = json.loads(z.read(names[0]))
+            item.quality = summarize_splatpack(data)
+            if item.quality is None:
+                item.quality_tries = 99
+        except (zipfile.BadZipFile, OSError, ValueError):
+            pass
 
     def describe(self, item):
         if item.kind is not None:
@@ -620,6 +695,7 @@ class Status:
     def __init__(self, paths, state, inbox, overrides):
         self.paths, self.state, self.inbox, self.overrides = paths, state, inbox, overrides
         self.current = None   # dict describing the active job
+        self.quality_cache = {}
         self.snapshot = {}    # served as JSON by the dashboard
 
     def write(self, cfg):
@@ -631,6 +707,11 @@ class Status:
         in_inbox = {i.name for i in list(self.inbox.items.values())}
         for h in self.state.get("history", [])[-20:][::-1]:
             h = dict(h)
+            if "quality" not in h:
+                h["quality"] = self.quality_cache.get(h["name"], "?")
+                if h["quality"] == "?":
+                    h["quality"] = self.quality_cache[h["name"]] = find_capture_quality(
+                        self.paths.jobs / h["name"] / "data")
             h["requeueable"] = (h["name"] not in seen and h["name"] not in in_inbox
                                 and find_processed(self.paths, h["name"]) is not None)
             seen.add(h["name"])
@@ -639,7 +720,7 @@ class Status:
         if c:
             current = {k: c.get(k) for k in
                        ("name", "phase", "step", "total", "started", "eta", "preview",
-                        "kind", "frames", "thumb", "settings", "paused", "paused_at")}
+                        "kind", "frames", "thumb", "settings", "paused", "paused_at", "quality")}
             current["pending_settings"] = effective_settings(cfg, self.overrides.get(c["name"]))
             current["previews"] = sorted(p.name for p in
                                          self.paths.previews.glob(f"{c['name']}_step*.jpg"))
@@ -1218,6 +1299,8 @@ def write_meta(dest, job, files, flipped):
             "rotation_xyz_degrees": [180, 0, 0] if flipped else [0, 0, 0]}
     if job.get("refine"):
         meta["pose_refinement"] = job["refine"]
+    if job.get("quality"):
+        meta["capture_quality"] = job["quality"]
     (dest / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
 
 
@@ -1227,14 +1310,15 @@ def process(cfg, paths, state, status, item, beat):
     job_dir.mkdir(parents=True, exist_ok=True)
     job = {"name": name, "phase": "downloading from iCloud", "step": None,
            "kind": item.kind, "frames": item.frames, "thumb": item.thumb,
-           "file": item.path.name,
+           "file": item.path.name, "quality": item.quality,
            "settings": effective_settings(cfg, status.overrides.get(name))}
     for old in paths.previews.glob(f"{name}_step*.jpg"):  # from an earlier run
         old.unlink()
     status.current = job
     beat()
     t0 = time.time()
-    imessage(cfg, f"📥 {name}: received, starting")
+    imessage(cfg, f"📥 {name}: received, starting"
+                  + (f". {quality_text(item.quality)}" if item.quality else ""))
     try:
         local_zip = fetch_local(item, job_dir, beat)
         if local_zip:
@@ -1242,6 +1326,8 @@ def process(cfg, paths, state, status, item, beat):
             beat()
             unpack(local_zip, job_dir / "data")
         colmap = find_colmap(job_dir / "data")
+        if not job.get("quality"):
+            job["quality"] = find_capture_quality(job_dir / "data")
         out_dir = job_dir / "out"
         pending = lambda: effective_settings(load_config(), status.overrides.get(name))
         refined = None   # (folder, stats), computed once per job
@@ -1357,7 +1443,7 @@ def record(state, job, result, duration, detail):
         "kind": job.get("kind"), "frames": job.get("frames"),
         "settings": job.get("settings"), "train_seconds": job.get("train_seconds"),
         "file": job.get("file"),
-        "files": job.get("files")})
+        "files": job.get("files"), "quality": job.get("quality")})
     state["history"] = state["history"][-50:]
     save_state(state)
 

@@ -214,6 +214,24 @@ class DashboardAPITest(unittest.TestCase):
         finally:
             self.status.current = None
 
+    def test_capture_quality_from_splatpack(self):
+        import zipfile
+        gq, root = self.gq, Path(self.tmp.name)
+        pairs = ([{"quality": {"band": "ok", "summary": "large pose jump", "score": 0.63}}] * 6
+                 + [{"quality": {"band": "good", "summary": "stable ar tracking", "score": 0.88}}] * 4)
+        q = gq.summarize_splatpack({"pairs": pairs})
+        self.assertEqual((q["photos"], q["pose_jump_pct"], q["low_overlap"]), (10, 60, True))
+        self.assertEqual(q["ratings"][0], {"band": "ok", "label": "large pose jump", "count": 6, "pct": 60})
+        self.assertIn("low overlap", gq.quality_text(q))
+        # Read straight out of a zip, as the inbox does.
+        z = root / "inbox" / "capQ.zip"
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.writestr("capQ/splatpack.json", json.dumps({"pairs": pairs}))
+        item = gq.InboxItem(z)
+        self.inbox.read_quality(item)
+        self.assertEqual(item.quality["pose_jump_pct"], 60)
+        z.unlink()
+
     def test_snapshot_has_estimates_and_presets(self):
         snap = self.snapshot()
         self.assertEqual(set(snap["presets"]), {"fast", "standard", "high"})

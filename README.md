@@ -26,6 +26,12 @@ structure-from-motion step. Any capture that contains a COLMAP model
 - **Instant thumbnails.** When a new item arrives, the middle frame is read straight out
   of the zip or folder (no unpacking) and rotated upright using the capture's
   orientation metadata.
+- **Capture ratings.** SplatKing rates every photo at capture time ("stable AR tracking",
+  "fast movement", "large pose jump", …) in `splatpack.json`. GaussQueue reads these as soon
+  as a capture arrives and shows them as a bar on the inbox card, the training panel and the
+  history. It flags ⚠ *low overlap* when most photos are "large pose jumps" (the phone moved
+  too far between shots, the usual cause of blurry results). The ratings also go into the 📥
+  text and `meta.json`.
 - **Dashboard** at `http://127.0.0.1:8765`. It shows live progress, the checkpoint
   previews (renders from a camera held out of training), the queue and recent results.
 - **Per-capture quality settings.** Fast / Standard / High presets, or set the steps,

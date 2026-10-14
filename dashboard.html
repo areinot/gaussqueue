@@ -107,6 +107,14 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .flipfield { grid-column: span 2; padding-top: 2px; }
 .fields .flip { flex-direction: row; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
 .fields .flip input { width: 15px; height: 15px; padding: 0; border: 0; flex: none; }
+.cq { display: flex; flex-direction: column; gap: 3px; }
+.cqbar { display: flex; height: 6px; border-radius: 99px; overflow: hidden; background: var(--track); }
+.cqbar span { display: block; height: 100%; }
+.cq-good { background: var(--ok); } .cq-fast { background: var(--warn); }
+.cq-jump { background: var(--bad); } .cq-other { background: var(--muted); }
+.cqtext { font-size: 12px; color: var(--muted); }
+.cqtext .warn { color: var(--bad); font-weight: 600; }
+.history .cq { margin-top: 4px; max-width: 520px; }
 .serr { font-size: 12px; color: var(--bad); min-height: 0; }
 #lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.88); display: none; align-items: center;
   justify-content: center; z-index: 10; cursor: zoom-out; padding: 16px; }
@@ -225,6 +233,7 @@ function renderNow(c) {
       <div class="name">${esc(c.name)}</div>
       <div class="phase">${esc(c.phase)}${kindText(c.kind, c.frames) ? " · " + esc(kindText(c.kind, c.frames)) : ""}</div>
       ${c.settings ? `<div class="quality">${qualityText(c.settings)}</div>` : ""}
+      ${captureQuality(c.quality)}
       ${controls}
       <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
       <div class="stats">
@@ -236,6 +245,25 @@ function renderNow(c) {
         <figure><img src="/img/${encodeURIComponent(p)}" data-pick="${esc(p)}" class="${p === hero ? "sel" : ""}" alt="">${stepLabel(p)}</figure>`).join("")}</div>
         <div class="meta">Click a checkpoint to show it above; renders are from a camera held out of training.</div>` : ""}
     </div>`);
+}
+
+// SplatKing's per-photo capture ratings (from splatpack.json).
+function cqClass(label) {
+  return /pose jump/.test(label) ? "cq-jump" : /fast/.test(label) ? "cq-fast"
+       : /stable/.test(label) ? "cq-good" : "cq-other";
+}
+function captureQuality(q) {
+  if (!q || !q.ratings) return "";
+  const order = {"cq-good": 0, "cq-fast": 1, "cq-other": 2, "cq-jump": 3};
+  const rs = [...q.ratings].sort((a, b) => order[cqClass(a.label)] - order[cqClass(b.label)]);
+  const tip = `SplatKing's rating of each photo at capture time (${q.photos} photos):\n`
+    + q.ratings.map(r => `${r.count} × ${r.band}: ${r.label}`).join("\n")
+    + `\n\n"Large pose jump" means the phone moved or turned too far between photos (low overlap).`;
+  const top = q.ratings.slice(0, 3).map(r => `${r.pct}% ${esc(r.label)}`).join(" · ");
+  return `<div class="cq" title="${esc(tip)}">
+      <div class="cqbar">${rs.map(r => `<span class="${cqClass(r.label)}" style="width:${r.pct}%"></span>`).join("")}</div>
+      <div class="cqtext">${q.low_overlap ? `<span class="warn">⚠ low overlap</span> · ` : ""}capture score ${q.score ?? "?"} · ${top}</div>
+    </div>`;
 }
 
 // "Flip vertical": output-only (rotates the result 180° about X), so it can change any time.
@@ -304,6 +332,7 @@ function renderQueue(q) {
         <div class="name">${esc(it.name)}</div>
         <div>${badge}${it.run_next && !it.hold ? ` <span class="badge b-next">next</span>` : ""}</div>
         <div class="meta">${esc([kindText(it.kind, it.frames), it.size ? size(it.size) : null, it.is_dir ? "folder" : "zip"].filter(Boolean).join(" · "))}</div>
+        ${captureQuality(it.quality)}
         ${it.settings ? `<div class="quality">${qualityText(it.settings)}${it.est_seconds ? ` · ≈${dur(it.est_seconds)}` : ""}</div>` : ""}
         <div class="meta">seen <span data-since="${it.first_seen}"></span> ago</div>
         ${editable && it.settings ? `<button class="toggle" data-toggle="${esc(it.name)}">${openSettings.has(it.name) ? "Hide settings" : "Settings"}</button>` : ""}
@@ -332,6 +361,7 @@ function renderHistory(h) {
       <div>
         <div class="name">${esc(r.name)} <span class="badge b-${esc(r.result)}">${esc(r.result)}</span></div>
         <div class="detail">${esc(r.duration)}${r.detail ? " · " + esc(r.detail) : ""}${r.result === "done" ? ` · outbox/${esc(r.name)}/` : ""}</div>
+        ${captureQuality(r.quality)}
       </div>
       <div class="when">
         <div class="meta">${esc(r.finished)}</div>
