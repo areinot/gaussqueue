@@ -605,7 +605,7 @@ class Inbox:
         return [i for i in self.order(overrides)
                 if i.state == "queued" and not overrides.get(i.name).get("hold")]
 
-    def snapshot(self, cfg, overrides, rate, busy=()):
+    def snapshot(self, cfg, overrides, rate, busy=(), estimates=None):
         out = []
         for i in self.order(overrides):
             if i.name in busy:
@@ -617,6 +617,11 @@ class Inbox:
             d["run_next"] = bool(ov.get("priority"))
             d["est_seconds"] = estimate_seconds(d["settings"], d["frames"], rate)
             d["run_on"] = ov.get("run_on", "auto")
+            if estimates:
+                d["est"] = estimates(d["settings"], d["frames"], ov)
+                known = [v for v in d["est"].values() if v]
+                if known:
+                    d["est_seconds"] = min(known)
             out.append(d)
         return out
 
@@ -860,7 +865,21 @@ class Status:
         c = self.current
         busy = self.busy_names()
         rate = current_rate(c, self.state)
-        queue = self.inbox.snapshot(cfg, self.overrides, rate, busy)
+        workers = list(self.workers.values()) or [LocalWorker()]
+        any_gsplat = any(w.gsplat for w in workers)
+
+        def estimates(st, frames, ov):
+            """{machine: seconds or None} for the machines that could run this capture:
+            all eligible ones on Auto, else just the chosen one."""
+            out = {}
+            for w in workers:
+                if not can_take(cfg, w, ov, any_gsplat):
+                    continue
+                trainer = "gsplat" if st.get("trainer") == "gsplat" and w.gsplat else "brush"
+                r = current_rate(self.jobs.get(w.name), self.state, w.name, trainer)
+                out[w.name] = estimate_seconds(st, frames, r)
+            return out
+        queue = self.inbox.snapshot(cfg, self.overrides, rate, busy, estimates)
         hist, seen = [], set()
         in_inbox = {i.name for i in list(self.inbox.items.values())}
         for h in self.state.get("history", [])[-20:][::-1]:
@@ -2105,6 +2124,7 @@ def process(cfg, paths, state, status, item, beat, worker=None):
         pending = lambda: effective_settings(load_config(), status.overrides.get(name))
         refined = None   # (folder, stats), computed once per job
         warnings = []
+        job["trainer"] = "gsplat" if job["settings"].get("trainer") == "gsplat" and worker.gsplat else "brush"
         if job["settings"].get("trainer") == "gsplat" and not worker.gsplat:
             warnings.append(f"gsplat needs a CUDA worker; trained with Brush on {worker.label}")
         while True:
@@ -2271,6 +2291,7 @@ def record(state, job, result, duration, detail):
             "preview": job.get("preview"), "thumb": job.get("thumb"),
             "kind": job.get("kind"), "frames": job.get("frames"),
             "settings": job.get("settings"), "train_seconds": job.get("train_seconds"),
+            "worker": job.get("worker"), "trainer": job.get("trainer"),
             "file": job.get("file"),
             "files": job.get("files"), "quality": job.get("quality")})
         state["history"] = state["history"][-50:]
@@ -2479,16 +2500,24 @@ class Snapshots:
                 save_state(self.state)
 
 
-def current_rate(job, state):
+def current_rate(job, state, worker=None, trainer=None):
     """Seconds per step per megapixel-of-training-resolution, from the running job
-    if it has progress, else the most recent finished job that recorded it."""
+    if it has progress, else the most recent finished job that recorded it. With worker
+    (and trainer), only runs on that machine count, preferring the same trainer; runs from
+    before history recorded a machine count as the Mac's, with Brush."""
     def norm(sec_per_step, st):
         return sec_per_step / ((st["max_resolution"] / 1000) ** 2)
     if job and job.get("step") and job.get("settings") and job.get("train_started"):
-        return norm((time.time() - job["train_started"]) / job["step"], job["settings"])
-    for h in reversed(state.get("history", [])):
-        if h.get("result") == "done" and h.get("train_seconds") and h.get("settings"):
-            return norm(h["train_seconds"] / h["settings"]["total_steps"], h["settings"])
+        if worker is None or (job.get("worker") == worker and job.get("trainer", "brush") == (trainer or "brush")):
+            return norm((time.time() - job["train_started"]) / job["step"], job["settings"])
+    done = [h for h in state.get("history", [])
+            if h.get("result") == "done" and h.get("train_seconds") and h.get("settings")]
+    if worker is not None:
+        mine = [h for h in done if (h.get("worker") or "mac") == worker]
+        same = [h for h in mine if (h.get("trainer") or "brush") == (trainer or "brush")]
+        done = same or mine
+    for h in reversed(done):
+        return norm(h["train_seconds"] / h["settings"]["total_steps"], h["settings"])
     return None
 
 

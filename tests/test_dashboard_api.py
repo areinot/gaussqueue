@@ -403,6 +403,30 @@ class DashboardAPITest(unittest.TestCase):
         # Not installed -> falls back (no native call recorded).
         self.assertIsNone(gq.native_spz(dict(cfg, spz_native=str(root / "missing"))))
 
+    def test_estimates_per_machine(self):
+        gq = self.gq
+        pc = gq.RemoteWorker({"name": "pc", "label": "PC (RTX 4080)", "ssh": "gpu-pc",
+                              "brush": "C:/b.exe", "work_dir": "D:/j"})
+        hist = self.status.state["history"]
+        hist.append({"name": "x", "result": "done", "train_seconds": 600, "worker": "pc", "trainer": "brush",
+                     "duration": "10m", "finished": "01-02 00:00",
+                     "settings": {"total_steps": 15000, "max_resolution": 1440}})
+        self.status.workers = {"pc": pc, "mac": gq.LocalWorker()}
+        try:
+            self.status.write(self.cfg)
+            q = next(i for i in self.snapshot()["queue"] if i["name"] == "capA")
+            self.assertEqual(set(q["est"]), {"pc", "mac"})         # Auto: every machine
+            self.assertAlmostEqual(q["est"]["pc"], 600, delta=1)   # same settings as the PC run
+            self.assertAlmostEqual(q["est"]["mac"], 1800, delta=1) # old history counts as the Mac's
+            self.post({"name": "capA", "action": "run_on", "value": "mac"})
+            q = next(i for i in self.snapshot()["queue"] if i["name"] == "capA")
+            self.assertEqual(set(q["est"]), {"mac"})               # pinned: just that machine
+        finally:
+            hist.pop()
+            self.status.workers = {}
+            self.overrides.clear("capA")
+            self.status.write(self.cfg)
+
     def test_snapshot_has_estimates_and_presets(self):
         snap = self.snapshot()
         self.assertEqual(set(snap["presets"]), {"preview", "fast", "standard", "high"})

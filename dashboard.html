@@ -406,6 +406,17 @@ function gsplatHTML(st) {
           ${choiceHTML("prune_pct", String(st.prune_pct || 0), [["0", "Off"], ["50", "50%"], ["70", "70%"], ["80", "80%"], ["90", "90%"]])}</div>`;
 }
 
+// "Est. time 52m (Mac) · 12m (RTX 4080)": training time on every machine that could run it on
+// Auto, else on the chosen one.
+const shortLabel = (w) => (w.label.match(/\(([^)]+)\)/) || [])[1] || w.label;
+function etaLine(it) {
+  const est = it.est || {};
+  const parts = (last.workers || []).filter(w => w.name in est)
+    .map(w => `${est[w.name] ? dur(est[w.name]) : "?"} (${esc(shortLabel(w))})`);
+  if (!parts.length && it.est_seconds) parts.push(dur(it.est_seconds));
+  return parts.length ? `<div class="quality"><b>Est. time</b> ${parts.join(" · ")}</div>` : "";
+}
+
 function selectHTML(key, value, opts) {
   const list = opts.map(o => Array.isArray(o) ? o : [o, key === "max_splats" ? kfmt(o) : String(o)]);
   if (!list.some(([v]) => v === value)) list.push([value, key === "max_splats" ? kfmt(value) : String(value)]);
@@ -434,7 +445,7 @@ const HELP = {
   subsample_frames: {name: "Frames used", what: "Train on every Nth photo. Faster, but less overlap between neighbouring photos, which hurts sharpness.",
     val: (v) => +v === 1 ? "All photos." : `Every ${v} photos (${Math.round(100 / v)}% of them).`},
   run_on: {name: "Run on", what: "Which machine trains this capture.",
-    opts: {auto: "Auto: the first free machine, PC first. gsplat captures wait for a machine that has gsplat."},
+    opts: {auto: "Auto: the first machine that's free, PC first. gsplat captures wait for a machine that has gsplat."},
     val: (v) => { const w = (last.workers || []).find(x => x.name === v); return w ? `Only ${w.label}.` : ""; }},
   refine_poses: {name: "Refine camera poses", what: "Before training, COLMAP matches features between photos and corrects the phone's camera poses. Also adds distant feature points as starting splats.",
     opts: {1: "On: a few minutes on the Mac first; sharper results, especially foliage and long walks.", 0: "Off: trains on ARKit's poses as captured."}},
@@ -580,7 +591,7 @@ function settingsHTML(it, isCurrent) {
         ${field("max_splats", "Splat cap", selectHTML("max_splats", st.max_splats, FIELD_OPTS.max_splats))}
         ${field("subsample_frames", "Frames used", selectHTML("subsample_frames", st.subsample_frames, FIELD_OPTS.subsample_frames))}
         ${!isCurrent && last.workers && last.workers.length > 1 ? `<div class="flipfield runon" data-help-key="run_on">Run on
-          <select data-runon>${[["auto", "Auto (fastest free)"], ...last.workers.map(w => [w.name, w.label])].map(([v, l]) =>
+          <select data-runon>${[["auto", "Auto (first available)"], ...last.workers.map(w => [w.name, w.label])].map(([v, l]) =>
             `<option value="${esc(v)}"${(it.run_on || "auto") === v ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></div>` : ""}
         <div class="flipfield" data-help-key="refine_poses">${refineBox(st.refine_poses)}</div>
         ${gsplatHTML(st)}
@@ -619,7 +630,8 @@ function renderQueue(q) {
         <div>${badge}${it.run_next && !it.hold ? ` <span class="badge b-next">next</span>` : ""}</div>
         <div class="meta">${esc([kindText(it.kind, it.frames), it.size ? size(it.size) : null, it.is_dir ? "folder" : "zip"].filter(Boolean).join(" · "))}</div>
         ${captureQuality(it.quality)}
-        ${it.settings ? `<div class="quality">${qualityText(it.settings)}${it.est_seconds ? ` · ≈${dur(it.est_seconds)}` : ""}</div>` : ""}
+        ${it.settings ? `<div class="quality">${qualityText(it.settings)}</div>` : ""}
+        ${etaLine(it)}
         <div class="meta">seen <span data-since="${it.first_seen}"></span> ago</div>
         ${editable && it.settings ? `<button class="toggle" data-toggle="${esc(it.name)}">${openSettings.has(it.name) ? "Hide settings" : "Settings"}</button>` : ""}
       </div>
