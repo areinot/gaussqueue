@@ -89,9 +89,15 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
    sits in the next column under the neighbouring card (placed by placeHelp()). */
 .grid { grid-auto-flow: row dense; }
 .grid > .card.helping { grid-row: span 2; }
-.helpcard { align-self: stretch; padding: 14px 16px; border-left: 2px solid var(--accent) !important; }
-.helpcard.on-left { border-left: 1px solid var(--line) !important; border-right: 2px solid var(--accent) !important; }  /* edge faces its card */
-.help { border-left: 1px solid var(--line); padding-left: 12px; font-size: 12.5px; line-height: 1.5;
+.helpcard { align-self: stretch; padding: 14px 16px 14px 26px; border-left: 2px solid var(--accent) !important; }
+.helpcard.on-left { padding: 14px 26px 14px 16px; border-left: 1px solid var(--line) !important;
+  border-right: 2px solid var(--accent) !important; }  /* edge faces its card */
+/* A pointer in the gutter, from the card to the title of the setting being described. */
+.help .hname { position: relative; }
+.help.beside .hname::before { content: "\25B6"; position: absolute; left: -17px; top: 50%; transform: translateY(-50%);
+  font-size: 9px; color: var(--accent); }
+.helpcard.on-left.beside .hname::before { content: "\25C0"; left: auto; right: -17px; }
+.help { border-left: 1px solid var(--line); padding-left: 24px; font-size: 12.5px; line-height: 1.5;
   color: var(--muted); display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .help .hname { font-size: 13px; font-weight: 600; color: var(--text); }
 .help .hsel { color: var(--text); }
@@ -476,6 +482,18 @@ function fillHelp() {
   requestAnimationFrame(alignHelp);
 }
 
+// Box of the first visible line of text inside an element (a setting's label).
+function firstTextRect(el) {
+  const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT,
+    {acceptNode: (n) => n.textContent.trim() && !n.parentElement.closest("select, option") ? 1 : 3});
+  const node = w.nextNode();
+  if (!node) return null;
+  const range = document.createRange();
+  range.selectNodeContents(node);
+  const rects = range.getClientRects();
+  return rects.length ? rects[0] : null;
+}
+
 const settingsFor = (name) => document.querySelector(`.settings[data-item="${CSS.escape(name)}"]`);
 
 // Line each help text up with the setting it describes (when it sits beside the controls).
@@ -486,11 +504,19 @@ function alignHelp() {
     if (!body || !target) return;
     const beside = el.getBoundingClientRect().left >= panel.getBoundingClientRect().right - 1
                 || el.getBoundingClientRect().right <= panel.getBoundingClientRect().left + 1;
+    el.classList.toggle("beside", beside);
     if (!beside) { body.style.transform = ""; return; }
+    // Centre the title on the setting's own label text (its first line of text).
+    const label = firstTextRect(target) || target.getBoundingClientRect();
+    const title = body.querySelector(".hname");
     const pad = parseFloat(getComputedStyle(el).paddingTop) || 0;
-    const room = el.clientHeight - pad * 2 - body.offsetHeight;
-    const y = target.getBoundingClientRect().top - el.getBoundingClientRect().top - pad - 4;
-    body.style.transform = `translateY(${Math.max(0, Math.min(y, room))}px)`;
+    let room = el.clientHeight - pad * 2 - body.offsetHeight;
+    const y = (label.top + label.height / 2) - el.getBoundingClientRect().top - pad - title.offsetHeight / 2;
+    if (y > room && el.classList.contains("helpcard")) {   // grow the help card rather than drift
+      el.style.minHeight = `${el.offsetHeight + Math.ceil(y - room)}px`;
+      room = y;
+    }
+    body.style.transform = `translateY(${Math.round(Math.max(0, Math.min(y, room)))}px)`;
   });
 }
 window.addEventListener("resize", () => requestAnimationFrame(() => { placeHelp(true); alignHelp(); }));
