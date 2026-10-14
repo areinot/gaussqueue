@@ -99,6 +99,25 @@ thing explicit fusion adds is coverage, and the extra coverage taught the model 
 in those directions. It stays available as `gsplat.depth_fusion` (off by default) and
 `gs/fuse.py`.
 
+## Carving known-empty space (experimental, off)
+
+The same fusion also records which space the LiDAR saw *through*. Two rules used that map:
+every 100 steps, remove splats centred in known-empty space and shorten splats whose long
+axis pokes into it; and make splats beyond the scanned region thin along the line to its
+centre, so distant scenery becomes camera-facing disks instead of needles. On top of the best
+setup (MCMC + depth + flatten) this removed 151k splats and shortened 241k over the run, but
+scored 15.76 dB at 2.4% depth error against 15.85 dB at 1.8% without it. Renders look about
+the same, with slightly calmer sky. With LiDAR depth supervision there are few floaters left
+to remove on this capture. The options stay available (`gsplat.carve`,
+`gsplat.far_flat_weight`) and off by default.
+
+## Open questions
+
+- **SPZ quantisation.** SPZ stores colour and spherical-harmonics coefficients in a few bits
+  each (and positions at 24 bits). How much of the fine view-dependent detail survives, per
+  SH band, compared with the float `.ply`? Measure held-out PSNR/SSIM of the `.spz` against
+  the `.ply` for the same result.
+
 ## Reproducing
 
 ```bash

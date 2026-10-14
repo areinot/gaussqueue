@@ -357,6 +357,32 @@ class DashboardAPITest(unittest.TestCase):
         self.assertTrue(gq.can_take(self.cfg, mac, {}, True))          # Brush captures go anywhere
         self.assertFalse(gq.can_take(self.cfg, mac, {"run_on": "pc"}, True))
 
+    def test_start_view_pose(self):
+        gq, root = self.gq, Path(self.tmp.name)
+        m = root / "svmodel" / "sparse" / "0"
+        m.mkdir(parents=True)
+        # A camera at world (1, 2, 3) looking along world +X: the rows of R (world to camera)
+        # are the camera's x, y, z axes in world coordinates, and z is the viewing direction.
+        import math as _m
+        R = [[0, 0, -1], [0, 1, 0], [1, 0, 0]]
+        w = _m.sqrt(1 + R[0][0] + R[1][1] + R[2][2]) / 2
+        q = [w, (R[2][1] - R[1][2]) / (4 * w), (R[0][2] - R[2][0]) / (4 * w), (R[1][0] - R[0][1]) / (4 * w)]
+        c = [1, 2, 3]
+        t = [-sum(R[i][j] * c[j] for j in range(3)) for i in range(3)]
+        (m / "images.txt").write_text(
+            f"1 {' '.join(map(str, q))} {' '.join(map(str, t))} 1 b_later.jpg\n\n"
+            f"2 {' '.join(map(str, q))} {' '.join(map(str, t))} 1 a_first.jpg\n\n")
+        name, origin, yaw = gq.start_view_pose(root / "svmodel", flip=False)
+        self.assertEqual(name, "a_first.jpg")
+        self.assertEqual(origin, [1, 2, 3])
+        self.assertAlmostEqual(yaw, -90.0)          # heading +X turned onto +Z
+        name, origin, yaw = gq.start_view_pose(root / "svmodel", flip=True)
+        self.assertEqual(origin, [1, -2, -3])       # flip is 180° about X
+        self.assertAlmostEqual(yaw, -90.0)          # heading +X is unchanged by the flip
+        self.assertAlmostEqual(gq.start_view_pose(root / "svmodel", False, "-z")[2], 90.0)
+        self.assertIsNone(gq.start_view_pose(root / "missing", False))
+        self.assertIn("start_view", gq.OUTPUT_KEYS)
+
     def test_native_spz_is_used_when_installed(self):
         gq, root = self.gq, Path(self.tmp.name)
         fake = root / "fake_gq_spz"

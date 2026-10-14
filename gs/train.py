@@ -47,6 +47,11 @@ def parse(argv=None):
     p.add_argument("--depth-conf", type=int, default=2)
     p.add_argument("--flat-weight", type=float, default=0.0)
     p.add_argument("--mode", choices=["3dgs", "2dgs"], default="3dgs")
+    p.add_argument("--space", help="space.npz from fuse.py --grid-only: known-empty / surface / unknown")
+    p.add_argument("--carve", action="store_true",
+                   help="every 100 steps, remove splats inside known-empty space and shorten ones poking into it")
+    p.add_argument("--far-flat-weight", type=float, default=0.0,
+                   help="make splats outside the scanned region thin along the line to its centre (billboards)")
     p.add_argument("--antialiased", action="store_true")
     p.add_argument("--init-ply")
     p.add_argument("--points", help="points3D.txt to initialise from instead of the model's")
@@ -92,6 +97,77 @@ def sky_shell(n, center, radius):
     theta = np.pi * (1 + 5 ** 0.5) * i
     d = np.stack([np.cos(theta) * np.sin(phi), np.cos(phi), np.sin(theta) * np.sin(phi)], 1)
     return (center + radius * d).astype(np.float32), np.full((n, 3), 0.8, dtype=np.float32)
+
+
+class Space:
+    """The LiDAR's map of space (fuse.py): 0 unknown, 1 known empty, 2 surface."""
+
+    def __init__(self, path, dev):
+        z = np.load(path)
+        self.grid = torch.from_numpy(z["grid"]).to(dev)
+        self.origin = torch.tensor(z["origin"], dtype=torch.float32, device=dev)
+        self.voxel = float(z["voxel"])
+        nz, ny, nx = self.grid.shape
+        self.n = torch.tensor([nx, ny, nz], device=dev)
+        self.center = self.origin + self.n * self.voxel / 2
+
+    def lookup(self, P):
+        idx = torch.floor((P - self.origin) / self.voxel).long()
+        inside = ((idx >= 0) & (idx < self.n)).all(-1)
+        idx = torch.minimum(idx.clamp(min=0), self.n - 1)
+        st = self.grid[idx[:, 2], idx[:, 1], idx[:, 0]]
+        return torch.where(inside, st, torch.zeros_like(st)), inside
+
+
+def quat_to_rotmat(q):
+    w, x, y, z = F.normalize(q, dim=-1).unbind(-1)
+    return torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+                        2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+                        2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1).view(-1, 3, 3)
+
+
+@torch.no_grad()
+def carve(params, space, min_logit=-6.0):
+    """Remove splats centred in known-empty space (opacity to ~0: MCMC relocates them, default
+    densification prunes them) and shorten long axes whose tips poke into it."""
+    means = params["means"]
+    st, _ = space.lookup(means)
+    dead = st == 1
+    params["opacities"][dead] = min_logit
+    s = torch.exp(params["scales"])
+    k = s.argmax(-1)
+    R = quat_to_rotmat(params["quats"])
+    axis = R[torch.arange(len(k), device=k.device), :, k]
+    smax = s.gather(1, k[:, None])[:, 0]
+    alive = ~dead
+    shrunk = 0
+    for frac in (1.0, 0.5):   # tip at 2 sigma; halve until it no longer reaches empty space
+        reach = 2 * smax * frac
+        poke = alive & ((space.lookup(means + reach[:, None] * axis)[0] == 1)
+                        | (space.lookup(means - reach[:, None] * axis)[0] == 1))
+        if not poke.any():
+            break
+        new = torch.log(smax[poke] * 0.5)
+        params["scales"][poke, k[poke]] = torch.minimum(params["scales"][poke, k[poke]], new)
+        smax[poke] *= 0.5
+        shrunk += int(poke.sum())
+    return int(dead.sum()), shrunk
+
+
+def far_flat_loss(params, space):
+    """Splats outside the scanned region: penalise their extent along the line to its centre,
+    so distant scenery becomes camera-facing disks instead of needles reaching into the scene."""
+    means = params["means"]
+    _, inside = space.lookup(means.detach())
+    far = ~inside
+    if not far.any():
+        return means.new_zeros(())
+    s = torch.exp(params["scales"][far])
+    R = quat_to_rotmat(params["quats"][far])
+    r = F.normalize(means[far].detach() - space.center, dim=-1)
+    along = (R.transpose(1, 2) @ r[:, :, None])[:, :, 0]   # r in each splat's local axes
+    sigma_r = ((s * along) ** 2).sum(-1).clamp_min(1e-12).sqrt()
+    return (sigma_r / s.max(-1).values).mean()
 
 
 def make_params(splats, device):
@@ -241,6 +317,8 @@ def train(a, splats=None, log=print):
         strategy.check_sanity(params, opts)
 
     packed = a.mode == "3dgs"
+    space = Space(a.space, dev) if a.space else None
+    carved = [0, 0]
     eval_view = ev if len(ev) else tv
     t0, last = time.time(), time.time()
     for step in range(1, a.steps + 1):
@@ -264,6 +342,8 @@ def train(a, splats=None, log=print):
                 loss = loss + 0.01 * ex["distort"].mean()
         if mcmc:
             loss = loss + 0.01 * torch.sigmoid(params["opacities"]).mean() + 0.01 * torch.exp(params["scales"]).mean()
+        if space is not None and a.far_flat_weight > 0:
+            loss = loss + a.far_flat_weight * far_flat_loss(params, space)
         loss.backward()
         for o in opts.values():
             o.step()
@@ -277,6 +357,10 @@ def train(a, splats=None, log=print):
                 strategy.refine_stop_iter = step   # cap reached: stop growing
                 log(f"splat cap {a.max_splats:,} reached at step {step}; densification stopped")
 
+        if space is not None and a.carve and step % 100 == 0 and step <= a.steps - 200:
+            d, sh = carve(params, space)
+            carved[0] += d
+            carved[1] += sh
         if step % 100 == 0 or step == a.steps:
             el = time.time() - t0
             log(f"step {step}/{a.steps} splats {len(params['means']):,} loss {float(loss):.4f} "
@@ -292,6 +376,7 @@ def train(a, splats=None, log=print):
     gsdata.save_ply(out / f"export_{a.steps}.ply", dict(params))
     metrics = {"steps": a.steps, "splats": len(params["means"]), "train_seconds": round(time.time() - t0, 1),
                "peak_gpu_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
+               "carved": {"removed": carved[0], "shortened": carved[1]},
                "views_train": len(tv), "views_test": len(ev), "settings": vars(a)}
     if len(ev):
         metrics["test"] = evaluate(params, ev, sh_degree, a.mode, a.antialiased, out / "test_renders")

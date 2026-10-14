@@ -46,6 +46,8 @@ def parse(argv=None):
                    help="fused depth needs at least this much evidence (1 = one confident reading at 1 m)")
     p.add_argument("--agree", type=float, default=0.10,
                    help="relative tolerance between fused depth and the photo's own reading")
+    p.add_argument("--grid-only", action="store_true",
+                   help="only write space.npz (known-empty / surface / unknown), no depth maps")
     p.add_argument("--exclude-every", type=int, default=0,
                    help="leave every Nth photo out of the fusion (the trainer's held-out photos)")
     return p.parse_args(argv)
@@ -136,6 +138,24 @@ class Volume:
             self.tsdf[k0:k1] = torch.where(ok, (T * W + s * wt) / Wn.clamp_min(1e-12), T)
             self.w[k0:k1] = Wn
 
+    def space_grid(self, factor=4, min_weight=0.2, min_share=0.75):
+        """Coarse map of what the LiDAR established: 1 = known empty (most of the block seen
+        through repeatedly, none of it surface), 2 = surface (or next to one), 0 = unknown.
+        Foliage, where some rays hit and some pass, averages below "empty"."""
+        T, W = self.tsdf, self.w
+        nz, ny, nx = T.shape
+        pad = [0, (-nx) % factor, 0, (-ny) % factor, 0, (-nz) % factor]
+        empty = F.pad(((W >= min_weight) & (T >= 0.95)).float(), pad)
+        surf = F.pad(((W > 0) & (T.abs() < 0.9)).float(), pad)
+        empty_c = (F.avg_pool3d(empty[None, None], factor)[0, 0] >= min_share).float()
+        surf_c = F.max_pool3d(surf[None, None], factor)[0, 0]
+        surf_c = F.max_pool3d(surf_c[None, None], 3, stride=1, padding=1)[0, 0]   # 1-voxel margin
+        grid = torch.zeros_like(surf_c, dtype=torch.uint8)
+        grid[empty_c > 0] = 1
+        grid[surf_c > 0] = 2
+        return {"grid": grid.cpu().numpy(), "origin": self.lo.cpu().numpy(),
+                "voxel": np.float32(self.voxel * factor)}
+
     def sample(self, P):
         """Trilinear TSDF and weight at world points P [N,3]."""
         nx, ny, nz = self.n
@@ -202,6 +222,13 @@ def main(a):
         vol.integrate(f, a.max_range)
     t1 = time.time()
     print(f"integrated in {t1 - t0:.0f}s", flush=True)
+    space = vol.space_grid()
+    np.savez_compressed(out / "space.npz", **space)
+    g = space["grid"]
+    print(f"space grid {g.shape[2]}x{g.shape[1]}x{g.shape[0]} at {100 * float(space['voxel']):.0f} cm: "
+          f"{100 * (g == 1).mean():.0f}% known empty, {100 * (g == 2).mean():.0f}% surface", flush=True)
+    if a.grid_only:
+        return {"space": {"empty": float((g == 1).mean()), "surface": float((g == 2).mean())}}
 
     far = float((hi - lo).norm()) + 1
     stats = {"frames": [], "voxel_m": vol.voxel, "trunc_m": vol.trunc, "fused_frames": len(fuse_frames)}

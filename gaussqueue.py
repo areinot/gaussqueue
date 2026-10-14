@@ -62,6 +62,12 @@ DEFAULTS = {
     # Rotate results 180° about X so "up" is up in SuperSplat & co. (SplatKing/COLMAP
     # captures are +Y-up, most splat viewers expect -Y-up). Per-capture override on the dashboard.
     "flip_up": False,
+    # Start view: move and turn each result so it opens where the first capture photo was
+    # taken. The origin goes to that camera's position and the scene is turned about the
+    # vertical axis (yaw only; pitch and roll stay as captured) so the photo's heading points
+    # along start_view_forward, the viewer's default forward. Output-only, per capture.
+    "start_view": True,
+    "start_view_forward": "+z",
     # Refine the capture's camera poses with COLMAP (features, matching, bundle
     # adjustment) before training. Slower, usually sharper. Needs `colmap` on PATH.
     "refine_poses": False,
@@ -83,8 +89,11 @@ DEFAULTS = {
     # more) and render it back into each photo for denoised, wider depth coverage. In tests it
     # made held-out depth worse in views facing foliage; training already fuses the per-photo
     # depth implicitly.
+    # carve: remove splats in space the LiDAR saw through (and shorten ones poking into it).
+    # far_flat_weight: make splats beyond the scanned region camera-facing disks.
     "gsplat": {"densify": "mcmc", "depth_weight": 0.3, "flat_weight": 10, "max_splats": 6_000_000,
-               "sky_points": 50000, "mode": "3dgs", "depth_fusion": False},
+               "sky_points": 50000, "mode": "3dgs", "depth_fusion": False,
+               "carve": False, "far_flat_weight": 0.0},
     "depth_supervision": True,   # gsplat: match LiDAR depth where ARKit is confident
     "flatten": True,             # gsplat: push splats flat onto surfaces
     # Post-training pruning (on a CUDA worker): remove this percentage of splats, ranked by
@@ -130,11 +139,13 @@ DEFAULTS = {
 TRAIN_KEYS = ("total_steps", "max_resolution", "sh_degree", "max_splats", "subsample_frames")
 GSPLAT_KEYS = ("trainer", "densify", "depth_supervision", "flatten")
 RESTART_KEYS = TRAIN_KEYS + ("refine_poses",) + GSPLAT_KEYS   # changing these restarts training
-SETTING_KEYS = RESTART_KEYS + ("flip_up", "prune_pct")   # these two only affect the output
+OUTPUT_KEYS = ("flip_up", "start_view", "prune_pct")   # only affect the output files
+SETTING_KEYS = RESTART_KEYS + OUTPUT_KEYS
 SETTING_LIMITS = {"total_steps": (500, 100_000), "max_resolution": (256, 4096),
                   "sh_degree": (0, 3), "max_splats": (50_000, 20_000_000),
                   "subsample_frames": (1, 20), "flip_up": (0, 1), "refine_poses": (0, 1),
-                  "depth_supervision": (0, 1), "flatten": (0, 1), "prune_pct": (0, 95)}
+                  "depth_supervision": (0, 1), "flatten": (0, 1), "prune_pct": (0, 95),
+                  "start_view": (0, 1)}
 SETTING_CHOICES = {"trainer": ("brush", "gsplat"), "densify": ("mcmc", "default", "absgrad")}
 PRESETS = {
     # Quick look: is the scene coherent, oriented right, covered? Not for judging detail.
@@ -158,6 +169,7 @@ def effective_settings(cfg, ov):
     base = PRESETS.get(preset) or standard_settings(cfg)
     out = dict(base)
     out["flip_up"] = int(bool(cfg.get("flip_up")))
+    out["start_view"] = int(bool(cfg.get("start_view", True)))
     out["refine_poses"] = int(bool(cfg.get("refine_poses")))
     out["trainer"] = cfg.get("trainer") if cfg.get("trainer") in SETTING_CHOICES["trainer"] else "brush"
     densify = sub_config(cfg, "gsplat")["densify"]
@@ -185,7 +197,8 @@ def settings_summary(st):
             + (f", gsplat {st.get('densify')}" + (" +depth" if st.get("depth_supervision") else "")
                + (" +flat" if st.get("flatten") else "") if gs else "")
             + (f", prune {st['prune_pct']}%" if st.get("prune_pct") else "")
-            + (", flipped" if st.get("flip_up") else ""))
+            + (", flipped" if st.get("flip_up") else "")
+            + (", starts at first photo" if st.get("start_view") else ""))
 
 
 class Overrides:
@@ -1016,7 +1029,7 @@ def start_dashboard(cfg, paths, status, overrides):
                         return self.send(200, b'{"ok":true}', "application/json")
                     if action in ("run_next", "hold"):
                         raise ValueError("already processing")
-                    output_only = action == "set" and body.get("key") == "flip_up"
+                    output_only = action == "set" and body.get("key") in OUTPUT_KEYS
                     if not cur.get("paused") and not output_only:
                         raise ValueError("pause training before changing its settings")
                 elif action in ("pause", "resume", "snapshot"):
@@ -1549,6 +1562,56 @@ def compress(cfg, ply, out_dir, name, beat, formats=None):
     return sizes, errors
 
 
+def start_view_pose(model_dir, flip, forward="+z"):
+    """The first capture photo's camera, in the output's coordinates: (photo name, position,
+    yaw in degrees that turns its heading onto the viewer's forward axis). None if unknown."""
+    images = Path(model_dir) / "sparse" / "0" / "images.txt"
+    if not images.exists():
+        return None
+    poses = read_poses(images)
+    if not poses:
+        return None
+    name = sorted(poses)[0]   # SplatKing names photos by capture time
+    fields, q, centre = poses[name]
+    R = _quat_to_R(*q)
+    fwd = [R[2][i] for i in range(3)]   # camera +Z (viewing direction) in world coordinates
+    if flip:   # 180° about X, as gq_spz --flip
+        centre = [centre[0], -centre[1], -centre[2]]
+        fwd = [fwd[0], -fwd[1], -fwd[2]]
+    if math.hypot(fwd[0], fwd[2]) < 1e-6:   # looking straight up or down: no heading
+        yaw = 0.0
+    else:
+        yaw = -math.degrees(math.atan2(fwd[0], fwd[2]))   # heading onto +Z
+        if forward == "-z":
+            yaw += 180.0
+        yaw = (yaw + 180.0) % 360.0 - 180.0
+    return name, [round(c, 6) for c in centre], round(yaw, 4)
+
+
+def trainable_model(job_dir):
+    """The COLMAP folder a job trained on: refined poses if there are any, else the capture's."""
+    refined = Path(job_dir) / "refine" / "model"
+    if (refined / "sparse" / "0" / "images.txt").exists():
+        return refined
+    try:
+        return find_colmap(Path(job_dir) / "data")
+    except Exception:
+        return None
+
+
+def orient_ply(cfg, src, dst, flip, view, beat=lambda: None):
+    """Write src to dst flipped and/or moved to the start view (one native pass). Returns
+    None or a short error. Without gq_spz, only the flip is possible (SplatTransform)."""
+    if native_spz(cfg):
+        args = [src, dst] + (["--flip"] if flip else [])
+        if view:
+            args += ["--origin", *view[1], "--yaw", view[2]]
+        return run_native(cfg, args, dst, beat)
+    if view:
+        return "start view needs gq_spz (scripts/install.sh builds it)"
+    return splat_transform(cfg, [src, "-r", FLIP, "-N", dst], dst, beat)
+
+
 def flip_ply(cfg, src, dst, beat=lambda: None):
     """Rotate a splat 180° about X (turns a +Y-up scene -Y-up and vice versa), including the
     spherical harmonics. Natively with gq_spz when installed (fast, low memory), otherwise
@@ -1589,6 +1652,8 @@ def write_meta(dest, job, files, flipped):
         meta["held_out_photos"] = job["metrics"]
     if job.get("depth_fusion"):
         meta["depth_fusion"] = job["depth_fusion"]
+    if job.get("start_view"):
+        meta["start_view"] = job["start_view"]
     if job.get("prune"):
         meta["pruning"] = job["prune"]
     if job.get("quality"):
@@ -1802,6 +1867,12 @@ class RemoteWorker:
                 if st.get("depth_supervision") and g.get("depth_fusion"):
                     depth = self.fuse_depth(cfg, job, d, raw, beat)
                 args += ["--depth-dir", depth, "--eval-depth-dir", raw]
+                if g.get("carve") or g.get("far_flat_weight"):
+                    space = self.fuse_depth(cfg, job, d, raw, beat, grid_only=True)
+                    if space:
+                        args += ["--space", space] + (["--carve"] if g.get("carve") else [])
+                        if g.get("far_flat_weight"):
+                            args += ["--far-flat-weight", g["far_flat_weight"]]
                 if st.get("depth_supervision"):
                     args += ["--depth-weight", g["depth_weight"]]
             if st.get("flatten"):
@@ -1883,25 +1954,29 @@ class RemoteWorker:
         # The worker's copy stays until finish(): pruning may still use it.
         return final
 
-    def fuse_depth(self, cfg, job, d, raw, beat):
-        """Multi-view LiDAR fusion (gs/fuse.py) on the worker; returns the depth folder to train
-        on, or the raw one if fusion fails. Held-out photos are left out of the fusion."""
-        job["phase"] = f"fusing LiDAR depth on {self.label}"
+    def fuse_depth(self, cfg, job, d, raw, beat, grid_only=False):
+        """Multi-view LiDAR fusion (gs/fuse.py) on the worker. Returns the fused depth folder
+        (raw if fusion fails), or with grid_only the space.npz map of known-empty space (None
+        if it fails). Held-out photos are left out of the fusion."""
+        job["phase"] = f"{'mapping LiDAR space' if grid_only else 'fusing LiDAR depth'} on {self.label}"
         beat(force=True)
         cwd = self.gsplat["scripts"]
-        args = [f"{cwd}/fuse.py", f"{d}/data", "--depth-dir", raw, "--out", f"{d}/data/fused",
-                "--exclude-every", cfg["eval_split_every"]]
+        out_dir = f"{d}/data/{'space' if grid_only else 'fused'}"
+        args = [f"{cwd}/fuse.py", f"{d}/data", "--depth-dir", raw, "--out", out_dir,
+                "--exclude-every", cfg["eval_split_every"]] + (["--grid-only"] if grid_only else [])
         log(f"run on {self.label}: fuse {' '.join(map(str, args))}")
         try:
             code = self.run(self.gsplat["python"], args, cwd, d, "fuse", beat)
             if code:
                 raise RuntimeError(f"exit {code} {self.failure(d, 'fuse')}")
-            out = self.ps(f"Get-Content '{d}/data/fused/fusion.json' -Raw", check=False)
+            if grid_only:
+                return f"{out_dir}/space.npz"
+            out = self.ps(f"Get-Content '{out_dir}/fusion.json' -Raw", check=False)
             job["depth_fusion"] = {k: v for k, v in json.loads(out).items() if k != "frames"}
-            return f"{d}/data/fused"
+            return out_dir
         except Exception as e:
-            log(f"depth fusion failed on {self.label}, using raw LiDAR: {e}")
-            return raw
+            log(f"LiDAR fusion failed on {self.label}: {e}")
+            return None if grid_only else raw
 
     def prune(self, cfg, job, colmap_dir, sensor, ply, pct, out_dir, beat, trained_here):
         """Prune a trained result on this worker. Returns (local pruned .ply, report)."""
@@ -2047,18 +2122,28 @@ def process(cfg, paths, state, status, item, beat, worker=None):
                 warnings.append(f"prune: {str(e)[:120]}")
         flip = bool(pending().get("flip_up"))
         job["settings"]["flip_up"] = int(flip)
+        want_view = bool(pending().get("start_view"))
+        job["settings"]["start_view"] = int(want_view)
+        view = start_view_pose(source, flip, cfg.get("start_view_forward", "+z")) if want_view else None
         result_ply, cerrors = final, list(warnings)
-        if flip:
-            job["phase"] = "flipping"
+        if flip or view:
+            job["phase"] = "orienting"
             beat()
-            flipped = job_dir / "compressed" / f"{name}.ply"
-            flipped.parent.mkdir(parents=True, exist_ok=True)
-            err = flip_ply(cfg, final, flipped, beat)
+            oriented = job_dir / "compressed" / f"{name}.ply"
+            oriented.parent.mkdir(parents=True, exist_ok=True)
+            err = orient_ply(cfg, final, oriented, flip, view, beat)
+            if err and view:   # e.g. no gq_spz: still flip
+                cerrors.append(f"start view: {err}")
+                view = None
+                err = orient_ply(cfg, final, oriented, flip, None, beat) if flip else None
             if err:
                 cerrors.append(f"flip: {err}")
                 flip = False
-            else:
-                result_ply = flipped
+            elif flip or view:
+                result_ply = oriented
+        if view:
+            job["start_view"] = {"photo": view[0], "origin": view[1], "yaw_degrees": view[2],
+                                 "forward": cfg.get("start_view_forward", "+z")}
         job["phase"] = "compressing"
         beat()
         sizes, more = compress(cfg, result_ply, job_dir / "compressed", name, beat)
@@ -2258,7 +2343,7 @@ class Snapshots:
         c = self.status.jobs.get("mac")
         if not c:
             return True, ""
-        if c.get("phase") in ("compressing", "flipping") or "refining" in str(c.get("phase")):
+        if c.get("phase") in ("compressing", "orienting") or "refining" in str(c.get("phase")):
             return False, "waiting for the running capture's own processing"
         free = memory_free_pct()
         need = int(cfg.get("snapshot_min_free_pct", 25))
@@ -2311,13 +2396,19 @@ class Snapshots:
             shutil.rmtree(work, ignore_errors=True)
             work.mkdir(parents=True)
             flip = bool(snap["settings"].get("flip_up"))
+            model = trainable_model(self.paths.jobs / snap["name"]) if snap["settings"].get("start_view") else None
+            view = start_view_pose(model, flip, cfg.get("start_view_forward", "+z")) if model else None
             ply, errors = src, []
-            if flip:
-                err = flip_ply(cfg, src, work / f"{label}.ply")
+            if flip or view:
+                err = orient_ply(cfg, src, work / f"{label}.ply", flip, view)
+                if err and view:
+                    errors.append(f"start view: {err}")
+                    view = None
+                    err = orient_ply(cfg, src, work / f"{label}.ply", flip, None) if flip else None
                 if err:
                     errors.append(f"flip: {err}")
                     flip = False
-                else:
+                elif flip or view:
                     ply = work / f"{label}.ply"
             sizes, more = compress(cfg, ply, work, label, lambda: None)
             errors += more
@@ -2332,6 +2423,9 @@ class Snapshots:
             job = {"name": label, "settings": snap["settings"], "frames": snap["frames"],
                    "quality": snap["quality"], "preview": snap.get("preview"), "thumb": snap.get("thumb"),
                    "files": files}
+            if view:
+                job["start_view"] = {"photo": view[0], "origin": view[1], "yaw_degrees": view[2],
+                                     "forward": cfg.get("start_view_forward", "+z")}
             write_meta(dest, job, files, flip)
             meta = json.loads((dest / "meta.json").read_text())
             meta["snapshot"] = {"of": snap["name"], "step": snap["step"], "total_steps": snap["total"]}

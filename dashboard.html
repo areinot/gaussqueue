@@ -177,7 +177,7 @@ const kindText = (k, f) => [k && k !== "unknown" ? k : null, f ? `${f} frames` :
 
 const PRESET_LABEL = {preview: "Preview", fast: "Fast", standard: "Standard", high: "High", custom: "Custom"};
 const kfmt = (n) => n >= 1e6 ? `${+(n/1e6).toFixed(1)}M` : n >= 1000 ? `${+(n/1000).toFixed(1)}k` : String(n);
-const qualityText = (st) => st ? `<b>${PRESET_LABEL[st.preset] || esc(st.preset)}</b> · ${kfmt(st.total_steps)} steps · ${st.max_resolution}px · SH${st.sh_degree} · ≤${kfmt(st.max_splats)} splats${st.subsample_frames > 1 ? ` · every ${st.subsample_frames} frames` : ""}${st.refine_poses ? " · refined poses" : ""}${st.trainer === "gsplat" ? ` · gsplat ${esc(st.densify || "")}${st.depth_supervision ? " +depth" : ""}${st.flatten ? " +flat" : ""}` : ""}${st.prune_pct ? ` · prune ${st.prune_pct}%` : ""}${st.flip_up ? " · flipped" : ""}` : "";
+const qualityText = (st) => st ? `<b>${PRESET_LABEL[st.preset] || esc(st.preset)}</b> · ${kfmt(st.total_steps)} steps · ${st.max_resolution}px · SH${st.sh_degree} · ≤${kfmt(st.max_splats)} splats${st.subsample_frames > 1 ? ` · every ${st.subsample_frames} frames` : ""}${st.refine_poses ? " · refined poses" : ""}${st.trainer === "gsplat" ? ` · gsplat ${esc(st.densify || "")}${st.depth_supervision ? " +depth" : ""}${st.flatten ? " +flat" : ""}` : ""}${st.prune_pct ? ` · prune ${st.prune_pct}%` : ""}${st.flip_up ? " · flipped" : ""}${st.start_view ? " · starts at first photo" : ""}` : "";
 const FIELD_OPTS = {
   max_resolution: [720, 960, 1080, 1280, 1440, 1920, 2560, 3840],
   sh_degree: [[0, "0 · flat colour"], [1, "1"], [2, "2"], [3, "3 · full sheen"]],
@@ -249,7 +249,7 @@ function jobPanel(c) {
              <button data-act="snapshot" title="Turn the latest checkpoint into a result you can open now (as <name>-step<N>).">Publish snapshot</button>`
           : `${pauseBtn}
              <button data-act="snapshot" title="Turn the latest checkpoint into a result you can open now (as <name>-step<N>). Training keeps going; processing waits until it can't slow the run.">Publish snapshot</button>
-             ${flipBox(pend && pend.flip_up)}`}
+             ${flipBox(pend && pend.flip_up)} ${startViewBox(pend && pend.start_view)}`}
       </div>
       ${!c.paused && itemErrors[c.name] ? `<div class="serr">${esc(itemErrors[c.name])}</div>` : ""}
       ${(c.snapshots || []).length ? `<div class="snaps">${c.snapshots.map(sn => {
@@ -326,6 +326,12 @@ function flipBox(on) {
     <input type="checkbox" data-set="flip_up"${on ? " checked" : ""}> Flip vertical</label>`;
 }
 
+// "Start view": output-only too (moves/turns the result so it opens at the first photo).
+function startViewBox(on) {
+  return `<label class="flip" title="Move the result so its origin is where you took the first photo, turned (left/right only) to face that photo's direction. Viewers that start at the origin open on your first shot. Applied to the output files after training; never restarts training.">
+    <input type="checkbox" data-set="start_view"${on ? " checked" : ""}> Start at first photo</label>`;
+}
+
 // "Refine camera poses": COLMAP bundle adjustment before training (changes the input, so it restarts).
 function refineBox(on) {
   return `<label class="flip" title="Before training, refine the capture's camera poses with COLMAP (feature matching + bundle adjustment). Takes a few minutes; usually sharper, especially for foliage and long walks.">
@@ -385,6 +391,7 @@ function settingsHTML(it, isCurrent) {
         <div class="flipfield">${refineBox(st.refine_poses)}</div>
         ${gsplatHTML(st)}
         <div class="flipfield">${flipBox(st.flip_up)}</div>
+        <div class="flipfield">${startViewBox(st.start_view)}</div>
       </div>
       <div class="actions">
         ${isCurrent ? "" : `<button data-act="run_next">Run next</button>
