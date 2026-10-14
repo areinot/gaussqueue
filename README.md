@@ -174,6 +174,7 @@ The exception is `dashboard_port`, which needs a restart.
 | Key | Default | |
 |---|---|---|
 | `standard` | 15k steps, 1440 px, SH 3, ≤10M splats | The default preset. *Fast* and *High* are fixed. |
+| `spz_version` | `3` | SPZ format version. Version 4, SplatTransform's default, isn't gzip-wrapped, and many apps load it as empty. Version 3 is the classic format that most apps support. |
 | `compress` | `["sog", "spz"]` | Compressed formats written next to the `.ply`. Use `[]` to turn this off. If compression fails, the capture still counts as done, and the problem is noted in the history. |
 | `refine_poses` | `false` (example config: `true`) | Refine camera poses with COLMAP before training. A few minutes of CPU per capture. |
 | `flip_up` | `false` (example config: `true`) | Rotate results 180° about X so they're the right way up in SuperSplat and similar viewers. |

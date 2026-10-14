@@ -52,6 +52,9 @@ DEFAULTS = {
     "brush": str(APP_HOME / "bin/brush_app"),
     # Compressed copies written next to the .ply (needs SplatTransform; [] = off)
     "compress": ["sog", "spz"],
+    # SPZ 4 (SplatTransform's default) isn't gzip-wrapped and many apps load it as empty;
+    # 3 is the widely supported classic format.
+    "spz_version": 3,
     # Rotate results 180° about X so "up" is up in SuperSplat & co. (SplatKing/COLMAP
     # captures are +Y-up, most splat viewers expect -Y-up). Per-capture override on the dashboard.
     "flip_up": False,
@@ -1421,7 +1424,8 @@ def compress(cfg, ply, out_dir, name, beat, formats=None):
     for fmt in formats:
         dst = out_dir / f"{name}.{fmt}"
         # -N drops NaN/degenerate splats, which some viewers choke on
-        err = splat_transform(cfg, [ply, "-N", dst], dst, beat)
+        extra = ["--spz-version", int(cfg.get("spz_version", 3))] if fmt == "spz" else []
+        err = splat_transform(cfg, [ply, "-N"] + extra + [dst], dst, beat)
         if err:
             errors.append(f"{fmt}: {err}")
         else:
