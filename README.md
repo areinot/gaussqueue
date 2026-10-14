@@ -3,7 +3,7 @@ This is some AI vibe-coded foolishness so uh, clone at your own risk.
 
 # GaussQueue
 
-A folder-watching training queue for Gaussian splats on a Mac.
+A dashboard and training queue for Gaussian splats on a Mac.
 
 Drop a capture into an inbox folder (an iCloud Drive folder works well, so you
 can send captures from your phone), and GaussQueue copies it to local disk, trains
