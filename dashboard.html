@@ -91,16 +91,21 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .grid > .card.helping { grid-row: span 2; }
 /* The help card's grid cell is invisible; the text sits in its own box, moved to line up with
    the setting, with the brace in the gutter between it and the capture's card. */
-.helpcard { align-self: stretch; padding: 0 0 0 22px; background: none !important; border: 0 !important;
+.helpcard { align-self: stretch; padding: 0 0 0 14px; background: none !important; border: 0 !important;
   box-shadow: none !important; }
-.helpcard.on-left { padding: 0 22px 0 0; }
-.helpcard .hbody { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
-  box-shadow: var(--shadow); padding: 12px 14px; }
+.helpcard.on-left { padding: 0 14px 0 0; }
+/* The brace is the box's edge on the card side: its arms run into the top and bottom borders. */
+.helpcard .hbody { background: var(--panel); border: 1px solid var(--line); border-left: 0;
+  border-radius: 0 12px 12px 0; box-shadow: var(--shadow); padding: 12px 14px 12px 10px; }
+.helpcard.on-left .hbody { border-left: 1px solid var(--line); border-right: 0; border-radius: 12px 0 0 12px;
+  padding: 12px 10px 12px 14px; }
 /* A curly brace in the gutter spans the help text, its point at the described setting's line. */
 .help .hbody { position: relative; }
 .help .brace { position: absolute; top: 0; left: -19px; width: 12px; height: 100%; overflow: visible;
+  pointer-events: none;
   fill: none; stroke: var(--accent); stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
-.helpcard.on-left .brace { left: auto; right: -19px; transform: scaleX(-1); }
+.helpcard .brace { left: -11px; top: -1px; height: calc(100% + 2px); }   /* arms meet the borders */
+.helpcard.on-left .brace { left: auto; right: -11px; transform: scaleX(-1); }
 .help { border-left: 1px solid var(--line); padding-left: 24px; font-size: 12.5px; line-height: 1.5;
   color: var(--muted); display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .help .hname { font-size: 13px; font-weight: 600; color: var(--text); }
@@ -488,13 +493,14 @@ function fillHelp() {
 
 // A "{" 12 units wide and h tall whose point is at height tip (anywhere along it): the arms
 // curl in from the right at both ends, the point juts out to the left.
-function bracePath(h, tip) {
-  const x = 6, r1 = Math.min(5, tip / 2), r2 = Math.min(5, (h - tip) / 2);
-  const a = Math.min(4, tip / 2), b = Math.min(4, (h - tip) / 2);   // curl into the point
-  return `M ${x + 5} 0.7 Q ${x} 0.7 ${x} ${r1 + 0.7}` +
-         ` L ${x} ${Math.max(r1 + 0.7, tip - a)} Q ${x} ${tip} ${x - 5} ${tip}` +
-         ` Q ${x} ${tip} ${x} ${Math.min(h - r2 - 0.7, tip + b)}` +
-         ` L ${x} ${h - r2 - 0.7} Q ${x} ${h - 0.7} ${x + 5} ${h - 0.7}`;
+// e: how far in from the top/bottom the arms run (on the box's border lines for help cards).
+function bracePath(h, tip, e = 0.7) {
+  const x = 6.5, r1 = Math.min(5.5, (tip - e) / 2), r2 = Math.min(5.5, (h - e - tip) / 2);
+  const a = Math.min(4, (tip - e) / 2), b = Math.min(4, (h - e - tip) / 2);   // curl into the point
+  return `M 12 ${e} Q ${x} ${e} ${x} ${r1 + e}` +
+         ` L ${x} ${Math.max(r1 + e, tip - a)} Q ${x} ${tip} ${x - 5} ${tip}` +
+         ` Q ${x} ${tip} ${x} ${Math.min(h - r2 - e, tip + b)}` +
+         ` L ${x} ${h - r2 - e} Q ${x} ${h - e} 12 ${h - e}`;
 }
 
 // Box of the first visible line of text inside an element (a setting's label).
@@ -542,8 +548,11 @@ function alignHelp() {
       svg.appendChild(document.createElementNS("http://www.w3.org/2000/svg", "path"));
       body.prepend(svg);
     }
-    svg.setAttribute("viewBox", `0 0 12 ${h}`);
-    svg.firstChild.setAttribute("d", bracePath(h, tip));
+    // help cards: the brace is 1 px taller each way so its arms sit on the box's borders
+    const card = el.classList.contains("helpcard"), H = card ? h + 2 : h;
+    svg.setAttribute("viewBox", `0 0 12 ${H}`);
+    svg.setAttribute("preserveAspectRatio", "none");
+    svg.firstChild.setAttribute("d", bracePath(H, card ? tip + 1 : tip, card ? 1.5 : 0.7));
   });
 }
 window.addEventListener("resize", () => requestAnimationFrame(() => { placeHelp(true); alignHelp(); }));
