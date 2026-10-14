@@ -117,6 +117,31 @@ class DashboardAPITest(unittest.TestCase):
         self.assertEqual([(q["name"], q["hold"], q["run_next"]) for q in queue],
                          [("capB", False, True), ("capA", True, False)])
 
+    def test_pause_rules(self):
+        # Queued (not running) items can't be paused or resumed.
+        code, body = self.post({"name": "capA", "action": "pause"})
+        self.assertEqual(code, 400)
+        self.assertIn("only the running capture", body)
+        # The running item: edits need a pause first; pause/resume set a request.
+        job = {"name": "capA", "phase": "training", "paused": False}
+        self.status.current = job
+        try:
+            code, body = self.post({"name": "capA", "action": "set", "key": "total_steps",
+                                    "value": 1000})
+            self.assertEqual(code, 400)
+            self.assertIn("pause training", body)
+            self.assertEqual(self.post({"name": "capA", "action": "resume"})[0], 400)
+            self.assertEqual(self.post({"name": "capA", "action": "pause"})[0], 200)
+            self.assertEqual(job["request"], "pause")
+            job.update(paused=True, phase="paused")
+            self.assertEqual(self.post({"name": "capA", "action": "set", "key": "total_steps",
+                                        "value": 1000})[0], 200)
+            snap = self.snapshot()["current"]
+            self.assertEqual(snap["pending_settings"]["total_steps"], 1000)
+            self.assertEqual(self.post({"name": "capA", "action": "hold"})[0], 400)
+        finally:
+            self.status.current = None
+
     def test_snapshot_has_estimates_and_presets(self):
         snap = self.snapshot()
         self.assertEqual(set(snap["presets"]), {"fast", "standard", "high"})

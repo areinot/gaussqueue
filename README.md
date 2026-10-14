@@ -31,6 +31,10 @@ structure-from-motion step. Any capture that contains a COLMAP model
 - **Per-capture quality settings.** Fast / Standard / High presets, or set the steps,
   resolution, SH degree, splat cap and frame subsampling yourself. Captures can also be
   held or moved to the front. Each queued capture shows an estimated duration.
+- **Pause and tweak.** Pause the running capture: Brush is frozen in place
+  (`SIGSTOP`) and the Mac is allowed to sleep. Resume to carry on where it stopped,
+  or change its settings while it's paused and resume to restart it from step 0 with
+  them. The capture stays on local disk, so nothing is copied again.
 - **Notifications (optional).** iMessages when a capture starts, at 25/50/75 % with a
   preview image, and when it finishes or fails.
 - **Unattended.** Runs as a launchd agent that starts at login and restarts if it
@@ -110,7 +114,8 @@ The dashboard listens on `127.0.0.1` only.
 - `POST /api/item` changes a queued item. Example bodies:
   `{"name": "...", "action": "preset", "value": "fast"}`,
   `{"name": "...", "action": "set", "key": "max_resolution", "value": 1920}`, and the
-  actions `run_next`, `hold` (with `"value": true|false`) and `reset`.
+  actions `run_next`, `hold` (with `"value": true|false`) and `reset`. For the running
+  capture, `pause` and `resume` are available, and settings can only be changed while it's paused.
   Requests must come from the dashboard's own origin and be JSON. That stops other
   websites open in your browser from changing your queue.
 

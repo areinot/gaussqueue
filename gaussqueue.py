@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -589,7 +590,8 @@ class Status:
         if c:
             current = {k: c.get(k) for k in
                        ("name", "phase", "step", "total", "started", "eta", "preview",
-                        "kind", "frames", "thumb", "settings")}
+                        "kind", "frames", "thumb", "settings", "paused", "paused_at")}
+            current["pending_settings"] = effective_settings(cfg, self.overrides.get(c["name"]))
             current["previews"] = sorted(p.name for p in
                                          self.paths.previews.glob(f"{c['name']}_step*.jpg"))
         self.snapshot = {
@@ -692,8 +694,22 @@ def start_dashboard(cfg, paths, status, overrides):
                 name = body.get("name", "")
                 if not any(i.name == name for i in list(status.inbox.items.values())):
                     raise ValueError("no such inbox item")
-                if status.current and status.current["name"] == name:
-                    raise ValueError("already processing")
+                cur = status.current
+                action = body.get("action")
+                if cur and cur["name"] == name:
+                    if action in ("pause", "resume"):
+                        if cur.get("phase") not in ("training", "paused"):
+                            raise ValueError("can only pause while training")
+                        if action == "resume" and not cur.get("paused"):
+                            raise ValueError("not paused")
+                        cur["request"] = action
+                        return self.send(200, b'{"ok":true}', "application/json")
+                    if action in ("run_next", "hold"):
+                        raise ValueError("already processing")
+                    if not cur.get("paused"):
+                        raise ValueError("pause training before changing its settings")
+                elif action in ("pause", "resume"):
+                    raise ValueError("only the running capture can be paused")
                 overrides.apply(name, body)
                 status.write(load_config())
                 self.send(200, b'{"ok":true}', "application/json")
@@ -768,7 +784,17 @@ def latest_step(out_dir, prefix):
     return best
 
 
-def train(cfg, paths, job, colmap_dir, out_dir, beat):
+RESTART = object()  # train() result: settings changed while paused, run again
+
+
+def same_settings(a, b):
+    return all(a[k] == b[k] for k in SETTING_KEYS)
+
+
+def train(cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
+    """Run Brush until done. Honours job["request"] = "pause" | "resume" (set by
+    the dashboard): pause SIGSTOPs Brush in place; resume either SIGCONTs it, or,
+    if the settings were changed while paused, kills it and returns RESTART."""
     if not os.access(cfg["brush"], os.X_OK):
         raise RuntimeError(f"Brush not found at {cfg['brush']} (run scripts/install.sh)")
     st = job["settings"]
@@ -792,14 +818,42 @@ def train(cfg, paths, job, colmap_dir, out_dir, beat):
         # cwd matters: Brush writes a GPU autotune cache relative to it (launchd's cwd is /)
         proc = subprocess.Popen(cmd, stdout=tlog, stderr=subprocess.STDOUT,
                                 cwd=out_dir.parent)
-    awake = subprocess.Popen(["caffeinate", "-i", "-m", "-w", str(proc.pid)])
-    job.update(phase="training", step=0, total=total, started=time.time(), train_started=time.time())
+    keep_awake = lambda: subprocess.Popen(["caffeinate", "-i", "-m", "-w", str(proc.pid)])
+    awake = keep_awake()
+    job.update(phase="training", step=0, total=total, started=time.time(),
+               train_started=time.time(), eta=None, paused=False, paused_at=None,
+               request=None)
     rotate = capture_rotation(colmap_dir.parent)
     notified = set()
     last_preview_step = None
+    last_progress = 0.0
     try:
         while proc.poll() is None:
-            time.sleep(5)
+            time.sleep(1)
+            req, job["request"] = job.get("request"), None
+            if req == "pause" and not job["paused"]:
+                os.kill(proc.pid, signal.SIGSTOP)
+                awake.terminate()  # let the Mac sleep while paused
+                job.update(paused=True, paused_at=time.time(), phase="paused", eta=None)
+                log(f"paused: {job['name']} at step {job['step']}")
+                beat(force=True)
+            elif req == "resume" and job["paused"]:
+                new = pending_settings()
+                if not same_settings(new, st):
+                    log(f"settings changed while paused; restarting {job['name']}")
+                    return RESTART  # finally: kills the stopped process
+                os.kill(proc.pid, signal.SIGCONT)
+                gap = time.time() - job["paused_at"]
+                job["started"] += gap        # keep elapsed/ETA honest
+                job["train_started"] += gap
+                job.update(paused=False, paused_at=None, phase="training")
+                awake = keep_awake()
+                log(f"resumed: {job['name']}")
+                beat(force=True)
+            if job["paused"] or time.time() - last_progress < 5:
+                beat()
+                continue
+            last_progress = time.time()
             step = latest_step(out_dir, "eval")
             if step:
                 job["step"] = step
@@ -830,8 +884,10 @@ def train(cfg, paths, job, colmap_dir, out_dir, beat):
             beat()
     finally:
         if proc.poll() is None:
-            proc.kill()
+            proc.kill()   # SIGKILL also works on a SIGSTOPped process
+            proc.wait()
         awake.terminate()
+        job.update(paused=False, paused_at=None)
     if proc.returncode != 0:
         reason = ""
         tlines = (out_dir.parent / "train.log").read_text(errors="replace").splitlines()
@@ -866,7 +922,17 @@ def process(cfg, paths, state, status, item, beat):
             unpack(local_zip, job_dir / "data")
         colmap = find_colmap(job_dir / "data")
         out_dir = job_dir / "out"
-        final = train(cfg, paths, job, colmap, out_dir, beat)
+        pending = lambda: effective_settings(load_config(), status.overrides.get(name))
+        while True:
+            final = train(cfg, paths, job, colmap, out_dir, beat, pending)
+            if final is not RESTART:
+                break
+            for old in paths.previews.glob(f"{name}_step*.jpg"):
+                old.unlink()
+            job.pop("preview", None)
+            job["settings"] = pending()
+            imessage(cfg, f"🔁 {name}: restarting with new settings "
+                          f"({settings_summary(job['settings'])})")
 
         job["phase"] = "uploading result to iCloud"
         beat()
@@ -980,10 +1046,10 @@ def main():
     log(f"GaussQueue started, watching {paths.inbox}")
     last_beat = [0.0]
 
-    def beat():
+    def beat(force=False):
         """Called often from every wait loop: keep the inbox (thumbnails!) and
         status fresh even while a job is training."""
-        if time.time() - last_beat[0] < 2:
+        if not force and time.time() - last_beat[0] < 2:
             return
         last_beat[0] = time.time()
         c = load_config()

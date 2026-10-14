@@ -89,6 +89,14 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .actions button { font: inherit; font-size: 12px; padding: 4px 9px; border-radius: 6px; cursor: pointer;
   border: 1px solid var(--line); background: var(--panel); color: var(--text); }
 .actions button:hover, .seg button:hover:not(.on) { background: var(--track); }
+.controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.controls button { font: inherit; font-size: 13px; padding: 5px 14px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+.controls button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.controls button:disabled { opacity: .5; cursor: default; }
+.b-paused { color: var(--warn); }
+.now .settings { border: 1px solid var(--line); border-radius: 10px; }
+.now.paused .bar > div { background: var(--warn); }
 .serr { font-size: 12px; color: var(--bad); min-height: 0; }
 #lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.88); display: none; align-items: center;
   justify-content: center; z-index: 10; cursor: zoom-out; padding: 16px; }
@@ -170,8 +178,14 @@ const heroName = (c) => {
   return selected && previews.includes(selected) ? selected : (c.preview || c.thumb);
 };
 
+function editing(el) {
+  const a = document.activeElement;
+  return a && el.contains(a) && (a.tagName === "INPUT" || a.tagName === "SELECT");
+}
+
 function renderNow(c) {
   const el = $("now");
+  if (editing(el)) return;
   if (!c) { lastJob = null; selected = null; el.className = "panel";
     setHTML(el, `<div class="idle">Idle. Drop a capture (zip or folder with a COLMAP model) into <b>${esc(last && last.inbox_dir || "the inbox")}</b>.</div>`); return; }
   if (c.name !== lastJob) { selected = null; lastJob = c.name; }
@@ -179,7 +193,20 @@ function renderNow(c) {
   const hero = heroName(c);
   const pct = c.step != null && c.total ? Math.min(100, 100*c.step/c.total) : 0;
   const stepLabel = (n) => { const m = n.match(/_step(\d+)\.jpg$/); return m ? `${(+m[1]/1000).toFixed(1)}k` : ""; };
-  el.className = "panel now";
+  el.className = "panel now" + (c.paused ? " paused" : "");
+  const pend = c.pending_settings, run = c.settings;
+  const changed = c.paused && pend && run && ["total_steps", "max_resolution", "sh_degree", "max_splats", "subsample_frames"].some(k => pend[k] !== run[k]);
+  const canPause = c.phase === "training" || c.paused;
+  const controls = canPause && last.presets ? `
+      <div class="controls" data-item="${esc(c.name)}">
+        ${c.paused
+          ? `<button class="primary" data-act="resume">${changed ? "Restart with new settings" : "Resume"}</button>
+             <span class="badge b-paused">paused</span>`
+          : `<button data-act="pause">Pause</button>`}
+      </div>
+      ${!c.paused && itemErrors[c.name] ? `<div class="serr">${esc(itemErrors[c.name])}</div>` : ""}
+      ${c.paused ? `${settingsHTML({name: c.name, settings: pend}, true)}
+        <div class="meta">${changed ? "Changed settings restart training from step 0 (the capture stays on local disk)." : "Change settings to restart from step 0 with them, or resume where it stopped."}</div>` : ""}` : "";
   // Time-dependent values (elapsed, ETA) are left as empty slots and filled by tick().
   setHTML(el, `
     <div class="hero">${hero ? img(hero, c.name) : `<span class="meta">no preview yet</span>`}</div>
@@ -187,6 +214,7 @@ function renderNow(c) {
       <div class="name">${esc(c.name)}</div>
       <div class="phase">${esc(c.phase)}${kindText(c.kind, c.frames) ? " · " + esc(kindText(c.kind, c.frames)) : ""}</div>
       ${c.settings ? `<div class="quality">${qualityText(c.settings)}</div>` : ""}
+      ${controls}
       <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
       <div class="stats">
         <div class="stat"><div class="k">Step</div><div class="v">${c.step != null ? `${c.step.toLocaleString()} / ${(c.total||0).toLocaleString()}` : "—"}</div></div>
@@ -206,7 +234,7 @@ function selectHTML(key, value, opts) {
   return `<select data-set="${key}">${list.map(([v, l]) => `<option value="${v}"${v === value ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
 }
 
-function settingsHTML(it) {
+function settingsHTML(it, isCurrent) {
   const st = it.settings, base = (last.presets || {})[st.base] || {};
   const cls = (k) => st.preset === "custom" && base[k] !== undefined && base[k] !== st[k] ? "changed" : "";
   const field = (k, label, inner) => `<label>${label}${inner.replace("<select", `<select class="${cls(k)}"`).replace("<input", `<input class="${cls(k)}"`)}</label>`;
@@ -223,8 +251,8 @@ function settingsHTML(it) {
         ${field("subsample_frames", "Frames used", selectHTML("subsample_frames", st.subsample_frames, FIELD_OPTS.subsample_frames))}
       </div>
       <div class="actions">
-        <button data-act="run_next">Run next</button>
-        <button data-act="hold" data-value="${it.hold ? "false" : "true"}">${it.hold ? "Resume" : "Hold"}</button>
+        ${isCurrent ? "" : `<button data-act="run_next">Run next</button>
+        <button data-act="hold" data-value="${it.hold ? "false" : "true"}">${it.hold ? "Resume" : "Hold"}</button>`}
         ${st.preset !== "standard" ? `<button data-act="reset">Reset</button>` : ""}
       </div>
       ${itemErrors[it.name] ? `<div class="serr">${esc(itemErrors[it.name])}</div>` : ""}
@@ -234,8 +262,7 @@ function settingsHTML(it) {
 function renderQueue(q) {
   $("queue-h").textContent = `Inbox (${q.length})`;
   // Don't rebuild while someone is typing in a settings field.
-  const a = document.activeElement;
-  if (a && $("queue").contains(a) && (a.tagName === "INPUT" || a.tagName === "SELECT")) return;
+  if (editing($("queue"))) return;
   if (!q.length) { setHTML($("queue"), `<div class="panel empty">Nothing waiting.</div>`); return; }
   const editable = !!(last && last.presets);
   let pos = 0;
@@ -267,7 +294,8 @@ async function sendItem(name, body) {
     const j = await r.json().catch(() => ({}));
     if (r.ok) delete itemErrors[name]; else itemErrors[name] = j.error || `error ${r.status}`;
   } catch (e) { itemErrors[name] = "service not reachable"; }
-  if (document.activeElement && $("queue").contains(document.activeElement)) document.activeElement.blur();
+  const a = document.activeElement;
+  if (a && ($("queue").contains(a) || $("now").contains(a))) a.blur();
   await refresh();
 }
 
@@ -294,8 +322,9 @@ function tick() {
     `live · ${last.settings.total_steps.toLocaleString()} steps @ ${last.settings.max_resolution}px`;
   const set = (sel, text) => document.querySelectorAll(sel).forEach(e => { if (e.textContent !== text) e.textContent = text; });
   if (c) {
-    set('[data-t="elapsed"]', c.started ? dur(now - c.started) : "—");
-    set('[data-t="eta"]', c.eta ? `${clock(c.eta)} (${dur(c.eta - now)})` : "—");
+    const t = c.paused && c.paused_at ? c.paused_at : now;
+    set('[data-t="elapsed"]', c.started ? dur(t - c.started) : "—");
+    set('[data-t="eta"]', c.paused ? "paused" : c.eta ? `${clock(c.eta)} (${dur(c.eta - now)})` : "—");
   }
   document.querySelectorAll("[data-since]").forEach(e => {
     const t = dur(now - +e.dataset.since);
