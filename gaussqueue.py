@@ -64,6 +64,9 @@ DEFAULTS = {
     "eval_split_every": 16,
     "extra_args": [],
     "keep_work_days": 7,
+    # When a capture is requeued and rerun, move the earlier result into
+    # <outbox>/<name>/previous/ instead of overwriting it.
+    "keep_previous_results": True,
 }
 
 
@@ -235,6 +238,18 @@ def item_name(path):
     while name.lower().endswith(".zip"):
         name = name[:-4]
     return name
+
+
+def find_processed(paths, name):
+    """The original zip/folder of a finished capture, in inbox/done or inbox/failed."""
+    for folder in (paths.done, paths.failed):
+        try:
+            for p in folder.iterdir():
+                if not p.name.startswith(".") and item_name(p) == name:
+                    return p
+        except FileNotFoundError:
+            pass
+    return None
 
 
 class Paths:
@@ -599,7 +614,14 @@ class Status:
         busy = c["name"] if c else None
         rate = current_rate(c, self.state)
         queue = self.inbox.snapshot(cfg, self.overrides, rate, busy)
-        hist = self.state.get("history", [])[-20:][::-1]
+        hist, seen = [], set()
+        in_inbox = {i.name for i in list(self.inbox.items.values())}
+        for h in self.state.get("history", [])[-20:][::-1]:
+            h = dict(h)
+            h["requeueable"] = (h["name"] not in seen and h["name"] not in in_inbox
+                                and find_processed(self.paths, h["name"]) is not None)
+            seen.add(h["name"])
+            hist.append(h)
         current = None
         if c:
             current = {k: c.get(k) for k in
@@ -664,6 +686,23 @@ class Status:
 
 # ---------------------------------------------------------------- dashboard server
 
+def requeue(status, overrides, name):
+    """Move a finished capture back into the inbox, on hold so its settings can be
+    changed before it runs again."""
+    paths = status.inbox.paths
+    if any(i.name == name for i in list(status.inbox.items.values())):
+        raise ValueError("already in the inbox")
+    src = find_processed(paths, name)
+    if src is None:
+        raise ValueError("original capture not found in inbox/done or inbox/failed")
+    dst = paths.inbox / src.name
+    if dst.exists():
+        raise ValueError(f"{src.name} already exists in the inbox")
+    overrides.apply(name, {"action": "hold", "value": True})  # before it becomes visible
+    shutil.move(str(src), dst)
+    log(f"requeued (on hold): {name}")
+
+
 def start_dashboard(cfg, paths, status, overrides):
     previews = paths.previews
     port = int(cfg["dashboard_port"])
@@ -706,6 +745,10 @@ def start_dashboard(cfg, paths, status, overrides):
                 n = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(min(n, 10_000)))
                 name = body.get("name", "")
+                if body.get("action") == "requeue":
+                    requeue(status, overrides, name)
+                    status.write(load_config())
+                    return self.send(200, b'{"ok":true}', "application/json")
                 if not any(i.name == name for i in list(status.inbox.items.values())):
                     raise ValueError("no such inbox item")
                 cur = status.current
@@ -980,7 +1023,10 @@ def process(cfg, paths, state, status, item, beat):
     job_dir.mkdir(parents=True, exist_ok=True)
     job = {"name": name, "phase": "downloading from iCloud", "step": None,
            "kind": item.kind, "frames": item.frames, "thumb": item.thumb,
+           "file": item.path.name,
            "settings": effective_settings(cfg, status.overrides.get(name))}
+    for old in paths.previews.glob(f"{name}_step*.jpg"):  # from an earlier run
+        old.unlink()
     status.current = job
     beat()
     t0 = time.time()
@@ -1028,6 +1074,15 @@ def process(cfg, paths, state, status, item, beat):
         job["phase"] = "uploading result to iCloud"
         beat()
         dest = paths.outbox / name
+        if cfg.get("keep_previous_results") and dest.is_dir() and any(
+                f.name != "previous" for f in dest.iterdir()):
+            prev = dest / "previous"
+            shutil.rmtree(prev, ignore_errors=True)
+            prev.mkdir()
+            for f in list(dest.iterdir()):
+                if f.name != "previous":
+                    shutil.move(str(f), prev / f.name)
+            log(f"kept earlier result of {name} in {prev}")
         dest.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(result_ply, dest / f"{name}.ply")
         for fmt in sizes:   # built locally, copied whole, so the outbox never sees partial files
@@ -1077,6 +1132,7 @@ def record(state, job, result, duration, detail):
         "preview": job.get("preview"), "thumb": job.get("thumb"),
         "kind": job.get("kind"), "frames": job.get("frames"),
         "settings": job.get("settings"), "train_seconds": job.get("train_seconds"),
+        "file": job.get("file"),
         "files": job.get("files")})
     state["history"] = state["history"][-50:]
     save_state(state)

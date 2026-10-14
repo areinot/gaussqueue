@@ -76,7 +76,7 @@ class DashboardAPITest(unittest.TestCase):
             return json.loads(r.read())
 
     def setUp(self):
-        for name in ("capA", "capB"):
+        for name in ("capA", "capB", "capC"):
             self.overrides.clear(name)
 
     def test_preset_then_field_override_is_custom(self):
@@ -163,6 +163,26 @@ class DashboardAPITest(unittest.TestCase):
                                         "value": 1})[0], 400)
         finally:
             self.status.current = None
+
+    def test_requeue_puts_finished_capture_back_on_hold(self):
+        paths = self.inbox.paths
+        (paths.done / "capC").mkdir()
+        self.status.state["history"].append({"name": "capC", "result": "done", "duration": "1m",
+                                             "finished": "01-01 00:01"})
+        self.status.write(self.cfg)
+        rows = {h["name"]: h for h in self.snapshot()["history"]}
+        self.assertTrue(rows["capC"]["requeueable"])
+        self.assertFalse(rows["old"]["requeueable"])   # its original isn't in done/
+        self.assertEqual(self.post({"name": "capC", "action": "requeue"})[0], 200)
+        self.assertTrue((paths.inbox / "capC").is_dir())
+        self.assertFalse((paths.done / "capC").exists())
+        self.assertTrue(self.overrides.get("capC").get("hold"))
+        self.inbox.tick(self.cfg)
+        self.assertNotIn("capC", [i.name for i in self.inbox.ready(self.overrides)])
+        code, body = self.post({"name": "capC", "action": "requeue"})
+        self.assertEqual(code, 400)
+        self.assertIn("already in the inbox", body)
+        self.assertEqual(self.post({"name": "old", "action": "requeue"})[0], 400)
 
     def test_snapshot_has_estimates_and_presets(self):
         snap = self.snapshot()

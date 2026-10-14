@@ -39,6 +39,10 @@ structure-from-motion step. Any capture that contains a COLMAP model
   also be set per capture, even mid-training), results are rotated 180° about X before
   compression. The rotation covers the view-dependent colour data too. `meta.json` records
   what was applied.
+- **Rerun at higher quality.** Each finished or failed capture in *Recent* has a
+  **Requeue** button. It moves the original capture back into the inbox, on hold, so you
+  can choose new settings and then release the hold. When the rerun finishes, the earlier
+  result is moved to `<outbox>/<name>/previous/` instead of being overwritten.
 - **Pause and tweak.** Pause the running capture: Brush is frozen in place
   (`SIGSTOP`) and the Mac is allowed to sleep. Resume to carry on where it stopped,
   or change its settings while it's paused and resume to restart it from step 0 with
@@ -102,6 +106,7 @@ The exception is `dashboard_port`, which needs a restart.
 | `standard` | 15k steps, 1440 px, SH 3, ≤10M splats | The default preset. *Fast* and *High* are fixed. |
 | `compress` | `["sog", "spz"]` | Compressed formats written next to the `.ply`. Use `[]` to turn this off. If compression fails, the capture still counts as done, and the problem is noted in the history. |
 | `flip_up` | `false` (example config: `true`) | Rotate results 180° about X so they're the right way up in SuperSplat and similar viewers. |
+| `keep_previous_results` | `true` | When a requeued capture finishes, keep the earlier result in `previous/`. If `false`, it's overwritten. |
 | `imessage_to` | `""` (off) | Phone number or Apple ID email to text. |
 | `notify_checkpoints` | `[0.25, 0.5, 0.75]` | Fractions of training that trigger a progress text. |
 | `settle_seconds` | `30` | How long an inbox item must stay unchanged before it's trained. |
@@ -136,7 +141,8 @@ The dashboard listens on `127.0.0.1` only.
 - `POST /api/item` changes a queued item. Example bodies:
   `{"name": "...", "action": "preset", "value": "fast"}`,
   `{"name": "...", "action": "set", "key": "max_resolution", "value": 1920}`, and the
-  actions `run_next`, `hold` (with `"value": true|false`) and `reset`. For the running
+  actions `run_next`, `hold` (with `"value": true|false`) and `reset`. For a capture in
+  *Recent*, `requeue` moves it back into the inbox, on hold. For the running
   capture, `pause` and `resume` are available, and settings can only be changed while it's paused.
   Requests must come from the dashboard's own origin and be JSON. That stops other
   websites open in your browser from changing your queue.

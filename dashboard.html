@@ -97,6 +97,11 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .b-paused { color: var(--warn); }
 .now .settings { border: 1px solid var(--line); border-radius: 10px; }
 .now.paused .bar > div { background: var(--warn); }
+.history .when { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+.requeue { font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+.requeue:hover { background: var(--track); }
+@media (max-width: 720px) { .history .when { align-items: flex-start; } }
 .serr { font-size: 12px; color: var(--bad); min-height: 0; }
 #lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.88); display: none; align-items: center;
   justify-content: center; z-index: 10; cursor: zoom-out; padding: 16px; }
@@ -311,7 +316,11 @@ function renderHistory(h) {
         <div class="name">${esc(r.name)} <span class="badge b-${esc(r.result)}">${esc(r.result)}</span></div>
         <div class="detail">${esc(r.duration)}${r.detail ? " · " + esc(r.detail) : ""}${r.result === "done" ? ` · outbox/${esc(r.name)}/` : ""}</div>
       </div>
-      <div class="meta when">${esc(r.finished)}</div>
+      <div class="when">
+        <div class="meta">${esc(r.finished)}</div>
+        ${r.requeueable && last.presets ? `<button class="requeue" data-requeue="${esc(r.name)}" title="Move the original capture back into the inbox, on hold, to rerun it with different settings">Requeue</button>` : ""}
+        ${itemErrors[r.name] && r.requeueable ? `<div class="serr">${esc(itemErrors[r.name])}</div>` : ""}
+      </div>
     </div>`).join(""));
 }
 
@@ -361,6 +370,8 @@ document.addEventListener("keydown", (e) => {
 });
 
 document.addEventListener("click", (e) => {
+  const rq = e.target.closest("[data-requeue]");
+  if (rq) { const n = rq.dataset.requeue; openSettings.add(n); sendItem(n, {action: "requeue"}); return; }
   const tog = e.target.closest("[data-toggle]");
   if (tog) { const n = tog.dataset.toggle; openSettings.has(n) ? openSettings.delete(n) : openSettings.add(n);
     if (last) renderQueue(last.queue || []); return; }
