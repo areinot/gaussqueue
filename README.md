@@ -157,6 +157,64 @@ Set `"local_training": false` to train only on remote workers. Limitations: *Pau
 available on remote machines yet. If the SSH connection drops mid-run, the capture fails and
 can be requeued.
 
+## gsplat trainer and pruning (CUDA workers, optional)
+
+A remote worker with an NVIDIA GPU can also run [gsplat](https://github.com/nerfstudio-project/gsplat),
+through the small trainer and pruner in `gs/`. The Mac copies `gs/*.py` to the worker
+before every job, so the worker always runs the code in this repo.
+
+- **Trainer: gsplat** (per capture, or `"trainer": "gsplat"` for everything). Adds what Brush
+  doesn't have:
+  - **LiDAR depth supervision.** SplatKing saves a depth map and a confidence map with every
+    photo. Rendered depth is pulled toward the LiDAR depth only where ARKit is confident (near
+    surfaces, up to about 5 m), so sky and distant scenery are left to the photos.
+  - **Flatten.** Penalises each splat's thinnest axis so splats lie flat on surfaces.
+  - **Densify:** *Default* (classic 3DGS growth), *Abs-grad* (grows more in fine detail) or
+    *MCMC* (a fixed budget: it always ends at the splat cap and moves weak splats to where
+    they're needed).
+  - Held-out photos (every `eval_split_every`th) are scored after training: PSNR, SSIM and
+    the median depth error against the LiDAR. These land in `meta.json`.
+- **Prune** (per capture, or `prune_pct`). After training, every splat is scored by how much
+  it matters to the photos, the lowest `prune_pct` % are removed, and the rest are fine-tuned
+  for `prune.finetune_steps` so they cover the gaps. Two scores are available:
+  `lightgaussian` (default; LightGaussian: each splat's total contribution to every pixel) and
+  `pup` (PUP-3DGS: how sensitive the photos are to each splat's position and size, estimated
+  here with random probes; it kept less fidelity than `lightgaussian` in our tests). Works on
+  results from either trainer. Pruning runs on the CUDA worker; Mac-trained results are
+  uploaded for it. The unpruned result stays in the work folder, and `meta.json` records the
+  fidelity before and after.
+- **Feature points** (`init_feature_points`, on by default; needs `refine_poses`). Training
+  starts from COLMAP's triangulated feature points as well as the LiDAR points. LiDAR only
+  reaches about 5 m. Without the feature points, distant trees, buildings and sky have no
+  starting splats, and training covers them with large blurry splats near the camera. This
+  applies to Brush too.
+
+Set up the worker once (Windows, PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup-gsplat-worker.ps1 -Root D:\gaussqueue
+```
+
+It installs a checksum-verified uv, Python 3.10, torch 2.4.1 (CUDA 12.4) and gsplat 1.5.3's
+prebuilt wheel, all under the root folder. It doesn't need a compiler or touch the system
+Python. Then add the line it prints to the worker's entry:
+
+```json
+"workers": [{"name": "pc", "label": "PC (RTX 4080)", "ssh": "gpu-pc",
+             "brush": "D:/gaussqueue/brush/brush_app.exe", "work_dir": "D:/gaussqueue/jobs",
+             "gsplat": {"python": "D:/gaussqueue/gsplat/venv/Scripts/python.exe",
+                        "scripts": "D:/gaussqueue/gsplat/gs"}}]
+```
+
+Captures set to gsplat wait for a machine that has it. If no machine does, or the capture
+is pinned to the Mac with *Run on*, it trains with Brush and says so in the history.
+The scripts also run by hand on any CUDA machine:
+
+```bash
+python gs/train.py <capture> --out out --depth-dir <capture>/sensor_data --depth-weight 0.3 --flat-weight 10
+python gs/prune.py out/export_30000.ply <capture> --out pruned --keep 0.3 --finetune 3000
+```
+
 ## Folders
 
 | Setting | Default | What goes there |
@@ -181,6 +239,12 @@ The exception is `dashboard_port`, which needs a restart.
 | `spz_version` | `3` | SPZ format version. Version 4, SplatTransform's default, isn't gzip-wrapped, and many apps load it as empty. Version 3 is the classic format that most apps support. |
 | `compress` | `["spz"]` | Compressed formats written next to the `.ply`. Use `[]` to turn this off. If compression fails, the capture still counts as done, and the problem is noted in the history. |
 | `refine_poses` | `false` (example config: `true`) | Refine camera poses with COLMAP before training. A few minutes of CPU per capture. |
+| `init_feature_points` | `true` | Also start training from COLMAP's triangulated feature points (needs `refine_poses`). See [gsplat trainer and pruning](#gsplat-trainer-and-pruning-cuda-workers-optional). |
+| `trainer` | `"brush"` | `"gsplat"` trains on CUDA workers that have it. Per-capture override on the dashboard. |
+| `gsplat` | `{"densify": "default", "depth_weight": 0.3, "flat_weight": 10, "sky_points": 50000, "mode": "3dgs"}` | gsplat options. `mode` can be `"2dgs"` (flat disks). |
+| `depth_supervision` / `flatten` | `true` / `true` | Defaults for the per-capture gsplat checkboxes. |
+| `prune_pct` | `0` (off) | Remove this % of splats after training. Per-capture override. |
+| `prune` | `{"score": "lightgaussian", "finetune_steps": 3000}` | Pruning score (`lightgaussian` or `pup`) and fine-tuning length. |
 | `flip_up` | `false` (example config: `true`) | Rotate results 180° about X so they're the right way up in SuperSplat and similar viewers. |
 | `keep_previous_results` | `true` | When a requeued capture finishes, keep the earlier result in `previous/`. If `false`, it's overwritten. |
 | `imessage_to` | `""` (off) | Phone number or Apple ID email to text. |

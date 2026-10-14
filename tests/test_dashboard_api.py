@@ -249,10 +249,22 @@ class DashboardAPITest(unittest.TestCase):
         (model / "sparse" / "0" / "images.txt").write_text("1 0.9 0.1 0 0 0.05 0 0 1 a.jpg\n\n")
         gq.save_pose_cache(cache, model, {"photos": 1})
         job = {"name": "capP"}
-        out, stats = gq.refined_model(self.cfg, cap, root / "work", lambda **k: None, job)
+        # Without feature points the old-style cache is only used when they aren't wanted.
+        out, stats = gq.refined_model(dict(self.cfg, init_feature_points=False), cap, root / "work",
+                                      lambda **k: None, job)
         self.assertTrue(stats["cached"])
         self.assertIn("0.9 0.1", (out / "sparse" / "0" / "images.txt").read_text())
         self.assertTrue((out / "images").is_symlink())
+        # With them: cached too, and merged into points3D.txt after the LiDAR points.
+        (model / "sparse" / "0" / gq.FEATURE_POINTS).write_text("7 5 5 5 9 9 9 0.5 1 2\n")
+        gq.save_pose_cache(cache, model, {"photos": 1})
+        out, stats = gq.refined_model(dict(self.cfg, init_feature_points=True), cap, root / "work",
+                                      lambda **k: None, job)
+        self.assertTrue(stats["cached"])
+        self.assertEqual(stats["feature_points"], 1)
+        pts = [l.split() for l in (out / "sparse" / "0" / "points3D.txt").read_text().splitlines()
+               if not l.startswith("#")]
+        self.assertEqual(pts, [["1", "0", "0", "0", "0", "0", "0", "-1"], ["2", "5", "5", "5", "9", "9", "9", "0.5"]])
         # A different capture (changed poses) gets a different key.
         (cap / "sparse" / "0" / "images.txt").write_text("1 1 0 0 0 1 0 0 1 a.jpg\n\n")
         self.assertNotEqual(cache, gq.pose_cache_dir(self.cfg, cap, "capP"))
@@ -317,6 +329,33 @@ class DashboardAPITest(unittest.TestCase):
             self.status.jobs = {}
             self.status.workers = {}
             self.status.write(self.cfg)
+
+    def test_gsplat_settings_and_scheduling(self):
+        gq = self.gq
+        # Choice settings take their listed strings only; prune is a bounded percentage.
+        self.assertEqual(self.post({"name": "capA", "action": "set", "key": "trainer", "value": "gsplat"})[0], 200)
+        self.assertEqual(self.post({"name": "capA", "action": "set", "key": "densify", "value": "mcmc"})[0], 200)
+        self.assertEqual(self.post({"name": "capA", "action": "set", "key": "trainer", "value": "bash"})[0], 400)
+        self.assertEqual(self.post({"name": "capA", "action": "set", "key": "prune_pct", "value": 99})[0], 400)
+        self.assertEqual(self.post({"name": "capA", "action": "set", "key": "prune_pct", "value": 70})[0], 200)
+        st = gq.effective_settings(self.cfg, self.overrides.get("capA"))
+        self.assertEqual((st["trainer"], st["densify"], st["prune_pct"]), ("gsplat", "mcmc", 70))
+        self.assertIn("gsplat mcmc", gq.settings_summary(st))
+        # Trainer/densify restart training; pruning, like the flip, only affects the output.
+        self.assertIn("trainer", gq.RESTART_KEYS)
+        self.assertNotIn("prune_pct", gq.RESTART_KEYS)
+        # Scheduling: gsplat captures wait for a gsplat worker unless pinned elsewhere.
+        pc = gq.RemoteWorker({"name": "pc", "label": "PC", "ssh": "gpu-pc", "brush": "C:/b.exe",
+                              "work_dir": "D:/j", "gsplat": {"python": "D:\\v\\python.exe", "scripts": "D:/gs"}})
+        mac = gq.LocalWorker()
+        self.assertEqual(pc.gsplat["python"], "D:/v/python.exe")
+        ov = {"trainer": "gsplat"}
+        self.assertTrue(gq.can_take(self.cfg, pc, ov, True))
+        self.assertFalse(gq.can_take(self.cfg, mac, ov, True))
+        self.assertTrue(gq.can_take(self.cfg, mac, ov, False))        # no gsplat anywhere: Brush
+        self.assertTrue(gq.can_take(self.cfg, mac, dict(ov, run_on="mac"), True))
+        self.assertTrue(gq.can_take(self.cfg, mac, {}, True))          # Brush captures go anywhere
+        self.assertFalse(gq.can_take(self.cfg, mac, {"run_on": "pc"}, True))
 
     def test_native_spz_is_used_when_installed(self):
         gq, root = self.gq, Path(self.tmp.name)

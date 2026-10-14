@@ -177,7 +177,7 @@ const kindText = (k, f) => [k && k !== "unknown" ? k : null, f ? `${f} frames` :
 
 const PRESET_LABEL = {preview: "Preview", fast: "Fast", standard: "Standard", high: "High", custom: "Custom"};
 const kfmt = (n) => n >= 1e6 ? `${+(n/1e6).toFixed(1)}M` : n >= 1000 ? `${+(n/1000).toFixed(1)}k` : String(n);
-const qualityText = (st) => st ? `<b>${PRESET_LABEL[st.preset] || esc(st.preset)}</b> · ${kfmt(st.total_steps)} steps · ${st.max_resolution}px · SH${st.sh_degree} · ≤${kfmt(st.max_splats)} splats${st.subsample_frames > 1 ? ` · every ${st.subsample_frames} frames` : ""}${st.refine_poses ? " · refined poses" : ""}${st.flip_up ? " · flipped" : ""}` : "";
+const qualityText = (st) => st ? `<b>${PRESET_LABEL[st.preset] || esc(st.preset)}</b> · ${kfmt(st.total_steps)} steps · ${st.max_resolution}px · SH${st.sh_degree} · ≤${kfmt(st.max_splats)} splats${st.subsample_frames > 1 ? ` · every ${st.subsample_frames} frames` : ""}${st.refine_poses ? " · refined poses" : ""}${st.trainer === "gsplat" ? ` · gsplat ${esc(st.densify || "")}${st.depth_supervision ? " +depth" : ""}${st.flatten ? " +flat" : ""}` : ""}${st.prune_pct ? ` · prune ${st.prune_pct}%` : ""}${st.flip_up ? " · flipped" : ""}` : "";
 const FIELD_OPTS = {
   max_resolution: [720, 960, 1080, 1280, 1440, 1920, 2560, 3840],
   sh_degree: [[0, "0 · flat colour"], [1, "1"], [2, "2"], [3, "3 · full sheen"]],
@@ -237,7 +237,8 @@ function jobPanel(c) {
   const pct = c.step != null && c.total ? Math.min(100, 100*c.step/c.total) : 0;
   const stepLabel = (n) => { const m = n.match(/_step(\d+)\.jpg$/); return m ? `${(+m[1]/1000).toFixed(1)}k` : ""; };
   const pend = c.pending_settings, run = c.settings;
-  const changed = c.paused && pend && run && ["total_steps", "max_resolution", "sh_degree", "max_splats", "subsample_frames", "refine_poses"].some(k => (pend[k] || 0) !== (run[k] || 0));
+  const changed = c.paused && pend && run && ["total_steps", "max_resolution", "sh_degree", "max_splats", "subsample_frames", "refine_poses",
+    "trainer", "densify", "depth_supervision", "flatten"].some(k => (pend[k] || 0) !== (run[k] || 0));
   const canPause = c.phase === "training" || c.paused;
   const pauseBtn = c.remote ? "" : `<button data-act="pause">Pause</button>`;
   const controls = canPause && last.presets ? `
@@ -331,6 +332,29 @@ function refineBox(on) {
     <input type="checkbox" data-set="refine_poses"${on ? " checked" : ""}> Refine camera poses (COLMAP)</label>`;
 }
 
+// Text-valued settings (trainer, densify): sent as strings, not numbers.
+function choiceHTML(key, value, opts) {
+  return `<select data-set="${key}" data-choice="1">${opts.map(([v, l]) =>
+    `<option value="${esc(v)}"${v === value ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
+}
+
+// gsplat + pruning controls; only shown when some machine has gsplat (CUDA).
+function gsplatHTML(st) {
+  if (!(last.workers || []).some(w => w.gsplat)) return "";
+  const gs = st.trainer === "gsplat";
+  const check = (key, label, title) => `<label class="flip" title="${title}">
+    <input type="checkbox" data-set="${key}"${st[key] ? " checked" : ""}> ${label}</label>`;
+  return `
+        <div class="flipfield runon" title="Brush runs on any machine. gsplat (CUDA) adds LiDAR depth supervision, flat splats and MCMC; it only runs on machines that have it.">Trainer
+          ${choiceHTML("trainer", st.trainer || "brush", [["brush", "Brush"], ["gsplat", "gsplat (CUDA)"]])}</div>
+        ${gs ? `<div class="flipfield runon" title="How splats are added during training. Default: classic 3DGS growth. Abs-grad: grows more in fine detail. MCMC: fixed budget, always ends at the splat cap.">Densify
+          ${choiceHTML("densify", st.densify || "default", [["default", "Default"], ["absgrad", "Abs-grad"], ["mcmc", "MCMC (fixed budget)"]])}</div>
+        <div class="flipfield">${check("depth_supervision", "LiDAR depth", "Match the LiDAR depth maps where the iPhone is confident (near surfaces). Sky and far scenery are left to the photos.")}</div>
+        <div class="flipfield">${check("flatten", "Flatten splats", "Push splats flat onto surfaces: crisper walls and ground, fewer floaters.")}</div>` : ""}
+        <div class="flipfield runon" title="After training, remove this share of splats (the ones that matter least to the photos) and fine-tune the rest. Runs on a CUDA machine; the unpruned result is kept in the work folder.">Prune
+          ${choiceHTML("prune_pct", String(st.prune_pct || 0), [["0", "Off"], ["50", "50%"], ["70", "70%"], ["80", "80%"], ["90", "90%"]])}</div>`;
+}
+
 function selectHTML(key, value, opts) {
   const list = opts.map(o => Array.isArray(o) ? o : [o, key === "max_splats" ? kfmt(o) : String(o)]);
   if (!list.some(([v]) => v === value)) list.push([value, key === "max_splats" ? kfmt(value) : String(value)]);
@@ -359,6 +383,7 @@ function settingsHTML(it, isCurrent) {
           <select data-runon>${[["auto", "Auto (fastest free)"], ...last.workers.map(w => [w.name, w.label])].map(([v, l]) =>
             `<option value="${esc(v)}"${(it.run_on || "auto") === v ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></div>` : ""}
         <div class="flipfield">${refineBox(st.refine_poses)}</div>
+        ${gsplatHTML(st)}
         <div class="flipfield">${flipBox(st.flip_up)}</div>
       </div>
       <div class="actions">
@@ -472,7 +497,8 @@ document.addEventListener("change", (e) => {
   const f = e.target.closest("[data-set]");
   if (!f) return;
   const name = f.closest("[data-item]").dataset.item;
-  const value = f.type === "checkbox" ? (f.checked ? 1 : 0) : +f.value;
+  const value = f.type === "checkbox" ? (f.checked ? 1 : 0)
+    : f.dataset.choice && f.dataset.set !== "prune_pct" ? f.value : +f.value;
   sendItem(name, {action: "set", key: f.dataset.set, value});
 });
 document.addEventListener("keydown", (e) => {

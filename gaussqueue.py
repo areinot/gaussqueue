@@ -35,6 +35,7 @@ CONFIG_PATH = APP_HOME / "config.json"
 STATE_PATH = APP_HOME / "state.json"
 OVERRIDES_PATH = APP_HOME / "overrides.json"
 DASHBOARD_HTML = Path(__file__).resolve().parent / "dashboard.html"
+GS_DIR = Path(__file__).resolve().parent / "gs"   # gsplat trainer/pruner, copied to CUDA workers
 SF_DATALESS = 0x40000000   # st_flags bit for iCloud placeholder ("dataless") files
 IMAGE_EXT = (".jpg", ".jpeg", ".png")
 VIDEO_EXT = (".mov", ".mp4", ".m4v")
@@ -65,6 +66,25 @@ DEFAULTS = {
     # adjustment) before training. Slower, usually sharper. Needs `colmap` on PATH.
     "refine_poses": False,
     "colmap": "colmap",
+    # Also start training from the feature points COLMAP triangulates while refining poses,
+    # not just the LiDAR points. LiDAR only reaches ~5 m, so without them distant trees,
+    # buildings and sky have nothing to grow from and end up as blur near the camera.
+    "init_feature_points": True,
+    # Trainer: "brush" (runs anywhere) or "gsplat" (CUDA; only on remote workers that have
+    # a "gsplat" entry, see workers below). Per-capture override on the dashboard.
+    "trainer": "brush",
+    # gsplat options. depth_supervision and flatten are per-capture toggles; the weights tune
+    # them. densify: "default" (3DGS growth), "absgrad" (grows more in fine detail) or "mcmc"
+    # (fixed budget: always ends at the splat cap). sky_points: extra starting splats on a
+    # distant sphere for sky. mode: "3dgs" or "2dgs" (flat disks).
+    "gsplat": {"densify": "default", "depth_weight": 0.3, "flat_weight": 10,
+               "sky_points": 50000, "mode": "3dgs"},
+    "depth_supervision": True,   # gsplat: match LiDAR depth where ARKit is confident
+    "flatten": True,             # gsplat: push splats flat onto surfaces
+    # Post-training pruning (on a CUDA worker): remove this percentage of splats, ranked by
+    # how much they matter to the photos, then fine-tune the rest. 0 = off. Per-capture.
+    "prune_pct": 0,
+    "prune": {"score": "lightgaussian", "finetune_steps": 3000},
     "splat_transform": str(APP_HOME / "tools/splat-transform/node_modules/.bin/splat-transform"),
     "imessage_to": "",                       # phone number or Apple ID email; empty = off
     "notify_checkpoints": [0.25, 0.5, 0.75], # fractions of training to text a preview at
@@ -90,7 +110,9 @@ DEFAULTS = {
     # Training machines. The Mac trains locally unless local_training is false; remote
     # workers are Windows/Linux PCs reachable over SSH (key auth; host = an ~/.ssh/config
     # alias), e.g. {"name": "pc", "label": "PC (RTX 4080)", "ssh": "gpu-pc",
-    #  "brush": "D:/gaussqueue/brush/brush_app.exe", "work_dir": "D:/gaussqueue/jobs"}.
+    #  "brush": "D:/gaussqueue/brush/brush_app.exe", "work_dir": "D:/gaussqueue/jobs",
+    #  "gsplat": {"python": "D:/gaussqueue/gsplat/venv/Scripts/python.exe",
+    #             "scripts": "D:/gaussqueue/gsplat/gs"}}   <- optional, enables gsplat + pruning
     # "Auto" captures go to an idle remote worker first, then the Mac.
     "local_training": True,
     "workers": [],
@@ -100,11 +122,14 @@ DEFAULTS = {
 # Per-item processing settings, editable from the dashboard. "standard" comes
 # from config.json, so editing config still changes the default.
 TRAIN_KEYS = ("total_steps", "max_resolution", "sh_degree", "max_splats", "subsample_frames")
-RESTART_KEYS = TRAIN_KEYS + ("refine_poses",)   # changing these restarts training
-SETTING_KEYS = RESTART_KEYS + ("flip_up",)      # flip_up only affects output files
+GSPLAT_KEYS = ("trainer", "densify", "depth_supervision", "flatten")
+RESTART_KEYS = TRAIN_KEYS + ("refine_poses",) + GSPLAT_KEYS   # changing these restarts training
+SETTING_KEYS = RESTART_KEYS + ("flip_up", "prune_pct")   # these two only affect the output
 SETTING_LIMITS = {"total_steps": (500, 100_000), "max_resolution": (256, 4096),
                   "sh_degree": (0, 3), "max_splats": (50_000, 20_000_000),
-                  "subsample_frames": (1, 20), "flip_up": (0, 1), "refine_poses": (0, 1)}
+                  "subsample_frames": (1, 20), "flip_up": (0, 1), "refine_poses": (0, 1),
+                  "depth_supervision": (0, 1), "flatten": (0, 1), "prune_pct": (0, 95)}
+SETTING_CHOICES = {"trainer": ("brush", "gsplat"), "densify": ("default", "absgrad", "mcmc")}
 PRESETS = {
     # Quick look: is the scene coherent, oriented right, covered? Not for judging detail.
     "preview": {"total_steps": 3000, "max_resolution": 720, "sh_degree": 1,
@@ -128,17 +153,32 @@ def effective_settings(cfg, ov):
     out = dict(base)
     out["flip_up"] = int(bool(cfg.get("flip_up")))
     out["refine_poses"] = int(bool(cfg.get("refine_poses")))
+    out["trainer"] = cfg.get("trainer") if cfg.get("trainer") in SETTING_CHOICES["trainer"] else "brush"
+    densify = sub_config(cfg, "gsplat")["densify"]
+    out["densify"] = densify if densify in SETTING_CHOICES["densify"] else "default"
+    out["depth_supervision"] = int(bool(cfg.get("depth_supervision", True)))
+    out["flatten"] = int(bool(cfg.get("flatten", True)))
+    out["prune_pct"] = int(cfg.get("prune_pct") or 0)
     out.update({k: ov[k] for k in SETTING_KEYS if k in ov})
     out["base"] = preset
     out["preset"] = preset if not any(k in ov for k in TRAIN_KEYS) else "custom"
     return out
 
 
+def sub_config(cfg, key):
+    """A nested config section with defaults filled in (config.json may set only some keys)."""
+    return {**DEFAULTS[key], **(cfg.get(key) or {})}
+
+
 def settings_summary(st):
+    gs = st.get("trainer") == "gsplat"
     return (f"{st['preset']}: {st['total_steps'] / 1000:g}k steps @ {st['max_resolution']}px, "
             f"SH{st['sh_degree']}, <={st['max_splats'] / 1e6:g}M splats"
             + (f", every {st['subsample_frames']} frames" if st["subsample_frames"] > 1 else "")
             + (", refined poses" if st.get("refine_poses") else "")
+            + (f", gsplat {st.get('densify')}" + (" +depth" if st.get("depth_supervision") else "")
+               + (" +flat" if st.get("flatten") else "") if gs else "")
+            + (f", prune {st['prune_pct']}%" if st.get("prune_pct") else "")
             + (", flipped" if st.get("flip_up") else ""))
 
 
@@ -187,6 +227,11 @@ class Overrides:
                     ov.pop("run_on", None)
                 else:
                     ov["run_on"] = str(body["value"])
+            elif action == "set" and body.get("key") in SETTING_CHOICES:
+                key, val = body["key"], body.get("value")
+                if val not in SETTING_CHOICES[key]:
+                    raise ValueError(f"{key} must be one of {', '.join(SETTING_CHOICES[key])}")
+                ov[key] = val
             elif action == "set":
                 key, val = body.get("key"), body.get("value")
                 if key not in SETTING_LIMITS:
@@ -820,6 +865,7 @@ class Status:
             "inbox_dir": cfg["inbox_dir"],
             "presets": {k: (v or standard_settings(cfg)) for k, v in PRESETS.items()},
             "limits": SETTING_LIMITS,
+            "choices": SETTING_CHOICES,
         }
         self.write_text(jobs, queue, hist)
 
@@ -1107,14 +1153,20 @@ def pose_cache_dir(cfg, colmap_dir, name):
     return POSE_CACHE / f"{name}-{h.hexdigest()[:16]}"
 
 
+FEATURE_POINTS = "points3D_features.txt"
+
+
 def build_refined_model(colmap_dir, cache, out):
-    """A trainable COLMAP folder: cached refined poses, original photos, LiDAR points."""
+    """A trainable COLMAP folder: cached refined poses, original photos, LiDAR points
+    (+ the cached feature points, when there are any)."""
     src = colmap_dir / "sparse" / "0"
     shutil.rmtree(out, ignore_errors=True)
     (out / "sparse" / "0").mkdir(parents=True)
     (out / "images").symlink_to((colmap_dir / "images").resolve())
     for f in ("images.txt", "cameras.txt"):
         shutil.copyfile(cache / f, out / "sparse" / "0" / f)
+    if (cache / FEATURE_POINTS).exists():
+        shutil.copyfile(cache / FEATURE_POINTS, out / "sparse" / "0" / FEATURE_POINTS)
     pts = src / "points3D.txt" if (src / "points3D.txt").exists() else cache / "points3D.txt"
     shutil.copyfile(pts, out / "sparse" / "0" / "points3D.txt")
     return out
@@ -1124,8 +1176,9 @@ def save_pose_cache(cache, model, stats):
     tmp = cache.with_name(cache.name + ".partial")
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
-    for f in ("images.txt", "cameras.txt"):
-        shutil.copyfile(model / "sparse" / "0" / f, tmp / f)
+    for f in ("images.txt", "cameras.txt", FEATURE_POINTS):
+        if (model / "sparse" / "0" / f).exists():
+            shutil.copyfile(model / "sparse" / "0" / f, tmp / f)
     (tmp / "stats.json").write_text(json.dumps(
         dict(stats, saved=dt.datetime.now().isoformat(timespec="seconds")), indent=2) + "\n")
     shutil.rmtree(cache, ignore_errors=True)
@@ -1136,16 +1189,41 @@ def refined_model(cfg, colmap_dir, work, beat, job):
     """Refined poses for a capture: from the pose cache if this exact capture was
     refined before, otherwise computed with COLMAP and saved to the cache."""
     cache = pose_cache_dir(cfg, colmap_dir, job["name"])
-    if (cache / "images.txt").exists() and (cache / "stats.json").exists():
+    want_features = bool(cfg.get("init_feature_points"))
+    if ((cache / "images.txt").exists() and (cache / "stats.json").exists()
+            and (not want_features or (cache / FEATURE_POINTS).exists())):
         stats = json.loads((cache / "stats.json").read_text())
         log(f"using cached pose refinement for {job['name']} ({cache.name})")
-        return build_refined_model(colmap_dir, cache, work / "model"), dict(stats, cached=True)
-    model, stats = refine_poses(cfg, colmap_dir, work, beat, job)
-    try:
-        save_pose_cache(cache, model, stats)
-    except OSError as e:
-        log(f"could not save pose cache for {job['name']}: {e}")
+        model, stats = build_refined_model(colmap_dir, cache, work / "model"), dict(stats, cached=True)
+    else:
+        model, stats = refine_poses(cfg, colmap_dir, work, beat, job)
+        try:
+            save_pose_cache(cache, model, stats)
+        except OSError as e:
+            log(f"could not save pose cache for {job['name']}: {e}")
+    if want_features:
+        n = merge_feature_points(model)
+        if n:
+            stats = dict(stats, feature_points=n)
     return model, stats
+
+
+def merge_feature_points(model):
+    """Append COLMAP's triangulated feature points to the model's (LiDAR) points3D.txt, so
+    training starts with splats on distant geometry too. Returns how many were added."""
+    sp = model / "sparse" / "0"
+    feats = sp / FEATURE_POINTS
+    if not feats.exists():
+        return 0
+    def rows(f):   # ID X Y Z R G B ERROR [track] -> the 7 values after the ID
+        if not f.exists():
+            return []
+        return [l.split()[1:8] for l in f.read_text().splitlines()
+                if l.strip() and not l.startswith("#") and len(l.split()) >= 8]
+    lidar, extra = rows(sp / "points3D.txt"), rows(feats)
+    (sp / "points3D.txt").write_text("# LiDAR points + COLMAP feature points\n" + "".join(
+        f"{i} {' '.join(r)}\n" for i, r in enumerate(lidar + extra, 1)))
+    return len(extra)
 
 
 def refine_poses(cfg, colmap_dir, work, beat, job):
@@ -1269,6 +1347,8 @@ def refine_poses(cfg, colmap_dir, work, beat, job):
         shutil.copyfile(src / "points3D.txt", out / "sparse" / "0" / "points3D.txt")
     else:
         shutil.copyfile(txt / "points3D.txt", out / "sparse" / "0" / "points3D.txt")
+    # COLMAP's triangulated feature points (same frame), for init_feature_points
+    shutil.copyfile(txt / "points3D.txt", out / "sparse" / "0" / FEATURE_POINTS)
     log(f"refined poses for {job['name']}: {stats}")
     return out, stats
 
@@ -1499,6 +1579,10 @@ def write_meta(dest, job, files, flipped):
             "rotation_xyz_degrees": [180, 0, 0] if flipped else [0, 0, 0]}
     if job.get("refine"):
         meta["pose_refinement"] = job["refine"]
+    if job.get("metrics"):
+        meta["held_out_photos"] = job["metrics"]
+    if job.get("prune"):
+        meta["pruning"] = job["prune"]
     if job.get("quality"):
         meta["capture_quality"] = job["quality"]
     (dest / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
@@ -1508,7 +1592,7 @@ def write_meta(dest, job, files, flipped):
 
 class LocalWorker:
     """This Mac."""
-    name, label, remote = "mac", "Mac", False
+    name, label, remote, gsplat = "mac", "Mac", False, None
 
     def __init__(self):
         self.stats = {}
@@ -1517,10 +1601,13 @@ class LocalWorker:
         self.stats = {"mem_free_pct": memory_free_pct()}
 
     def info(self, job):
-        return {"name": self.name, "label": self.label, "remote": False, "online": True,
+        return {"name": self.name, "label": self.label, "remote": False, "online": True, "gsplat": False,
                 "job": job and {"name": job["name"], "phase": job.get("phase"),
                                 "step": job.get("step"), "total": job.get("total")},
                 **self.stats}
+
+    def finish(self, name):
+        pass
 
 
 class RemoteWorker:
@@ -1535,6 +1622,9 @@ class RemoteWorker:
         self.label = spec.get("label") or self.name
         self.ssh = spec["ssh"]
         self.brush = spec["brush"].replace("\\", "/")
+        g = spec.get("gsplat") or {}
+        self.gsplat = ({"python": g["python"].replace("\\", "/"), "scripts": g["scripts"].replace("\\", "/")}
+                       if g.get("python") and g.get("scripts") else None)
         self.root = spec["work_dir"].replace("\\", "/").rstrip("/")
         self.online = False
         self.checked = 0.0
@@ -1585,6 +1675,7 @@ class RemoteWorker:
 
     def info(self, job):
         return {"name": self.name, "label": self.label, "remote": True, "online": self.online,
+                "gsplat": bool(self.gsplat),
                 "job": job and {"name": job["name"], "phase": job.get("phase"),
                                 "step": job.get("step"), "total": job.get("total")},
                 **self.stats}
@@ -1603,19 +1694,13 @@ class RemoteWorker:
                 timeout=600)
         return f"{d}/snapshots/export_{step}.ply"
 
-    # -- the job
-    def train(self, cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
-        name, d = job["name"], self.job_dir(job["name"])
-        st = job["settings"]
-        total = int(st["total_steps"])
-        job.update(phase=f"uploading to {self.label}", step=None, eta=None, paused=False)
-        beat(force=True)
-        self.ps(f"Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '{d}'; "
-                f"New-Item -ItemType Directory -Force '{d}/data','{d}/out' | Out-Null")
-        # Stream the trainable folder (photos + poses; -h follows the images symlink).
-        tar = subprocess.Popen(["tar", "-C", str(colmap_dir), "-chf", "-", "images", "sparse"],
-                               stdout=subprocess.PIPE)
-        up = subprocess.Popen(self._ssh(f'tar -xf - -C "{d}/data"'), stdin=tar.stdout,
+    # -- job plumbing
+    def upload_dir(self, parent, names, dest, beat):
+        """Stream folders to the worker with tar (-h follows symlinks such as images/)."""
+        env = dict(os.environ, COPYFILE_DISABLE="1")   # no macOS ._ metadata files
+        tar = subprocess.Popen(["tar", "-C", str(parent), "-chf", "-", *names],
+                               stdout=subprocess.PIPE, env=env)
+        up = subprocess.Popen(self._ssh(f'tar -xf - -C "{dest}"'), stdin=tar.stdout,
                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         tar.stdout.close()
         while up.poll() is None:
@@ -1625,81 +1710,145 @@ class RemoteWorker:
         if up.returncode or tar.returncode:
             raise RuntimeError(f"upload to {self.label} failed: {up.stderr.read().decode()[-200:]}")
 
-        args = [f"{d}/data", "--total-steps", total, "--max-resolution", st["max_resolution"],
-                "--sh-degree", st["sh_degree"], "--max-splats", st["max_splats"],
-                "--subsample-frames", st["subsample_frames"],
-                "--export-every", cfg["checkpoint_every"], "--eval-every", cfg["eval_every"],
-                "--eval-split-every", cfg["eval_split_every"], "--eval-save-to-disk",
-                "--export-path", f"{d}/out"] + list(cfg["extra_args"])
+    def upload_file(self, local, remote_path):
+        r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", str(local), f"{self.ssh}:/{remote_path}"],
+                           capture_output=True, text=True, timeout=7200)
+        if r.returncode:
+            raise RuntimeError(f"upload to {self.label} failed: {r.stderr.strip()[:200]}")
+
+    def upload_capture(self, d, colmap_dir, sensor, beat):
+        """A fresh <d>/data with the trainable photos + poses (and the LiDAR depth maps)."""
+        self.ps(f"Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '{d}'; "
+                f"New-Item -ItemType Directory -Force '{d}/data','{d}/out' | Out-Null")
+        self.upload_dir(colmap_dir, ["images", "sparse"], f"{d}/data", beat)
+        if sensor:
+            self.upload_dir(sensor.parent, [sensor.name], f"{d}/data", beat)
+
+    def sync_gsplat(self):
+        """Copy this repo's gs/*.py to the worker, so it always runs the matching code."""
+        dst = self.gsplat["scripts"]
+        self.ps(f"New-Item -ItemType Directory -Force '{dst}' | Out-Null")
+        r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", *sorted(map(str, GS_DIR.glob("*.py"))),
+                            f"{self.ssh}:/{dst}/"], capture_output=True, text=True, timeout=300)
+        if r.returncode:
+            raise RuntimeError(f"copying the gsplat scripts to {self.label} failed: {r.stderr.strip()[:200]}")
+
+    def run(self, exe, args, cwd, d, name, beat, poll=None):
+        """Run a program on the worker and wait for it, logging to <d>/<name>.log/.err.
+        poll() is called about every 10 s. Stopping (an exception here) kills it."""
         arglist = ", ".join("'" + str(a).replace("'", "''") + "'" for a in args)
-        script = (f"$p = Start-Process -FilePath '{self.brush}' -ArgumentList @({arglist}) "
-                  f"-WorkingDirectory '{d}' -NoNewWindow -PassThru "
-                  f"-RedirectStandardOutput '{d}/train.log' -RedirectStandardError '{d}/train.err'\n"
+        script = (f"$env:PYTHONUNBUFFERED='1'\n"
+                  f"$p = Start-Process -FilePath '{exe}' -ArgumentList @({arglist}) "
+                  f"-WorkingDirectory '{cwd}' -NoNewWindow -PassThru "
+                  f"-RedirectStandardOutput '{d}/{name}.log' -RedirectStandardError '{d}/{name}.err'\n"
                   f"$null = $p.Handle\n$p.Id | Out-File -Encoding ascii '{d}/pid.txt'\n"
                   f"$p.WaitForExit()\nexit $p.ExitCode")
         enc = base64.b64encode(("$ErrorActionPreference='Stop'\n" + script).encode("utf-16-le")).decode()
-        log(f"run on {self.label}: brush {' '.join(map(str, args))}")
         proc = subprocess.Popen(self._ssh("powershell", "-NoProfile", "-NonInteractive",
                                           "-EncodedCommand", enc),
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        job.update(phase="training", step=0, total=total, started=time.time(),
-                   train_started=time.time(), eta=None)
-        rotate = capture_rotation(out_dir.parent / "data")
-        notified, last_preview_step, last_poll = set(), None, 0.0
-        tmp = APP_HOME / "tmp"
-        tmp.mkdir(parents=True, exist_ok=True)
+        last_poll = time.time()
         try:
             while proc.poll() is None:
                 time.sleep(1)
                 beat()
-                if time.time() - last_poll < 10:
-                    continue
-                last_poll = time.time()
-                try:
-                    listing = self.ps(f"Get-ChildItem '{d}/out' -Directory -Filter eval_* | "
-                                      "ForEach-Object { $_.Name }", timeout=30, check=False)
-                except subprocess.TimeoutExpired:
-                    continue
-                steps = [int(m.group(1)) for m in re.finditer(r"eval_(\d+)", listing)]
-                if not steps:
-                    continue
-                step = max(steps)
-                job["step"] = step
-                rate = (time.time() - job["started"]) / step
-                job["eta"] = time.time() + rate * (total - step)
-                ckpt = int(cfg["checkpoint_every"])
-                due = any(f not in notified and step >= f * total for f in cfg["notify_checkpoints"])
-                if step != last_preview_step and (step % ckpt == 0 or step == total or due):
-                    names = self.ps(f"Get-ChildItem '{d}/out/eval_{step}' -Filter *.png | Sort-Object Name | "
-                                    "Select-Object -First 1 | ForEach-Object { $_.Name }", check=False).strip()
-                    if names:
-                        try:
-                            local_png = tmp / f"{name}_{step}.png"
-                            self.download(f"{d}/out/eval_{step}/{names}", local_png)
-                            preview = f"{name}_step{step:05d}.jpg"
-                            make_jpeg(local_png, paths.previews / preview, 1280, rotate)
-                            local_png.unlink(missing_ok=True)
-                            job["preview"], last_preview_step = preview, step
-                        except Exception as e:
-                            log(f"preview from {self.label} failed: {e}")
-                crossed = [f for f in cfg["notify_checkpoints"] if f not in notified and step >= f * total]
-                if crossed and last_preview_step == step:
-                    notified.update(crossed)
-                    img = paths.attach / job["preview"]
-                    shutil.copyfile(paths.previews / job["preview"], img)
-                    imessage(cfg, f"🟡 {name} on {self.label}: {100 * step // total}% "
-                                  f"({step:,}/{total:,} steps), "
-                                  f"ETA ~{dt.datetime.fromtimestamp(job['eta']):%H:%M}", img)
+                if poll and time.time() - last_poll >= 10:
+                    last_poll = time.time()
+                    poll()
         except BaseException:
             self.ps(f"$i = Get-Content '{d}/pid.txt' -ErrorAction SilentlyContinue; "
                     "if ($i) { Stop-Process -Id $i -Force -ErrorAction SilentlyContinue }", check=False)
             proc.kill()
             raise
-        if proc.returncode:
-            err = self.ps(f"Get-Content '{d}/train.err','{d}/train.log' -Tail 5 -ErrorAction SilentlyContinue",
-                          check=False)
-            reason = next((l for l in err.splitlines() if "panicked" in l or "rror" in l), "")
-            raise RuntimeError(f"brush on {self.label} exited with {proc.returncode} {reason[:120]}")
+        return proc.returncode
+
+    def failure(self, d, name):
+        """The most telling line from a failed run's logs."""
+        out = self.ps(f"Get-Content '{d}/{name}.err','{d}/{name}.log' -Tail 8 -ErrorAction SilentlyContinue",
+                      check=False)
+        return next((l.strip() for l in reversed(out.splitlines()) if "panicked" in l or "rror" in l), "")[:160]
+
+    # -- the job
+    def train(self, cfg, paths, job, colmap_dir, out_dir, beat, pending_settings, sensor=None):
+        name, d = job["name"], self.job_dir(job["name"])
+        st = job["settings"]
+        total = int(st["total_steps"])
+        gs = st.get("trainer") == "gsplat" and bool(self.gsplat)
+        job.update(phase=f"uploading to {self.label}", step=None, eta=None, paused=False)
+        beat(force=True)
+        self.upload_capture(d, colmap_dir, sensor if gs else None, beat)
+        if gs:
+            self.sync_gsplat()
+            g = sub_config(cfg, "gsplat")
+            what, exe, cwd = "gsplat", self.gsplat["python"], self.gsplat["scripts"]
+            args = [f"{cwd}/train.py", f"{d}/data", "--out", f"{d}/out", "--steps", total,
+                    "--max-res", st["max_resolution"], "--sh-degree", st["sh_degree"],
+                    "--max-splats", st["max_splats"], "--subsample", st["subsample_frames"],
+                    "--strategy", st.get("densify") or "default", "--mode", g["mode"],
+                    "--sky-points", g["sky_points"], "--export-every", cfg["checkpoint_every"],
+                    "--eval-every", cfg["eval_every"], "--holdout-every", cfg["eval_split_every"]]
+            if sensor:   # depth maps: supervision when on, held-out depth error either way
+                args += ["--depth-dir", f"{d}/data/{sensor.name}"]
+                if st.get("depth_supervision"):
+                    args += ["--depth-weight", g["depth_weight"]]
+            if st.get("flatten"):
+                args += ["--flat-weight", g["flat_weight"]]
+        else:
+            what, exe, cwd = "brush", self.brush, d
+            args = [f"{d}/data", "--total-steps", total, "--max-resolution", st["max_resolution"],
+                    "--sh-degree", st["sh_degree"], "--max-splats", st["max_splats"],
+                    "--subsample-frames", st["subsample_frames"],
+                    "--export-every", cfg["checkpoint_every"], "--eval-every", cfg["eval_every"],
+                    "--eval-split-every", cfg["eval_split_every"], "--eval-save-to-disk",
+                    "--export-path", f"{d}/out"] + list(cfg["extra_args"])
+        log(f"run on {self.label}: {what} {' '.join(map(str, args))}")
+        job.update(phase="training", step=0, total=total, started=time.time(),
+                   train_started=time.time(), eta=None)
+        rotate = capture_rotation(out_dir.parent / "data")
+        notified, last_preview = set(), [None]
+        tmp = APP_HOME / "tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+
+        def poll():   # progress = the newest eval_<step> folder; fetch its render as the preview
+            try:
+                listing = self.ps(f"Get-ChildItem '{d}/out' -Directory -Filter eval_* | "
+                                  "ForEach-Object { $_.Name }", timeout=30, check=False)
+            except subprocess.TimeoutExpired:
+                return
+            steps = [int(m.group(1)) for m in re.finditer(r"eval_(\d+)", listing)]
+            if not steps:
+                return
+            step = max(steps)
+            job["step"] = step
+            rate = (time.time() - job["started"]) / step
+            job["eta"] = time.time() + rate * (total - step)
+            ckpt = int(cfg["checkpoint_every"])
+            due = any(f not in notified and step >= f * total for f in cfg["notify_checkpoints"])
+            if step != last_preview[0] and (step % ckpt == 0 or step == total or due):
+                names = self.ps(f"Get-ChildItem '{d}/out/eval_{step}' -Filter *.png | Sort-Object Name | "
+                                "Select-Object -First 1 | ForEach-Object { $_.Name }", check=False).strip()
+                if names:
+                    try:
+                        local_png = tmp / f"{name}_{step}.png"
+                        self.download(f"{d}/out/eval_{step}/{names}", local_png)
+                        preview = f"{name}_step{step:05d}.jpg"
+                        make_jpeg(local_png, paths.previews / preview, 1280, rotate)
+                        local_png.unlink(missing_ok=True)
+                        job["preview"], last_preview[0] = preview, step
+                    except Exception as e:
+                        log(f"preview from {self.label} failed: {e}")
+            crossed = [f for f in cfg["notify_checkpoints"] if f not in notified and step >= f * total]
+            if crossed and last_preview[0] == step:
+                notified.update(crossed)
+                img = paths.attach / job["preview"]
+                shutil.copyfile(paths.previews / job["preview"], img)
+                imessage(cfg, f"🟡 {name} on {self.label}: {100 * step // total}% "
+                              f"({step:,}/{total:,} steps), "
+                              f"ETA ~{dt.datetime.fromtimestamp(job['eta']):%H:%M}", img)
+
+        code = self.run(exe, args, cwd, d, "train", beat, poll)
+        if code:
+            raise RuntimeError(f"{what} on {self.label} exited with {code} {self.failure(d, 'train')}")
         job["train_seconds"] = time.time() - job["train_started"]
         job["phase"] = f"downloading result from {self.label}"
         beat(force=True)
@@ -1710,9 +1859,62 @@ class RemoteWorker:
             self.download(f"{d}/train.log", out_dir.parent / "train.log")
         except Exception:
             (out_dir.parent / "train.log").write_text("")
-        self.remove(d)   # free the worker's disk; the capture is still on the Mac
+        if gs:
+            try:
+                self.download(f"{d}/out/metrics.json", out_dir / "metrics.json")
+                job["metrics"] = json.loads((out_dir / "metrics.json").read_text()).get("test")
+                if job["metrics"]:
+                    job["metrics"].pop("views", None)
+            except Exception as e:
+                log(f"no metrics from {self.label}: {e}")
+        # The worker's copy stays until finish(): pruning may still use it.
         return final
 
+    def prune(self, cfg, job, colmap_dir, sensor, ply, pct, out_dir, beat, trained_here):
+        """Prune a trained result on this worker. Returns (local pruned .ply, report)."""
+        name, st = job["name"], job["settings"]
+        pc, g = sub_config(cfg, "prune"), sub_config(cfg, "gsplat")
+        if trained_here:   # the capture and the result are still on the worker
+            d = self.job_dir(name)
+            remote_ply = f"{d}/out/{Path(ply).name}"
+            if sensor and not (st.get("trainer") == "gsplat"):   # Brush runs didn't upload depth
+                self.upload_dir(sensor.parent, [sensor.name], f"{d}/data", beat)
+        else:
+            d = self.job_dir(name + "-prune")
+            job["phase"] = f"uploading to {self.label} for pruning"
+            beat(force=True)
+            self.upload_capture(d, colmap_dir, sensor, beat)
+            remote_ply = f"{d}/in.ply"
+            self.upload_file(ply, remote_ply)
+        self.sync_gsplat()
+        job["phase"] = f"pruning {pct}% on {self.label}"
+        beat(force=True)
+        cwd = self.gsplat["scripts"]
+        args = [f"{cwd}/prune.py", remote_ply, f"{d}/data", "--out", f"{d}/prune",
+                "--score", pc["score"], "--keep", round(1 - pct / 100, 4),
+                "--finetune", pc["finetune_steps"], "--eval-res", st["max_resolution"], "--holdout-every", 0]
+        if sensor:
+            args += ["--depth-dir", f"{d}/data/{sensor.name}"]
+            if st.get("depth_supervision"):
+                args += ["--depth-weight", g["depth_weight"]]
+        if st.get("flatten"):
+            args += ["--flat-weight", g["flat_weight"]]
+        log(f"run on {self.label}: prune {' '.join(map(str, args))}")
+        try:
+            code = self.run(self.gsplat["python"], args, cwd, d, "prune", beat)
+            if code:
+                raise RuntimeError(f"pruning on {self.label} exited with {code} {self.failure(d, 'prune')}")
+            local = out_dir / f"pruned_{pct}.ply"
+            self.download(f"{d}/prune/pruned.ply", local)
+            self.download(f"{d}/prune/prune.json", out_dir / "prune.json")
+            return local, json.loads((out_dir / "prune.json").read_text())
+        finally:
+            if not trained_here:
+                self.remove(d)
+
+    def finish(self, name):
+        """Free the worker's disk once the job is completely done."""
+        self.remove(self.job_dir(name))
 
 def make_workers(cfg):
     """Configured machines, in scheduling preference order (remote GPUs first)."""
@@ -1760,6 +1962,7 @@ def process(cfg, paths, state, status, item, beat, worker=None):
             beat()
             unpack(local_zip, job_dir / "data")
         colmap = find_colmap(job_dir / "data")
+        sensor = find_sensor_data(job_dir / "data")
         if not job.get("quality"):
             job["quality"] = find_capture_quality(job_dir / "data")
         out_dir = job_dir / "out"
@@ -1767,6 +1970,8 @@ def process(cfg, paths, state, status, item, beat, worker=None):
         pending = lambda: effective_settings(load_config(), status.overrides.get(name))
         refined = None   # (folder, stats), computed once per job
         warnings = []
+        if job["settings"].get("trainer") == "gsplat" and not worker.gsplat:
+            warnings.append(f"gsplat needs a CUDA worker; trained with Brush on {worker.label}")
         while True:
             source = colmap
             if job["settings"].get("refine_poses"):
@@ -1783,7 +1988,7 @@ def process(cfg, paths, state, status, item, beat, worker=None):
                     source = refined[0]
                 job["refine"] = refined[1]
             if worker.remote:
-                final = worker.train(cfg, paths, job, source, out_dir, beat, pending)
+                final = worker.train(cfg, paths, job, source, out_dir, beat, pending, sensor)
             else:
                 final = train(cfg, paths, job, source, out_dir, beat, pending)
             if final is not RESTART:
@@ -1795,7 +2000,17 @@ def process(cfg, paths, state, status, item, beat, worker=None):
             imessage(cfg, f"🔁 {name}: restarting with new settings "
                           f"({settings_summary(job['settings'])})")
 
-        # Output flip is read at the end, so it can be changed while training runs.
+        # Pruning and the output flip are read at the end, so they can change while training runs.
+        trained = final
+        prune_pct = int(pending().get("prune_pct") or 0)
+        job["settings"]["prune_pct"] = prune_pct
+        if prune_pct:
+            try:
+                final, job["prune"] = prune_result(cfg, status, job, worker, source, sensor,
+                                                   final, prune_pct, out_dir, beat)
+            except Exception as e:
+                log(f"pruning failed for {name}: {e}")
+                warnings.append(f"prune: {str(e)[:120]}")
         flip = bool(pending().get("flip_up"))
         job["settings"]["flip_up"] = int(flip)
         result_ply, cerrors = final, list(warnings)
@@ -1834,13 +2049,17 @@ def process(cfg, paths, state, status, item, beat, worker=None):
         shutil.copyfile(job_dir / "train.log", dest / "train.log")
         if job.get("preview"):
             shutil.copyfile(paths.previews / job["preview"], dest / "preview.jpg")
-        for p in out_dir.glob("export_*.ply"):   # keep only the final locally
-            if p != final:
+        for p in out_dir.glob("export_*.ply"):   # keep only the final (+ unpruned) result locally
+            if p not in (final, trained):
                 p.unlink()
         shutil.move(str(item.path), paths.done / item.path.name)
         dur = fmt_dur(time.time() - t0)
         size_mb = (dest / f"{name}.ply").stat().st_size / 1e6
         files = f"{size_mb:.0f} MB ply" + "".join(f" · {b / 1e6:.0f} MB {f}" for f, b in sizes.items())
+        if job.get("prune"):
+            pr = job["prune"]
+            files += (f" · pruned to {pr['splats_out']:,} splats ({prune_pct}% removed, PSNR "
+                      f"{pr['before']['psnr']:.1f} → {(pr.get('finetuned') or pr['pruned'])['psnr']:.1f})")
         job["files"] = {"ply": int(size_mb * 1e6), **sizes}
         write_meta(dest, job, job["files"], flip)
         try:
@@ -1870,9 +2089,33 @@ def process(cfg, paths, state, status, item, beat, worker=None):
         record(state, job, "FAILED", dur, str(e)[:160])
         imessage(cfg, f"❌ {name}: failed after {dur}: {e}")
     finally:
+        try:
+            worker.finish(name)
+        except Exception as e:
+            log(f"cleanup on {worker.label} failed: {e}")
         status.overrides.clear(name)
         status.jobs.pop(worker.name, None)
         beat(force=True)
+
+
+def find_sensor_data(data_dir):
+    """SplatKing's per-photo LiDAR depth/confidence folder, if the capture has one."""
+    for p in sorted(Path(data_dir).glob("**/sensor_data")):
+        if p.is_dir() and any(p.glob("*_depth.bin")):
+            return p
+    return None
+
+
+def prune_result(cfg, status, job, worker, colmap_dir, sensor, ply, pct, out_dir, beat):
+    """Prune on the job's own worker when it can (no re-upload), else on any online
+    CUDA worker. Returns (pruned .ply, report)."""
+    if worker.remote and worker.gsplat:
+        pw = worker
+    else:
+        pw = next((w for w in status.workers.values() if w.remote and w.gsplat and w.online), None)
+        if pw is None:
+            raise RuntimeError("needs an online CUDA worker with gsplat")
+    return pw.prune(cfg, job, colmap_dir, sensor, ply, pct, out_dir, beat, trained_here=pw is worker)
 
 
 def record(state, job, result, duration, detail):
@@ -2116,6 +2359,17 @@ SCRIPT = Path(__file__).resolve()
 SCRIPT_MTIME = SCRIPT.stat().st_mtime
 
 
+def can_take(cfg, worker, ov, any_gsplat):
+    """Whether a worker may start a queued capture: honours "Run on", and keeps gsplat
+    captures for workers that have gsplat (if there are any; pinned ones fall back to Brush)."""
+    run_on = ov.get("run_on", "auto")
+    if run_on not in ("auto", worker.name):
+        return False
+    if run_on == "auto" and any_gsplat and not worker.gsplat:
+        return effective_settings(cfg, ov).get("trainer") != "gsplat"
+    return True
+
+
 def reload_if_changed():
     """When idle, re-exec ourselves if this script was edited, so code changes
     never need a manual restart that would kill a running training job."""
@@ -2195,12 +2449,17 @@ def main():
             beat(force=True)
             for name in [n for n, (t, _) in list(running.items()) if not t.is_alive()]:
                 running.pop(name, None)
+            # Reload edited code before picking up more work: with a backlog the queue is
+            # never idle after scheduling, so checking only afterwards would never reload.
+            if not running and not status.snapshots.pending():
+                reload_if_changed()
             claimed = {n for _, n in list(running.values())}
+            any_gsplat = any(w.gsplat for w in status.workers.values())
             for w in list(status.workers.values()):   # remote GPUs first, then the Mac
                 if w.name in running or (w.remote and not w.online):
                     continue
                 item = next((i for i in inbox.ready(overrides) if i.name not in claimed
-                             and overrides.get(i.name).get("run_on", "auto") in ("auto", w.name)), None)
+                             and can_take(cfg, w, overrides.get(i.name), any_gsplat)), None)
                 if item is None:
                     continue
                 t = threading.Thread(target=run_job, args=(cfg, item, w), daemon=True)
@@ -2210,8 +2469,6 @@ def main():
                 t.start()
             if not running:
                 cleanup_jobs(paths, cfg["keep_work_days"])
-                if not status.snapshots.pending():   # never reload mid-job or mid-snapshot
-                    reload_if_changed()
         except Exception as e:
             log(f"loop error: {e}\n{traceback.format_exc()}")
         time.sleep(cfg["poll_seconds"])
@@ -2307,6 +2564,11 @@ def check():
         print(f"✓ colmap: {colmap}" + (" (refine_poses on by default)" if cfg.get("refine_poses") else ""))
     elif cfg.get("refine_poses"):
         print("! colmap not found (brew install colmap); captures will train on unrefined poses")
+    for spec in cfg.get("workers") or []:
+        w = RemoteWorker(spec)
+        print(f"  worker {w.label}: ssh {w.ssh}, brush" + (", gsplat + pruning" if w.gsplat else ""))
+    if cfg.get("trainer") == "gsplat" and not any((s.get("gsplat") or {}).get("python") for s in cfg.get("workers") or []):
+        print("! trainer is gsplat but no worker has gsplat; captures will train with Brush")
     for tool in ("brctl", "sips", "caffeinate", "osascript"):
         if not shutil.which(tool):
             print(f"✗ missing macOS tool: {tool}")
