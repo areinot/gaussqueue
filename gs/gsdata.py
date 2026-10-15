@@ -162,10 +162,10 @@ class Views:
     plus LiDAR depth/confidence when a SplatKing sensor_data folder is given, and the
     per-photo masks of a box dataset (box.py: 255 train colour, 128 must be empty, 0 ignore)."""
 
-    def __init__(self, root, images, max_res, device="cuda", depth_dir=None):
+    def __init__(self, root, images, max_res, device="cuda", depth_dir=None, weight_dir=None):
         root = Path(root)
         self.names, self.rgb, self.K, self.viewmats, self.depth, self.conf = [], [], [], [], [], []
-        self.masks = []
+        self.masks, self.weights = [], []
         for im in images:
             img = Image.open(root / "images" / im["name"]).convert("RGB")
             cam = im["cam"]
@@ -184,6 +184,12 @@ class Views:
                     mi = mi.resize(img.size, Image.NEAREST)
                 m = torch.from_numpy(np.array(mi)).to(device)
             self.masks.append(m)
+            wt = None
+            wp = Path(weight_dir) / (Path(im["name"]).stem + ".png") if weight_dir else None
+            if wp is not None and wp.exists():
+                wi = Image.open(wp).resize(img.size, Image.BILINEAR)
+                wt = (torch.from_numpy(np.array(wi)).float() / 255).half().to(device)
+            self.weights.append(wt)
             self.viewmats.append(torch.tensor(im["viewmat"], dtype=torch.float32))
             self.names.append(im["name"])
             d = c = None
@@ -241,9 +247,9 @@ def _gauss_window(size=11, sigma=1.5, device="cuda"):
     return (g[:, None] @ g[None, :]).expand(3, 1, size, size).contiguous()
 
 
-def ssim(a, b, mask=None):
+def ssim(a, b, mask=None, weight=None):
     """SSIM of two [H,W,3] images in 0..1 (differentiable); with a [H,W] bool mask, the
-    mean over the masked pixels only."""
+    mean over the masked pixels only; with a [H,W] weight, the weighted mean."""
     import torch.nn.functional as F
     x, y = a.permute(2, 0, 1)[None], b.permute(2, 0, 1)[None]
     w = _gauss_window(device=a.device)
@@ -253,9 +259,12 @@ def ssim(a, b, mask=None):
     sxy = F.conv2d(x * y, w, groups=3) - mu_x * mu_y
     c1, c2 = 0.01 ** 2, 0.03 ** 2
     m = ((2 * mu_x * mu_y + c1) * (2 * sxy + c2)) / ((mu_x ** 2 + mu_y ** 2 + c1) * (sxx + syy + c2))
+    k = (w.shape[-1] - 1) // 2
+    if weight is not None:
+        ww = weight[k:-k, k:-k].float() * (mask[k:-k, k:-k] if mask is not None else 1)
+        return (m[0].mean(0) * ww).sum() / ww.sum().clamp_min(1e-6)
     if mask is None:
         return m.mean()
-    k = (w.shape[-1] - 1) // 2
     mm = mask[k:-k, k:-k]
     return m[0].mean(0)[mm].mean() if mm.any() else m.mean()
 

@@ -79,6 +79,8 @@ def parse(argv=None):
                                            "so runs on different datasets are scored on the same views")
     p.add_argument("--subsample", type=int, default=1, help="train on every Nth photo")
     p.add_argument("--exclude-names", help="file listing photos not to train on (one name per line)")
+    p.add_argument("--pixel-weights", help="folder of per-photo weight maps (coverage.py): pixels that "
+                                           "close-ups cover better count less")
     p.add_argument("--view-weights", help="JSON {photo name: weight}: photos are picked for training in "
                                           "proportion to their weight (e.g. how densely they sample the "
                                           "surface, so close-ups lead); missing photos weigh 1")
@@ -368,7 +370,8 @@ def train(a, splats=None, log=print):
     if a.exclude_names:
         skip = {l.strip() for l in Path(a.exclude_names).read_text().splitlines() if l.strip()}
         tr_ims = [im for im in tr_ims if im["name"] not in skip]
-    tv = gsdata.Views(root, tr_ims, a.max_res, dev, a.depth_dir if a.depth_weight > 0 else None)
+    tv = gsdata.Views(root, tr_ims, a.max_res, dev, a.depth_dir if a.depth_weight > 0 else None,
+                      a.pixel_weights)
     ev = gsdata.Views(root, te_ims, a.max_res, dev, a.eval_depth_dir or a.depth_dir)
     centers = tv.centers()
     scene_scale = float((centers - centers.mean(0)).norm(dim=1).max()) * 1.1 or 1.0
@@ -445,13 +448,15 @@ def train(a, splats=None, log=print):
         gt = tv.image(i)
         if strategy:
             strategy.step_pre_backward(params, opts, state, step, meta)
-        mask = tv.masks[i]
-        if mask is None:
+        mask, pw = tv.masks[i], tv.weights[i]
+        if mask is None and pw is None:
             loss = (1 - a.ssim_weight) * (rgb_r - gt).abs().mean() + a.ssim_weight * (1 - gsdata.ssim(rgb_r, gt))
         else:
-            keep, empty = mask == 255, mask == 128
-            l1 = (rgb_r - gt).abs()[keep].mean() if keep.any() else rgb_r.sum() * 0
-            loss = (1 - a.ssim_weight) * l1 + a.ssim_weight * (1 - gsdata.ssim(rgb_r, gt, keep))
+            keep = mask == 255 if mask is not None else torch.ones_like(gt[..., 0], dtype=torch.bool)
+            empty = mask == 128 if mask is not None else torch.zeros_like(keep)
+            wk = keep.float() * (pw.float() if pw is not None else 1)
+            l1 = ((rgb_r - gt).abs().mean(-1) * wk).sum() / wk.sum().clamp_min(1e-6)
+            loss = (1 - a.ssim_weight) * l1 + a.ssim_weight * (1 - gsdata.ssim(rgb_r, gt, keep, pw))
             if empty.any() and a.empty_weight > 0:
                 loss = loss + a.empty_weight * alpha[empty].mean()
         if a.depth_weight > 0 and tv.depth[i] is not None:
