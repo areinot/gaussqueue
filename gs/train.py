@@ -94,6 +94,10 @@ def parse(argv=None):
     p.add_argument("--ssim-weight", type=float, default=0.2,
                    help="share of the photo loss given to SSIM (edges, texture); the rest is L1")
     p.add_argument("--export-every", type=int, default=0)
+    p.add_argument("--test-every", type=int, default=0,
+                   help="score the held-out photos every N steps into <out>/curve.json (quality vs steps)")
+    p.add_argument("--track-views", nargs="*", default=[],
+                   help="held-out photos whose renders are saved at every --test-every step")
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args(argv)
@@ -443,6 +447,7 @@ def train(a, splats=None, log=print):
     carved = [0, 0]
     eval_view = ev if len(ev) else tv
     t0, last = time.time(), time.time()
+    curve = []
     for step in range(1, a.steps + 1):
         if first is not None and step <= a.first_until * a.steps:
             i = int(torch.multinomial(first, 1))
@@ -519,6 +524,18 @@ def train(a, splats=None, log=print):
             with torch.no_grad():
                 img, *_ = render(params, eval_view, 0, sh_degree, a.mode, a.antialiased)
             gsdata.save_png(out / f"eval_{step}" / (Path(eval_view.names[0]).stem + ".png"), img)
+        if a.test_every and len(ev) and step % a.test_every == 0 and step != a.steps:
+            with torch.no_grad():
+                m = evaluate(params, ev, sh_degree, a.mode, a.antialiased)
+                for i, nm in enumerate(ev.names):
+                    if Path(nm).stem in a.track_views or nm in a.track_views:
+                        img, *_ = render(params, ev, i, sh_degree, a.mode, a.antialiased)
+                        gsdata.save_png(out / "track" / f"{Path(nm).stem}_{step:06d}.png", img.clamp(0, 1))
+            curve.append({"step": step, "psnr": m["psnr"], "ssim": m["ssim"], "depth_err": m.get("depth_err"),
+                          "splats": len(params["means"]), "seconds": round(time.time() - t0, 1),
+                          "views": [{k: v[k] for k in ("name", "psnr", "ssim")} for v in m["views"]]})
+            (out / "curve.json").write_text(json.dumps(curve, indent=1))
+            log(f"step {step}: held-out PSNR {m['psnr']:.2f} SSIM {m['ssim']:.4f}")
         if a.export_every and step % a.export_every == 0 and step != a.steps:
             gsdata.save_ply(out / f"export_{step}.ply", dict(params))
 
