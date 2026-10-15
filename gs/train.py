@@ -74,6 +74,15 @@ def parse(argv=None):
     p.add_argument("--sky-points", type=int, default=0,
                    help="also start with this many splats on a distant sphere (sky, far scenery)")
     p.add_argument("--means-lr", type=float, default=1.6e-4, help="times scene scale")
+    p.add_argument("--lr-decay-steps", type=int, default=0,
+                   help="decay the position learning rate over this many steps, then hold it "
+                        "(0 = over the whole run, the old behaviour)")
+    p.add_argument("--lr-final", type=float, default=0.01,
+                   help="position learning rate at the end of the decay, as a fraction of the start")
+    p.add_argument("--refine-stop", type=int, default=0,
+                   help="stop densifying at this step (0 = 85%% of the run for MCMC, half for default/absgrad)")
+    p.add_argument("--track-cameras", help="a COLMAP folder of extra cameras (e.g. novel angles) rendered "
+                                           "at every --test-every step into <out>/track")
     p.add_argument("--holdout-every", type=int, default=0)
     p.add_argument("--holdout-names", help="file listing the photos to hold out (one name per line), "
                                            "so runs on different datasets are scored on the same views")
@@ -426,13 +435,17 @@ def train(a, splats=None, log=print):
     lrs = {"means": a.means_lr * scene_scale, "scales": 5e-3, "quats": 1e-3, "opacities": 5e-2,
            "sh0": 2.5e-3, "shN": 2.5e-3 / 20}
     opts = {k: torch.optim.Adam([{"params": params[k], "lr": lr, "name": k}], eps=1e-15) for k, lr in lrs.items()}
-    sched = torch.optim.lr_scheduler.ExponentialLR(opts["means"], gamma=0.01 ** (1 / max(a.steps, 1)))
+    decay = a.lr_decay_steps or a.steps
+    means_lr0 = lrs["means"]
+
+    def means_lr(step):   # exponential decay to lr_final over `decay` steps, then held
+        return means_lr0 * a.lr_final ** (min(step, decay) / max(decay, 1))
 
     if mcmc:
-        strategy = MCMCStrategy(cap_max=a.max_splats, refine_stop_iter=int(a.steps * 0.85))
+        strategy = MCMCStrategy(cap_max=a.max_splats, refine_stop_iter=a.refine_stop or int(a.steps * 0.85))
         state = strategy.initialize_state()
     elif not fine_tune:
-        strategy = DefaultStrategy(absgrad=a.strategy == "absgrad", refine_stop_iter=a.steps // 2,
+        strategy = DefaultStrategy(absgrad=a.strategy == "absgrad", refine_stop_iter=a.refine_stop or a.steps // 2,
                                    key_for_gradient="gradient_2dgs" if a.mode == "2dgs" else "means2d")
         state = strategy.initialize_state(scene_scale=scene_scale)
     else:
@@ -448,6 +461,10 @@ def train(a, splats=None, log=print):
     eval_view = ev if len(ev) else tv
     t0, last = time.time(), time.time()
     curve = []
+    extra = None
+    if a.track_cameras:
+        xi, _, _ = gsdata.read_model(gsdata.find_model(a.track_cameras))
+        extra = gsdata.Views(a.track_cameras, xi, a.max_res, dev)
     for step in range(1, a.steps + 1):
         if first is not None and step <= a.first_until * a.steps:
             i = int(torch.multinomial(first, 1))
@@ -500,9 +517,10 @@ def train(a, splats=None, log=print):
         for o in opts.values():
             o.step()
             o.zero_grad(set_to_none=True)
-        sched.step()
+        for g in opts["means"].param_groups:
+            g["lr"] = means_lr(step)
         if mcmc:
-            strategy.step_post_backward(params, opts, state, step, meta, lr=sched.get_last_lr()[0])
+            strategy.step_post_backward(params, opts, state, step, meta, lr=means_lr(step))
         elif strategy:
             strategy.step_post_backward(params, opts, state, step, meta, packed=packed)
             if len(params["means"]) > a.max_splats and strategy.refine_stop_iter > step:
@@ -531,6 +549,10 @@ def train(a, splats=None, log=print):
                     if Path(nm).stem in a.track_views or nm in a.track_views:
                         img, *_ = render(params, ev, i, sh_degree, a.mode, a.antialiased)
                         gsdata.save_png(out / "track" / f"{Path(nm).stem}_{step:06d}.png", img.clamp(0, 1))
+                if extra is not None:
+                    for i, nm in enumerate(extra.names):
+                        img, *_ = render(params, extra, i, sh_degree, a.mode, a.antialiased)
+                        gsdata.save_png(out / "track" / f"{Path(nm).stem}_{step:06d}.png", img.clamp(0, 1))
             curve.append({"step": step, "psnr": m["psnr"], "ssim": m["ssim"], "depth_err": m.get("depth_err"),
                           "splats": len(params["means"]), "seconds": round(time.time() - t0, 1),
                           "views": [{k: v[k] for k in ("name", "psnr", "ssim")} for v in m["views"]]})
@@ -539,6 +561,13 @@ def train(a, splats=None, log=print):
         if a.export_every and step % a.export_every == 0 and step != a.steps:
             gsdata.save_ply(out / f"export_{step}.ply", dict(params))
 
+    if a.test_every and (a.track_views or extra is not None):   # final frame of the tracked views
+        with torch.no_grad():
+            for vw in ([ev] if len(ev) else []) + ([extra] if extra is not None else []):
+                for i, nm in enumerate(vw.names):
+                    if vw is extra or Path(nm).stem in a.track_views or nm in a.track_views:
+                        img, *_ = render(params, vw, i, sh_degree, a.mode, a.antialiased)
+                        gsdata.save_png(out / "track" / f"{Path(nm).stem}_{a.steps:06d}.png", img.clamp(0, 1))
     if box is not None:   # drop what ended up outside the box
         with torch.no_grad():
             inside = box.inside(params["means"])
