@@ -79,6 +79,12 @@ def parse(argv=None):
                                            "so runs on different datasets are scored on the same views")
     p.add_argument("--subsample", type=int, default=1, help="train on every Nth photo")
     p.add_argument("--exclude-names", help="file listing photos not to train on (one name per line)")
+    p.add_argument("--view-weights", help="JSON {photo name: weight}: photos are picked for training in "
+                                          "proportion to their weight (e.g. how densely they sample the "
+                                          "surface, so close-ups lead); missing photos weigh 1")
+    p.add_argument("--first-names", help="file listing the only photos used until --first-until "
+                                         "(e.g. the distant ones: coarse shape and colour first)")
+    p.add_argument("--first-until", type=float, default=0.0, help="fraction of training for --first-names")
     p.add_argument("--ssim-weight", type=float, default=0.2,
                    help="share of the photo loss given to SSIM (edges, texture); the rest is L1")
     p.add_argument("--export-every", type=int, default=0)
@@ -369,6 +375,19 @@ def train(a, splats=None, log=print):
     log(f"{len(tv)} training views, {len(ev)} held out, scene scale {scene_scale:.2f}, "
         f"depth maps {'yes' if tv.has_depth else 'no'}")
 
+    weights = torch.ones(len(tv))
+    if a.view_weights:
+        vw = json.loads(Path(a.view_weights).read_text())
+        weights = torch.tensor([float(vw.get(n, 1.0)) for n in tv.names]).clamp_min(1e-3)
+    first = None
+    if a.first_names and a.first_until > 0:
+        fn = {l.strip() for l in Path(a.first_names).read_text().splitlines() if l.strip()}
+        first = torch.tensor([float(n in fn) for n in tv.names])
+        if first.sum() == 0:
+            first = None
+        else:
+            log(f"first {a.first_until:.0%} of training on {int(first.sum())} photos only")
+
     mcmc = a.strategy == "mcmc"
     if splats is None and a.init_ply:
         splats = gsdata.load_ply(a.init_ply)
@@ -414,7 +433,12 @@ def train(a, splats=None, log=print):
     eval_view = ev if len(ev) else tv
     t0, last = time.time(), time.time()
     for step in range(1, a.steps + 1):
-        i = int(torch.randint(len(tv), (1,)))
+        if first is not None and step <= a.first_until * a.steps:
+            i = int(torch.multinomial(first, 1))
+        elif a.view_weights:
+            i = int(torch.multinomial(weights, 1))
+        else:
+            i = int(torch.randint(len(tv), (1,)))
         deg = sh_degree if fine_tune else min(sh_degree, (step - 1) // 1000)
         rgb_r, depth, alpha, meta, ex = render(params, tv, i, deg, a.mode, a.antialiased,
                                                absgrad=a.strategy == "absgrad", packed=packed)
