@@ -278,6 +278,26 @@ class Overrides:
                 self.data.pop(name, None)
             self._save()
 
+    def restore(self, name, st, cfg):
+        """Set an item's settings to a previous run's: its preset, plus every setting that
+        differs from that preset (so an unchanged preset still shows by name). Settings that
+        no longer validate are left at their defaults."""
+        base = st.get("base") if st.get("base") in PRESETS else (
+            st.get("preset") if st.get("preset") in PRESETS else "standard")
+        with self.lock:
+            ov = self.data.setdefault(name, {})
+            for k in ("preset",) + SETTING_KEYS:
+                ov.pop(k, None)
+        if base != "standard":
+            self.apply(name, {"action": "preset", "value": base})
+        defaults = effective_settings(cfg, {"preset": base})
+        for k in SETTING_KEYS:
+            if k in st and st[k] != defaults.get(k):
+                try:
+                    self.apply(name, {"action": "set", "key": k, "value": st[k]})
+                except ValueError:
+                    pass
+
     def clear(self, name):
         with self.lock:
             if self.data.pop(name, None) is not None:
@@ -979,9 +999,21 @@ class Status:
 
 # ---------------------------------------------------------------- dashboard server
 
+def last_settings(paths, state, name):
+    """The settings a capture last ran with: its newest history entry, else its result's
+    meta.json in the outbox. None if unknown."""
+    for h in reversed(state.get("history", [])):
+        if h.get("name") == name and h.get("settings"):
+            return h["settings"]
+    try:
+        return json.loads((paths.outbox / name / "meta.json").read_text()).get("settings")
+    except (OSError, ValueError):
+        return None
+
+
 def requeue(status, overrides, name):
     """Move a finished capture back into the inbox, on hold so its settings can be
-    changed before it runs again."""
+    changed before it runs again. It comes back with the settings it last ran with."""
     paths = status.inbox.paths
     if any(i.name == name for i in list(status.inbox.items.values())):
         raise ValueError("already in the inbox")
@@ -992,8 +1024,11 @@ def requeue(status, overrides, name):
     if dst.exists():
         raise ValueError(f"{src.name} already exists in the inbox")
     overrides.apply(name, {"action": "hold", "value": True})  # before it becomes visible
+    prev = last_settings(paths, status.state, name)
+    if prev:
+        overrides.restore(name, prev, load_config())
     shutil.move(str(src), dst)
-    log(f"requeued (on hold): {name}")
+    log(f"requeued (on hold): {name}" + (", with its last settings" if prev else ""))
 
 
 def start_dashboard(cfg, paths, status, overrides):

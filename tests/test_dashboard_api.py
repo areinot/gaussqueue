@@ -167,8 +167,10 @@ class DashboardAPITest(unittest.TestCase):
     def test_requeue_puts_finished_capture_back_on_hold(self):
         paths = self.inbox.paths
         (paths.done / "capC").mkdir()
+        ran = dict(self.gq.effective_settings(self.cfg, {"preset": "high"}),
+                   max_resolution=1080, prune_pct=70, trainer="gsplat", sh_degree=99)
         self.status.state["history"].append({"name": "capC", "result": "done", "duration": "1m",
-                                             "finished": "01-01 00:01"})
+                                             "finished": "01-01 00:01", "settings": ran})
         self.status.write(self.cfg)
         rows = {h["name"]: h for h in self.snapshot()["history"]}
         self.assertTrue(rows["capC"]["requeueable"])
@@ -177,6 +179,14 @@ class DashboardAPITest(unittest.TestCase):
         self.assertTrue((paths.inbox / "capC").is_dir())
         self.assertFalse((paths.done / "capC").exists())
         self.assertTrue(self.overrides.get("capC").get("hold"))
+        # ...with the settings it last ran with: same preset, its changes on top, and
+        # values that no longer validate (sh_degree 99) left at the preset's
+        ov = self.overrides.get("capC")
+        self.assertEqual(ov.get("preset"), "high")
+        st = self.gq.effective_settings(self.cfg, ov)
+        self.assertEqual((st["max_resolution"], st["prune_pct"], st["trainer"]), (1080, 70, "gsplat"))
+        self.assertEqual(st["sh_degree"], self.gq.effective_settings(self.cfg, {"preset": "high"})["sh_degree"])
+        self.assertNotIn("total_steps", ov)   # unchanged from the preset: not an override
         self.inbox.tick(self.cfg)
         self.assertNotIn("capC", [i.name for i in self.inbox.ready(self.overrides)])
         code, body = self.post({"name": "capC", "action": "requeue"})
