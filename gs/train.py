@@ -81,6 +81,10 @@ def parse(argv=None):
     p.add_argument("--exclude-names", help="file listing photos not to train on (one name per line)")
     p.add_argument("--pixel-weights", help="folder of per-photo weight maps (coverage.py): pixels that "
                                            "close-ups cover better count less")
+    p.add_argument("--pixel-weights-absolute", action="store_true",
+                   help="use --pixel-weights as absolute loss weights (scaled by the folder's "
+                        "summary.json scale), so they also shift weight between photos; by default "
+                        "they only redistribute it within each photo")
     p.add_argument("--view-weights", help="JSON {photo name: weight}: photos are picked for training in "
                                           "proportion to their weight (e.g. how densely they sample the "
                                           "surface, so close-ups lead); missing photos weigh 1")
@@ -372,6 +376,10 @@ def train(a, splats=None, log=print):
         tr_ims = [im for im in tr_ims if im["name"] not in skip]
     tv = gsdata.Views(root, tr_ims, a.max_res, dev, a.depth_dir if a.depth_weight > 0 else None,
                       a.pixel_weights)
+    pw_scale = 1.0
+    if a.pixel_weights and a.pixel_weights_absolute:
+        sf = Path(a.pixel_weights) / "summary.json"
+        pw_scale = float(json.loads(sf.read_text()).get("scale", 1.0)) if sf.exists() else 1.0
     ev = gsdata.Views(root, te_ims, a.max_res, dev, a.eval_depth_dir or a.depth_dir)
     centers = tv.centers()
     scene_scale = float((centers - centers.mean(0)).norm(dim=1).max()) * 1.1 or 1.0
@@ -454,9 +462,15 @@ def train(a, splats=None, log=print):
         else:
             keep = mask == 255 if mask is not None else torch.ones_like(gt[..., 0], dtype=torch.bool)
             empty = mask == 128 if mask is not None else torch.zeros_like(keep)
-            wk = keep.float() * (pw.float() if pw is not None else 1)
-            l1 = ((rgb_r - gt).abs().mean(-1) * wk).sum() / wk.sum().clamp_min(1e-6)
-            loss = (1 - a.ssim_weight) * l1 + a.ssim_weight * (1 - gsdata.ssim(rgb_r, gt, keep, pw))
+            wk = keep.float() * (pw.float() * pw_scale if pw is not None else 1)
+            if pw is not None and a.pixel_weights_absolute:   # weights also set the photo's share
+                n = keep.float().sum().clamp_min(1.0)
+                l1 = ((rgb_r - gt).abs().mean(-1) * wk).sum() / n
+                ssim_term = (wk.sum() / n) * (1 - gsdata.ssim(rgb_r, gt, keep, pw))
+            else:
+                l1 = ((rgb_r - gt).abs().mean(-1) * wk).sum() / wk.sum().clamp_min(1e-6)
+                ssim_term = 1 - gsdata.ssim(rgb_r, gt, keep, pw)
+            loss = (1 - a.ssim_weight) * l1 + a.ssim_weight * ssim_term
             if empty.any() and a.empty_weight > 0:
                 loss = loss + a.empty_weight * alpha[empty].mean()
         if a.depth_weight > 0 and tv.depth[i] is not None:
