@@ -375,11 +375,11 @@ class DashboardAPITest(unittest.TestCase):
         name, origin, yaw = gq.start_view_pose(root / "svmodel", flip=False)
         self.assertEqual(name, "a_first.jpg")
         self.assertEqual(origin, [1, 2, 3])
-        self.assertAlmostEqual(yaw, -90.0)          # heading +X turned onto +Z
+        self.assertAlmostEqual(yaw, 90.0)           # default: heading +X turned onto -Z
         name, origin, yaw = gq.start_view_pose(root / "svmodel", flip=True)
         self.assertEqual(origin, [1, -2, -3])       # flip is 180° about X
-        self.assertAlmostEqual(yaw, -90.0)          # heading +X is unchanged by the flip
-        self.assertAlmostEqual(gq.start_view_pose(root / "svmodel", False, "-z")[2], 90.0)
+        self.assertAlmostEqual(yaw, 90.0)           # heading +X is unchanged by the flip
+        self.assertAlmostEqual(gq.start_view_pose(root / "svmodel", False, "+z")[2], -90.0)
         self.assertIsNone(gq.start_view_pose(root / "missing", False))
         self.assertIn("start_view", gq.OUTPUT_KEYS)
 

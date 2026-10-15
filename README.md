@@ -268,7 +268,7 @@ The exception is `dashboard_port`, which needs a restart.
 | `prune_pct` | `0` (off) | Remove this % of splats after training. Per-capture override. |
 | `prune` | `{"score": "lightgaussian", "finetune_steps": 3000}` | Pruning score (`lightgaussian` or `pup`) and fine-tuning length. |
 | `flip_up` | `false` (example config: `true`) | Rotate results 180° about X so they're the right way up in SuperSplat and similar viewers. |
-| `start_view` | `true` | Move each result so its origin is where the first capture photo was taken, turned about the vertical axis (yaw only; pitch and roll stay as captured) so that photo's heading points along `start_view_forward` (`"+z"`, or `"-z"`). Viewers that start at the origin open on your first shot. Per-capture checkbox; output-only. Recorded in `meta.json` (`start_view`: photo, origin, yaw). Needs gq_spz. |
+| `start_view` | `true` | Move each result so its origin is where the first capture photo was taken, turned about the vertical axis (yaw only; pitch and roll stay as captured) so that photo's heading points along `start_view_forward` (`"-z"`, the OpenGL-style default most viewers start with, or `"+z"`). Viewers that start at the origin open on your first shot. Per-capture checkbox; output-only. Recorded in `meta.json` (`start_view`: photo, origin, yaw). Needs gq_spz. |
 | `keep_previous_results` | `true` | When a requeued capture finishes, keep the earlier result in `previous/`. If `false`, it's overwritten. |
 | `imessage_to` | `""` (off) | Phone number or Apple ID email to text. |
 | `notify_checkpoints` | `[0.25, 0.5, 0.75]` | Fractions of training that trigger a progress text. |

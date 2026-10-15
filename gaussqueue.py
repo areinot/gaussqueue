@@ -68,9 +68,10 @@ DEFAULTS = {
     # Start view: move and turn each result so it opens where the first capture photo was
     # taken. The origin goes to that camera's position and the scene is turned about the
     # vertical axis (yaw only; pitch and roll stay as captured) so the photo's heading points
-    # along start_view_forward, the viewer's default forward. Output-only, per capture.
+    # along start_view_forward, the viewer's default forward ("-z": OpenGL-style viewers, which
+    # look down -Z from the origin; "+z" for viewers that look down +Z). Output-only, per capture.
     "start_view": True,
-    "start_view_forward": "+z",
+    "start_view_forward": "-z",
     # Refine the capture's camera poses with COLMAP (features, matching, bundle
     # adjustment) before training. Slower, usually sharper. Needs `colmap` on PATH.
     "refine_poses": False,
@@ -1564,7 +1565,7 @@ def compress(cfg, ply, out_dir, name, beat, formats=None, versions=None):
     return sizes, errors
 
 
-def start_view_pose(model_dir, flip, forward="+z"):
+def start_view_pose(model_dir, flip, forward="-z"):
     """The first capture photo's camera, in the output's coordinates: (photo name, position,
     yaw in degrees that turns its heading onto the viewer's forward axis). None if unknown."""
     images = Path(model_dir) / "sparse" / "0" / "images.txt"
@@ -2210,7 +2211,7 @@ def process(cfg, paths, state, status, item, beat, worker=None):
         job["settings"]["flip_up"] = int(flip)
         want_view = bool(pending().get("start_view"))
         job["settings"]["start_view"] = int(want_view)
-        view = start_view_pose(source, flip, cfg.get("start_view_forward", "+z")) if want_view else None
+        view = start_view_pose(source, flip, cfg.get("start_view_forward", "-z")) if want_view else None
         result_ply, cerrors = final, list(warnings)
         if flip or view:
             job["phase"] = "orienting"
@@ -2229,7 +2230,7 @@ def process(cfg, paths, state, status, item, beat, worker=None):
                 result_ply = oriented
         if view:
             job["start_view"] = {"photo": view[0], "origin": view[1], "yaw_degrees": view[2],
-                                 "forward": cfg.get("start_view_forward", "+z")}
+                                 "forward": cfg.get("start_view_forward", "-z")}
         job["phase"] = "compressing"
         beat()
         versions = spz_versions(pending())
@@ -2531,7 +2532,7 @@ class Snapshots:
             work.mkdir(parents=True)
             flip = bool(snap["settings"].get("flip_up"))
             model = trainable_model(self.paths.jobs / snap["name"]) if snap["settings"].get("start_view") else None
-            view = start_view_pose(model, flip, cfg.get("start_view_forward", "+z")) if model else None
+            view = start_view_pose(model, flip, cfg.get("start_view_forward", "-z")) if model else None
             # Pruning without fine-tuning: the GPU is busy training, so score splats by opacity
             # and size only (gq_spz --keep) instead of running the full pruning stage.
             pct = int(snap["settings"].get("prune_pct") or 0)
@@ -2571,7 +2572,7 @@ class Snapshots:
                    "files": files}
             if view:
                 job["start_view"] = {"photo": view[0], "origin": view[1], "yaw_degrees": view[2],
-                                     "forward": cfg.get("start_view_forward", "+z")}
+                                     "forward": cfg.get("start_view_forward", "-z")}
             write_meta(dest, job, files, flip)
             meta = json.loads((dest / "meta.json").read_text())
             meta["snapshot"] = {"of": snap["name"], "step": snap["step"], "total_steps": snap["total"],
