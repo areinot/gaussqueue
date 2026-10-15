@@ -290,7 +290,8 @@ function renderJobs(jobs) {
   const el = $("now");
   if (editing(el)) return;
   for (const k of Object.keys(selectedBy)) if (!jobs.some(j => j.name === k)) delete selectedBy[k];
-  const exp = experimentsPanel(last && last.experiments);
+  const exps = last && last.experiments;
+  const exp = (Array.isArray(exps) ? exps : exps ? [exps] : []).map(experimentsPanel).join("");
   if (!jobs.length) {
     setHTML(el, exp || `<div class="panel"><div class="idle">Idle. Drop a capture (zip or folder with a COLMAP model) into <b>${esc(last && last.inbox_dir || "the inbox")}</b>.</div></div>`);
     return;
@@ -305,7 +306,8 @@ function experimentsPanel(e) {
   if (!e || !(e.variants || []).length) return "";
   const w = (last.workers || []).find(x => x.name === e.worker);
   const row = (v) => {
-    const res = v.psnr != null ? `PSNR ${v.psnr.toFixed(2)}${v.depth_err != null ? ` · depth ${(100 * v.depth_err).toFixed(1)}%` : ""}` : "";
+    const res = [v.psnr != null ? `PSNR ${v.psnr.toFixed(2)}` : "", v.depth_err != null ? `depth ${(100 * v.depth_err).toFixed(1)}%` : "",
+                 v.splats != null ? `${kfmt(v.splats)} splats` : "", v.seconds != null ? dur(v.seconds) : ""].filter(Boolean).join(" · ");
     const st = v.state === "done" ? `✓ ${res}`
       : v.state === "running" ? `${v.step != null ? `step ${v.step.toLocaleString()} / ${(v.total || 0).toLocaleString()}` : "starting"}${v.eta ? ` · ends ${clock(v.eta)}` : ""}`
       : v.state === "failed" ? `failed${v.error ? ": " + esc(v.error) : ""}`

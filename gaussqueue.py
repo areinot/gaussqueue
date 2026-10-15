@@ -36,7 +36,7 @@ APP_HOME = Path(os.environ.get("GAUSSQUEUE_HOME",
 CONFIG_PATH = APP_HOME / "config.json"
 STATE_PATH = APP_HOME / "state.json"
 OVERRIDES_PATH = APP_HOME / "overrides.json"
-EXPERIMENTS_PATH = APP_HOME / "experiments.json"   # written by tools/experiments.py
+EXPERIMENTS_DIR = APP_HOME / "experiments" / "batches"   # one JSON per batch (tools/experiments.py)
 DASHBOARD_HTML = Path(__file__).resolve().parent / "dashboard.html"
 GS_DIR = Path(__file__).resolve().parent / "gs"   # gsplat trainer/pruner, copied to CUDA workers
 SF_DATALESS = 0x40000000   # st_flags bit for iCloud placeholder ("dataless") files
@@ -2850,16 +2850,22 @@ SCRIPT_MTIME = SCRIPT.stat().st_mtime
 
 
 def read_experiments():
-    """Progress of an experiment batch (tools/experiments.py), for the dashboard and so the
-    queue leaves its machine alone. The runner rewrites the file at least every 30 s, so a
-    file not updated for 2 minutes is a batch that stopped. Finished ones show for 12 hours."""
-    try:
-        e = json.loads(EXPERIMENTS_PATH.read_text())
-    except (OSError, ValueError):
-        return None
-    age = time.time() - float(e.get("updated") or 0)
-    e["live"] = not e.get("finished") and age < 120
-    return e if e["live"] or age < 12 * 3600 else None
+    """Experiment batches (tools/experiments.py), newest first, for the dashboard and so the
+    queue leaves their machines alone. A runner rewrites its file at least every 30 s, so one
+    not updated for 2 minutes is a batch that stopped. Finished ones show for 12 hours."""
+    out = []
+    files = list(EXPERIMENTS_DIR.glob("*.json")) if EXPERIMENTS_DIR.is_dir() else []
+    files += [p for p in [APP_HOME / "experiments.json"] if p.exists()]   # older runners
+    for p in files:
+        try:
+            e = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        age = time.time() - float(e.get("updated") or 0)
+        e["live"] = not e.get("finished") and age < 120
+        if e["live"] or age < 12 * 3600:
+            out.append(e)
+    return sorted(out, key=lambda e: -float(e.get("started") or 0))
 
 
 def can_take(cfg, worker, ov, any_gsplat):
@@ -2965,10 +2971,9 @@ def main():
                 reload_if_changed()
             claimed = {n for _, n in list(running.values())}
             any_gsplat = any(w.gsplat for w in status.workers.values())
-            exp = read_experiments()
-            experimenting = exp.get("worker") if exp and exp["live"] else None
+            experimenting = {e.get("worker") for e in read_experiments() if e["live"]}
             for w in list(status.workers.values()):   # remote GPUs first, then the Mac
-                if w.name in running or (w.remote and not w.online) or w.name == experimenting:
+                if w.name in running or (w.remote and not w.online) or w.name in experimenting:
                     continue
                 item = next((i for i in inbox.ready(overrides) if i.name not in claimed
                              and can_take(cfg, w, overrides.get(i.name), any_gsplat)), None)

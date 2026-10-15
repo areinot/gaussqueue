@@ -1,21 +1,25 @@
-"""Run a batch of training experiments on a GaussQueue worker, one variant after another,
-with progress on the dashboard (an "Experiments" card) and the queue keeping off that
-machine until the batch is done.
+"""Run a batch of training experiments, one variant after another, with progress on the
+dashboard (an "Experiments" card per batch) and the queue keeping off that machine until
+the batch is done.
 
   python3 tools/experiments.py plan.json
 
 plan.json:
   {"name": "Shelf box: lens fix",          shown on the card
-   "worker": "pc",                          a worker from config.json (with gsplat)
+   "worker": "pc",                          a worker from config.json, or "mac" (this Mac)
+   "program": "gsplat",                     "gsplat" (default; the worker's gs scripts) or "brush"
    "out": "D:/experiments/round2",          each variant writes to <out>/<variant name>
-   "script": "train.py",                    in the worker's gsplat scripts folder (default)
+   "script": "train.py",                    gsplat: in the gs scripts folder (default train.py)
    "common": ["<data dir>", "--steps", "15000", ...],
    "variants": [{"name": "A", "args": ["--depth-weight", "0.3"]}, ...],
    "note": "optional line for the card"}
 
-A variant waits while the queue is processing a capture on that machine. The runner's log
-for each variant goes to $GAUSSQUEUE_HOME/experiments/<variant>.log. Stopping the runner
-(Ctrl-C) stops the variant that's running.
+gsplat runs report steps and held-out scores from train.py's output. Brush runs (Brush is
+quiet when not on a terminal) are followed through the eval_<step> folders it writes, so give
+them --eval-every; the card then shows the splat count of the final export.
+
+A variant waits while the queue is processing a capture on that machine. Logs go to
+$GAUSSQUEUE_HOME/experiments/<batch>/<variant>.log. Ctrl-C stops the running variant.
 """
 import json
 import os
@@ -28,15 +32,22 @@ import urllib.request
 from pathlib import Path
 
 APP_HOME = Path(os.environ.get("GAUSSQUEUE_HOME", Path.home() / "Library/Application Support/GaussQueue"))
-STATE = APP_HOME / "experiments.json"
+BATCHES = APP_HOME / "experiments" / "batches"
 STEP = re.compile(r"step (\d+)/(\d+) .*?([\d.]+) it/s")
 RESULT = re.compile(r"held-out PSNR ([\d.]+) SSIM ([\d.]+)(?: depth error ([\d.]+)%)?")
 
 
+def slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60] or "batch"
+
+
 class Batch:
-    def __init__(self, plan, worker):
+    def __init__(self, plan, worker_name):
         self.lock = threading.Lock()
-        self.data = {"name": plan.get("name", "Experiments"), "worker": worker["name"],
+        BATCHES.mkdir(parents=True, exist_ok=True)
+        self.path = BATCHES / f"{time.strftime('%Y%m%d-%H%M%S')}-{slug(plan.get('name', 'batch'))}.json"
+        self.data = {"name": plan.get("name", "Experiments"), "worker": worker_name,
+                     "program": plan.get("program", "gsplat"),
                      "note": plan.get("note"), "started": time.time(), "finished": None,
                      "variants": [{"name": v["name"], "state": "queued", "args": v.get("args", [])}
                                   for v in plan["variants"]]}
@@ -46,9 +57,9 @@ class Batch:
         with self.lock:
             self.data["updated"] = time.time()
             self.data["eta"] = self.eta()
-            tmp = STATE.with_suffix(".tmp")
+            tmp = self.path.with_suffix(".tmp")
             tmp.write_text(json.dumps(self.data, indent=1))
-            tmp.replace(STATE)
+            tmp.replace(self.path)
 
     def eta(self):
         """Current variant's end plus the rest at the average duration so far."""
@@ -81,43 +92,124 @@ def quote(a):
     return f'"{a}"' if re.search(r'[\s&|<>^]', a) else a
 
 
+def ply_splats(path):
+    try:
+        with open(path, "rb") as f:
+            m = re.search(rb"element vertex (\d+)", f.read(4096))
+        return int(m.group(1)) if m else None
+    except OSError:
+        return None
+
+
+def arg_value(args, flag):
+    try:
+        return args[args.index(flag) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+class Runner:
+    """Where and how a variant runs: locally or over SSH, gsplat or Brush."""
+
+    def __init__(self, plan, cfg):
+        self.plan, self.program = plan, plan.get("program", "gsplat")
+        name = plan["worker"]
+        self.local = name == "mac"
+        if self.local:
+            self.worker = {"name": "mac"}
+            self.brush = cfg.get("brush") or str(APP_HOME / "bin" / "brush_app")
+            self.gsplat = None
+        else:
+            self.worker = next((w for w in cfg.get("workers", []) if w.get("name") == name), None)
+            if not self.worker:
+                sys.exit(f"no worker {name!r} in config.json")
+            self.brush = self.worker.get("brush")
+            self.gsplat = self.worker.get("gsplat")
+        if self.program == "gsplat" and not self.gsplat:
+            sys.exit(f"{name} has no gsplat set up (gsplat needs a CUDA worker)")
+        if self.program == "brush" and not self.brush:
+            sys.exit(f"no Brush configured for {name}")
+
+    def command(self, variant):
+        out = f"{self.plan['out']}/{variant['name']}"
+        args = self.plan.get("common", []) + variant.get("args", [])
+        if self.program == "brush":
+            argv = [self.brush] + args + ["--export-path", out]
+            cwd = None
+        else:
+            g = self.gsplat
+            argv = [g["python"], "-u", f"{g['scripts']}/{self.plan.get('script', 'train.py')}"] + args + ["--out", out]
+            cwd = g["scripts"]
+        if self.local:
+            Path(out).mkdir(parents=True, exist_ok=True)
+            return argv, cwd, out
+        pre = f'if not exist "{out}" mkdir "{out}" && ' if self.program == "brush" else ""
+        line = pre + (f'cd /d "{cwd}" && ' if cwd else "") + " ".join(quote(a) for a in argv) + " 2>&1"
+        return ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", self.worker["ssh"], line], None, out
+
+    def brush_progress(self, out):
+        """Newest eval_<step> folder Brush has written (None if none yet)."""
+        try:
+            if self.local:
+                names = [p.name for p in Path(out).glob("eval_*")]
+            else:
+                r = subprocess.run(["ssh", "-o", "BatchMode=yes", self.worker["ssh"],
+                                    f'dir /b /ad "{out}"'], capture_output=True, text=True, timeout=30)
+                names = r.stdout.split()
+        except Exception:
+            return None
+        steps = [int(m.group(1)) for n in names if (m := re.fullmatch(r"eval_(\d+)", n))]
+        return max(steps) if steps else None
+
+    def final_splats(self, out, steps):
+        if self.local:
+            exports = sorted(Path(out).glob("export_*.ply"), key=lambda p: int(re.sub(r"\D", "", p.stem) or 0))
+            return ply_splats(exports[-1]) if exports else None
+        return None
+
+
 def main(plan_path):
     plan = json.loads(Path(plan_path).read_text())
     cfg = json.loads((APP_HOME / "config.json").read_text())
-    worker = next((w for w in cfg.get("workers", []) if w.get("name") == plan["worker"]), None)
-    if not worker or not worker.get("gsplat"):
-        sys.exit(f"no worker {plan['worker']!r} with gsplat in config.json")
+    runner = Runner(plan, cfg)
     port = cfg.get("dashboard_port", 8765)
-    g = worker["gsplat"]
-    logs = APP_HOME / "experiments"
+    batch = Batch(plan, runner.worker["name"])
+    logs = APP_HOME / "experiments" / batch.path.stem
     logs.mkdir(parents=True, exist_ok=True)
-    batch = Batch(plan, worker)
     stop = threading.Event()
     threading.Thread(target=batch.heartbeat, args=(stop,), daemon=True).start()
     try:
         for v, rec in zip(plan["variants"], batch.data["variants"]):
-            while (busy := queue_job_on(worker["name"], port)):
+            while (busy := queue_job_on(runner.worker["name"], port)):
                 rec.update(state="waiting", waiting=f"the queue is processing {busy}")
                 batch.write()
                 time.sleep(20)
             rec.update(state="running", began=time.time(), step=None, total=None, eta=None, waiting=None)
+            all_args = plan.get("common", []) + v.get("args", [])
+            total = arg_value(all_args, "--total-steps") or arg_value(all_args, "--steps")
+            rec["total"] = int(total) if total else None
             batch.write()
-            args = ([f"{g['scripts']}/{plan.get('script', 'train.py')}"] + plan.get("common", [])
-                    + ["--out", f"{plan['out']}/{v['name']}"] + v.get("args", []))
-            cmd = f'cd /d "{g["scripts"]}" && ' + " ".join(quote(a) for a in [g["python"], "-u"] + args)
+            argv, cwd, out = runner.command(v)
             print(f"=== {v['name']}: {' '.join(map(str, v.get('args', [])))}", flush=True)
-            proc = subprocess.Popen(["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30",
-                                     worker["ssh"], cmd + " 2>&1"],
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1)
+            done = threading.Event()
+            if runner.program == "brush":   # quiet: follow its eval folders instead
+                def follow():
+                    while not done.wait(10):
+                        step = runner.brush_progress(out)
+                        if step and rec.get("total"):
+                            rate = step / max(1.0, time.time() - rec["began"])
+                            rec.update(step=step, eta=time.time() + (rec["total"] - step) / rate)
+                threading.Thread(target=follow, daemon=True).start()
             last_write = 0.0
             with open(logs / f"{v['name']}.log", "w") as lf:
                 for line in proc.stdout:
                     lf.write(line)
                     m = STEP.search(line)
                     if m:
-                        step, total, rate = int(m[1]), int(m[2]), float(m[3])
-                        rec.update(step=step, total=total,
-                                   eta=time.time() + (total - step) / rate if rate else None)
+                        step, tot, rate = int(m[1]), int(m[2]), float(m[3])
+                        rec.update(step=step, total=tot, eta=time.time() + (tot - step) / rate if rate else None)
                     m = RESULT.search(line)
                     if m:
                         rec.update(psnr=float(m[1]), ssim=float(m[2]),
@@ -127,12 +219,18 @@ def main(plan_path):
                         batch.write()
                         last_write = time.time()
             proc.wait()
+            done.set()
             rec["finished"] = time.time()
+            rec["seconds"] = round(rec["finished"] - rec["began"])
             if proc.returncode:
                 tail = (logs / f"{v['name']}.log").read_text(errors="replace").strip().splitlines()
                 rec.update(state="failed", error=(tail[-1] if tail else f"exit {proc.returncode}")[:160])
             else:
                 rec["state"] = "done"
+                if runner.program == "brush":
+                    rec.update(step=rec.get("total"), splats=runner.final_splats(out, rec.get("total")))
+            print(f"    {rec['state']} in {rec['seconds']} s" + (f", {rec['splats']:,} splats" if rec.get("splats") else ""),
+                  flush=True)
             batch.write()
     except KeyboardInterrupt:
         for rec in batch.data["variants"]:
