@@ -20,6 +20,12 @@ them --eval-every; the card then shows the splat count of the final export.
 
 A variant waits while the queue is processing a capture on that machine. Logs go to
 $GAUSSQUEUE_HOME/experiments/<batch>/<variant>.log. Ctrl-C stops the running variant.
+
+Each finished variant's final export is brought to this Mac and published to the outbox as
+exp-<batch>-<variant>/ (.ply and .v3.spz, flipped right way up like queue results), so the
+dashboard's card offers download buttons for it.
+
+  python3 tools/experiments.py --publish <batch json>   publish the variants of a finished batch
 """
 import json
 import os
@@ -46,7 +52,7 @@ class Batch:
         self.lock = threading.Lock()
         BATCHES.mkdir(parents=True, exist_ok=True)
         self.path = BATCHES / f"{time.strftime('%Y%m%d-%H%M%S')}-{slug(plan.get('name', 'batch'))}.json"
-        self.data = {"name": plan.get("name", "Experiments"), "worker": worker_name,
+        self.data = {"name": plan.get("name", "Experiments"), "worker": worker_name, "out": plan.get("out"),
                      "program": plan.get("program", "gsplat"),
                      "note": plan.get("note"), "started": time.time(), "finished": None,
                      "variants": [{"name": v["name"], "state": "queued", "args": v.get("args", [])}
@@ -99,6 +105,48 @@ def ply_splats(path):
         return int(m.group(1)) if m else None
     except OSError:
         return None
+
+
+def expand(p):
+    return Path(os.path.expanduser(str(p)))
+
+
+def publish(cfg, runner_local, ssh, out, label):
+    """Fetch <out>'s newest export_<step>.ply and write outbox/<label>/<label>.ply + .v3.spz
+    (flipped). Returns [{"file", "size"}] or [] if there's nothing to publish."""
+    outbox = expand(cfg.get("outbox_dir") or APP_HOME / "outbox")
+    tool = expand(cfg.get("spz_native") or APP_HOME / "bin" / "gq_spz")
+    if runner_local:
+        exports = sorted(Path(out).glob("export_*.ply"), key=lambda p: int(re.sub(r"\D", "", p.stem) or 0))
+        if not exports:
+            return []
+        src, tmp = exports[-1], None
+    else:
+        win = str(out).replace("/", "\\")   # cmd's dir reads "/x" as a switch
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", ssh, f'dir /b "{win}\\export_*.ply"'],
+                           capture_output=True, text=True, timeout=60)
+        names = sorted((n.strip() for n in r.stdout.split() if n.strip().endswith(".ply")),
+                       key=lambda n: int(re.sub(r"\D", "", n) or 0))
+        if not names:
+            return []
+        tmp = APP_HOME / "tmp" / f"{label}.ply"
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", f"{ssh}:/{out}/{names[-1]}", str(tmp)],
+                           capture_output=True, text=True, timeout=3600)
+        if r.returncode:
+            return []
+        src = tmp
+    dest = outbox / label
+    dest.mkdir(parents=True, exist_ok=True)
+    files = []
+    for suffix, extra in ((".ply", []), (".v3.spz", ["--spz-version", "3"])):
+        f = dest / f"{label}{suffix}"
+        r = subprocess.run([str(tool), str(src), str(f), "--flip"] + extra, capture_output=True, text=True)
+        if r.returncode == 0 and f.exists():
+            files.append({"file": f.name, "size": f.stat().st_size})
+    if tmp:
+        tmp.unlink(missing_ok=True)
+    return files
 
 
 def arg_value(args, flag):
@@ -154,7 +202,7 @@ class Runner:
                 names = [p.name for p in Path(out).glob("eval_*")]
             else:
                 r = subprocess.run(["ssh", "-o", "BatchMode=yes", self.worker["ssh"],
-                                    f'dir /b /ad "{out}"'], capture_output=True, text=True, timeout=30)
+                                    f'dir /b /ad "{str(out).replace("/", chr(92))}"'], capture_output=True, text=True, timeout=30)
                 names = r.stdout.split()
         except Exception:
             return None
@@ -229,6 +277,12 @@ def main(plan_path):
                 rec["state"] = "done"
                 if runner.program == "brush":
                     rec.update(step=rec.get("total"), splats=runner.final_splats(out, rec.get("total")))
+                label = f"exp-{slug(plan.get('name', 'batch'))[:40]}-{slug(v['name'])}"
+                try:
+                    rec["downloads"] = publish(cfg, runner.local, runner.worker.get("ssh"), out, label)
+                    rec["result"] = label if rec["downloads"] else None
+                except Exception as e:
+                    print(f"    publishing {v['name']} failed: {e}", flush=True)
             print(f"    {rec['state']} in {rec['seconds']} s" + (f", {rec['splats']:,} splats" if rec.get("splats") else ""),
                   flush=True)
             batch.write()
@@ -243,7 +297,33 @@ def main(plan_path):
         print("=== all done", flush=True)
 
 
+def publish_batch(path):
+    """Publish the finished variants of an existing batch file (and record the downloads)."""
+    path = Path(path)
+    data = json.loads(path.read_text())
+    cfg = json.loads((APP_HOME / "config.json").read_text())
+    plan = data.get("plan") or {}
+    local = data.get("worker") == "mac"
+    ssh = None if local else next(w["ssh"] for w in cfg.get("workers", []) if w.get("name") == data["worker"])
+    out_root = data.get("out") or plan.get("out")
+    if not out_root:
+        sys.exit("this batch file doesn't record its output folder")
+    for rec in data["variants"]:
+        if rec.get("state") != "done" or rec.get("downloads"):
+            continue
+        label = f"exp-{slug(data.get('name', 'batch'))[:40]}-{slug(rec['name'])}"
+        rec["downloads"] = publish(cfg, local, ssh, f"{out_root}/{rec['name']}", label)
+        rec["result"] = label if rec["downloads"] else None
+        print(f"{rec['name']}: {', '.join(d['file'] for d in rec['downloads']) or 'nothing to publish'}", flush=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=1))
+        tmp.replace(path)
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    if len(sys.argv) == 3 and sys.argv[1] == "--publish":
+        publish_batch(sys.argv[2])
+    elif len(sys.argv) == 2:
+        main(sys.argv[1])
+    else:
         sys.exit(__doc__)
-    main(sys.argv[1])

@@ -314,7 +314,7 @@ function experimentsPanel(e) {
       : v.state === "waiting" ? `waiting: ${esc(v.waiting || "")}` : "queued";
     const pct = v.state === "done" ? 100 : v.step && v.total ? Math.min(100, 100 * v.step / v.total) : 0;
     return `<div class="exp-row s-${esc(v.state)}"><span class="exp-name" title="${esc((v.args || []).join(" "))}">${esc(v.name)}</span>
-      <span class="exp-bar"><span style="width:${pct.toFixed(1)}%"></span></span><span class="exp-state">${st}</span></div>`;
+      <span class="exp-bar"><span style="width:${pct.toFixed(1)}%"></span></span><span class="exp-state">${st}${dlButtons(v.result, v.downloads)}</span></div>`;
   };
   const state = e.live ? (e.eta ? `done ~${clock(e.eta)}` : "running") : e.finished ? `finished ${clock(e.finished)}` : "stopped";
   return `<div class="panel exp"><div class="info">
