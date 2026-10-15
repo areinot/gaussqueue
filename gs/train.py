@@ -44,7 +44,9 @@ def parse(argv=None):
     p.add_argument("--steps", type=int, default=30000)
     p.add_argument("--max-res", type=int, default=1920)
     p.add_argument("--sh-degree", type=int, default=3)
-    p.add_argument("--strategy", choices=["default", "absgrad", "mcmc", "none"], default="mcmc")
+    p.add_argument("--strategy", choices=["default", "absgrad", "mcmc", "hybrid", "none"], default="mcmc",
+                   help="hybrid: MCMC that clones where absgrad's texture signal is strongest (hybrid.py)")
+    p.add_argument("--hybrid-power", type=float, default=1.0, help="hybrid: weight of the absgrad signal")
     p.add_argument("--max-splats", type=int, default=3_000_000)
     p.add_argument("--depth-dir")
     p.add_argument("--eval-depth-dir", help="depth maps for scoring held-out photos (default: --depth-dir)")
@@ -444,7 +446,7 @@ def train(a, splats=None, log=print):
         else:
             log(f"first {a.first_until:.0%} of training on {int(first.sum())} photos only")
 
-    mcmc = a.strategy == "mcmc"
+    mcmc = a.strategy in ("mcmc", "hybrid")
     if splats is None and a.init_ply:
         splats = gsdata.load_ply(a.init_ply)
     if splats is None:
@@ -475,7 +477,12 @@ def train(a, splats=None, log=print):
     def means_lr(step):   # exponential decay to lr_final over `decay` steps, then held
         return means_lr0 * a.lr_final ** (min(step, decay) / max(decay, 1))
 
-    if mcmc:
+    if a.strategy == "hybrid":
+        from hybrid import HybridStrategy
+        strategy = HybridStrategy(power=a.hybrid_power, cap_max=a.max_splats,
+                                  refine_stop_iter=a.refine_stop or int(a.steps * 0.85))
+        state = strategy.initialize_state()
+    elif mcmc:
         strategy = MCMCStrategy(cap_max=a.max_splats, refine_stop_iter=a.refine_stop or int(a.steps * 0.85))
         state = strategy.initialize_state()
     elif not fine_tune:
@@ -509,7 +516,7 @@ def train(a, splats=None, log=print):
         deg = sh_degree if fine_tune else min(sh_degree, (step - 1) // 1000)
         vmi = pose.viewmat(tv.viewmats[i], i) if pose is not None else None
         rgb_r, depth, alpha, meta, ex = render(params, tv, i, deg, a.mode, a.antialiased,
-                                               absgrad=a.strategy == "absgrad", packed=packed, viewmat=vmi)
+                                               absgrad=a.strategy in ("absgrad", "hybrid"), packed=packed, viewmat=vmi)
         gt = tv.image(i)
         if strategy:
             strategy.step_pre_backward(params, opts, state, step, meta)

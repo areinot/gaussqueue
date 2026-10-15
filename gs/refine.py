@@ -30,6 +30,7 @@ import argparse
 import json
 import math
 import re
+import shlex
 import shutil
 import sqlite3
 import struct
@@ -169,7 +170,8 @@ def calibrate_lens(colmap, ba, work, log, focal_blend=1.0):
     return out_, [float(x) for x in dist], clamped, mean_reprojection(colmap, ba), mean_reprojection(colmap, out_)
 
 
-def refine(colmap, images, src, work, out, gpu=False, lens=False, focal_blend=1.0):
+def refine(colmap, images, src, work, out, gpu=False, lens=False, focal_blend=1.0,
+           matcher="auto", max_image_size=1600, extract_args=(), match_args=()):
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
     out.mkdir(parents=True, exist_ok=True)
@@ -192,7 +194,7 @@ def refine(colmap, images, src, work, out, gpu=False, lens=False, focal_blend=1.
                  "--ImageReader.camera_params", params])
     run([colmap, "feature_extractor", "--database_path", db, "--image_path", images, *cam_args,
          "--FeatureExtraction.use_gpu", use_gpu,
-         "--FeatureExtraction.max_image_size", 1600, "--log_target", "stderr"], log)
+         "--FeatureExtraction.max_image_size", max_image_size, *extract_args, "--log_target", "stderr"], log)
 
     con = sqlite3.connect(db)
     ids = {nm: (iid, cid) for iid, nm, cid in con.execute("select image_id, name, camera_id from images")}
@@ -210,10 +212,10 @@ def refine(colmap, images, src, work, out, gpu=False, lens=False, focal_blend=1.
     frames = {d: (f, r) for f, r, d in con.execute(
         "select f.frame_id, f.rig_id, d.data_id from frames f join frame_data d on f.frame_id = d.frame_id")}
     phase("matching")
-    if n <= 120:
+    if matcher == "exhaustive" or (matcher == "auto" and n <= 120):
         con.close()
         run([colmap, "exhaustive_matcher", "--database_path", db,
-             "--FeatureMatching.use_gpu", use_gpu, "--log_target", "stderr"], log)
+             "--FeatureMatching.use_gpu", use_gpu, *match_args, "--log_target", "stderr"], log)
     else:  # match each photo with its spatial neighbours, using the known positions
         cov = struct.pack("<9d", 0.04, 0, 0, 0, 0.04, 0, 0, 0, 0.04)
         for nm, (_, _, c) in orig.items():
@@ -225,7 +227,7 @@ def refine(colmap, images, src, work, out, gpu=False, lens=False, focal_blend=1.
         con.close()
         run([colmap, "spatial_matcher", "--database_path", db, "--FeatureMatching.use_gpu", use_gpu,
              "--SpatialMatching.ignore_z", 0, "--SpatialMatching.max_num_neighbors", 30,
-             "--SpatialMatching.max_distance", 10, "--log_target", "stderr"], log)
+             "--SpatialMatching.max_distance", 10, *match_args, "--log_target", "stderr"], log)
 
     # Known-pose model with the database's ids (COLMAP 4 also wants rigs + frames).
     known = work / "known"
@@ -335,11 +337,18 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--gpu", action="store_true", help="SIFT extraction and matching on the GPU (CUDA)")
     p.add_argument("--lens", action="store_true", help="also calibrate the lens (distortion + per-photo focal)")
+    p.add_argument("--matcher", choices=["auto", "exhaustive", "spatial"], default="auto",
+                   help="auto: exhaustive up to 120 photos, else spatial (neighbours from the known positions)")
+    p.add_argument("--max-image-size", type=int, default=1600, help="feature extraction resolution")
+    p.add_argument("--extract-args", default="", help='extra feature_extractor options, one quoted string '
+                                                      '(--extract-args="--SiftExtraction.max_num_features 16384")')
+    p.add_argument("--match-args", default="", help="extra matcher options, one quoted string")
     p.add_argument("--focal-blend", type=float, default=1.0,
                    help="with --lens: how much of each photo's own focal to keep (0 = one shared focal, 1 = own)")
     a = p.parse_args(argv)
     try:
-        stats = refine(a.colmap, Path(a.images), Path(a.model), Path(a.work), Path(a.out), a.gpu, a.lens, a.focal_blend)
+        stats = refine(a.colmap, Path(a.images), Path(a.model), Path(a.work), Path(a.out), a.gpu, a.lens,
+                       a.focal_blend, a.matcher, a.max_image_size, shlex.split(a.extract_args), shlex.split(a.match_args))
         print(json.dumps(stats), flush=True)
     except Exception as e:
         print(f"error: {e}", flush=True)

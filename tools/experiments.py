@@ -11,7 +11,7 @@ plan.json:
    "out": "D:/experiments/round2",          each variant writes to <out>/<variant name>
    "script": "train.py",                    gsplat: in the gs scripts folder (default train.py)
    "common": ["<data dir>", "--steps", "15000", ...],
-   "variants": [{"name": "A", "args": ["--depth-weight", "0.3"]}, ...],
+   "variants": [{"name": "A", "desc": "depth on", "args": ["--depth-weight", "0.3"]}, ...],
    "note": "optional line for the card"}
 
 gsplat runs report steps and held-out scores from train.py's output. Brush runs (Brush is
@@ -55,7 +55,7 @@ class Batch:
         self.data = {"name": plan.get("name", "Experiments"), "worker": worker_name, "out": plan.get("out"),
                      "program": plan.get("program", "gsplat"),
                      "note": plan.get("note"), "started": time.time(), "finished": None,
-                     "variants": [{"name": v["name"], "state": "queued", "args": v.get("args", [])}
+                     "variants": [{"name": v["name"], "desc": v.get("desc"), "state": "queued", "args": v.get("args", [])}
                                   for v in plan["variants"]]}
         self.write()
 

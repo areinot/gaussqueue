@@ -58,8 +58,10 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .meta { font-size: 12px; color: var(--muted); }
 .exp { margin-top: 14px; }
 .exp-rows { display: flex; flex-direction: column; gap: 6px; }
-.exp-row { display: grid; grid-template-columns: minmax(90px, 160px) 90px 1fr; gap: 10px; align-items: center; font-size: 13px; }
+.exp-row { display: grid; grid-template-columns: minmax(120px, 230px) 90px 1fr; gap: 10px; align-items: center; font-size: 13px; }
 .exp-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.exp-desc { display: block; font-weight: 400; font-size: 11.5px; color: var(--muted); white-space: normal; }
+.exp-row { align-items: start; }
 .exp-bar { height: 6px; background: var(--track); border-radius: 3px; overflow: hidden; }
 .exp-bar > span { display: block; height: 100%; background: var(--accent); }
 .exp-row.s-done .exp-bar > span { background: var(--ok); } .exp-row.s-failed { color: var(--bad); }
@@ -313,7 +315,7 @@ function experimentsPanel(e) {
       : v.state === "failed" ? `failed${v.error ? ": " + esc(v.error) : ""}`
       : v.state === "waiting" ? `waiting: ${esc(v.waiting || "")}` : "queued";
     const pct = v.state === "done" ? 100 : v.step && v.total ? Math.min(100, 100 * v.step / v.total) : 0;
-    return `<div class="exp-row s-${esc(v.state)}"><span class="exp-name" title="${esc((v.args || []).join(" "))}">${esc(v.name)}</span>
+    return `<div class="exp-row s-${esc(v.state)}"><span class="exp-name" title="${esc((v.args || []).join(" "))}">${esc(v.name)}${v.desc ? `<span class="exp-desc">${esc(v.desc)}</span>` : ""}</span>
       <span class="exp-bar"><span style="width:${pct.toFixed(1)}%"></span></span><span class="exp-state">${st}${dlButtons(v.result, v.downloads)}</span></div>`;
   };
   const state = e.live ? (e.eta ? `done ~${clock(e.eta)}` : "running") : e.finished ? `finished ${clock(e.finished)}` : "stopped";
