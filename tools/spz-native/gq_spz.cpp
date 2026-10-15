@@ -2,7 +2,7 @@
 // reference library, natively, so there's no WebAssembly memory ceiling.
 //
 //   gq_spz <in.ply> <out.spz|out.ply> [--spz-version 3|4] [--flip]
-//          [--origin X Y Z] [--yaw DEGREES]
+//          [--origin X Y Z] [--yaw DEGREES] [--keep FRACTION]
 //
 // The output format follows the extension: .spz is packed SPZ, .ply is a float PLY.
 // --spz-version 3  classic gzip-wrapped SPZ (what most apps read); 4 = zstd (library default)
@@ -10,7 +10,12 @@
 //                  are +Y-up (SplatKing/COLMAP) are the right way up in -Y-up viewers.
 // --origin X Y Z   then move the point (X, Y, Z) to the origin (coordinates after --flip)
 // --yaw DEGREES    then rotate about the Y (up) axis, including spherical harmonics
+// --keep FRACTION keep only this fraction of the splats, the most important first: opacity
+//                  times (volume / 90th-percentile volume, capped at 1)^0.1. That's LightGaussian's
+//                  score without the per-view hit counts, so it needs no photos or GPU
+//                  (a quick prune for mid-training snapshots; the real pruning stage is gs/prune.py)
 // --self-test      check the spherical-harmonics rotation against the library's exact flip
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -161,18 +166,64 @@ int selfTest() {
   return (err < 1e-4 && err2 < 1e-4) ? 0 : 1;
 }
 
+// Keep the `keep` fraction of splats with the highest opacity * normalized-volume^0.1.
+void prune(spz::GaussianCloud &c, double keep) {
+  const int n = c.numPoints;
+  const int target = std::max(1, static_cast<int>(std::lround(n * keep)));
+  if (target >= n) return;
+  std::vector<float> vol(n), score(n);
+  for (int i = 0; i < n; ++i)
+    vol[i] = std::exp(c.scales[3 * i] + c.scales[3 * i + 1] + c.scales[3 * i + 2]);
+  std::vector<float> tmp(vol);
+  auto p90 = tmp.begin() + static_cast<long>(0.9 * (n - 1));
+  std::nth_element(tmp.begin(), p90, tmp.end());
+  const double ref = std::max(*p90, 1e-30f);
+  for (int i = 0; i < n; ++i) {
+    const double opacity = 1.0 / (1.0 + std::exp(-c.alphas[i]));
+    score[i] = static_cast<float>(opacity * std::pow(std::min(vol[i] / ref, 1.0), 0.1));
+  }
+  tmp = score;
+  auto cut = tmp.begin() + (n - target);
+  std::nth_element(tmp.begin(), cut, tmp.end());
+  const float threshold = *cut;
+  int above = 0;
+  for (float s : score) above += s > threshold;
+  int ties = target - above;   // splats exactly at the threshold, to fill up to target
+  const int shPer = static_cast<int>(c.sh.size() / n);
+  int j = 0;
+  for (int i = 0; i < n; ++i) {
+    if (!(score[i] > threshold || (score[i] == threshold && ties-- > 0))) continue;
+    for (int k = 0; k < 3; ++k) {
+      c.positions[3 * j + k] = c.positions[3 * i + k];
+      c.scales[3 * j + k] = c.scales[3 * i + k];
+      c.colors[3 * j + k] = c.colors[3 * i + k];
+    }
+    for (int k = 0; k < 4; ++k) c.rotations[4 * j + k] = c.rotations[4 * i + k];
+    c.alphas[j] = c.alphas[i];
+    std::copy_n(c.sh.begin() + static_cast<long>(i) * shPer, shPer, c.sh.begin() + static_cast<long>(j) * shPer);
+    ++j;
+  }
+  c.numPoints = j;
+  c.positions.resize(3 * j);
+  c.scales.resize(3 * j);
+  c.colors.resize(3 * j);
+  c.rotations.resize(4 * j);
+  c.alphas.resize(j);
+  c.sh.resize(static_cast<size_t>(j) * shPer);
+}
+
 }  // namespace
 
 int main(int argc, char *argv[]) {
   if (argc >= 2 && std::strcmp(argv[1], "--self-test") == 0) return selfTest();
   if (argc < 3) {
     std::cerr << "usage: gq_spz <in.ply> <out.spz|out.ply> [--spz-version 3|4] [--flip] "
-                 "[--origin X Y Z] [--yaw DEGREES]\n";
+                 "[--origin X Y Z] [--yaw DEGREES] [--keep FRACTION]\n";
     return 2;
   }
   int version = 3;
   bool flip = false, move = false;
-  double origin[3] = {0, 0, 0}, yaw = 0;
+  double origin[3] = {0, 0, 0}, yaw = 0, keep = 1;
   for (int i = 3; i < argc; ++i) {
     if (std::strcmp(argv[i], "--flip") == 0) {
       flip = true;
@@ -184,10 +235,16 @@ int main(int argc, char *argv[]) {
     } else if (std::strcmp(argv[i], "--yaw") == 0 && i + 1 < argc) {
       yaw = std::atof(argv[++i]);
       move = true;
+    } else if (std::strcmp(argv[i], "--keep") == 0 && i + 1 < argc) {
+      keep = std::atof(argv[++i]);
     } else {
       std::cerr << "unknown option: " << argv[i] << "\n";
       return 2;
     }
+  }
+  if (!(keep > 0 && keep <= 1)) {
+    std::cerr << "--keep must be a fraction in (0, 1]\n";
+    return 2;
   }
   if (version != 3 && version != 4) {
     std::cerr << "--spz-version must be 3 or 4\n";
@@ -200,6 +257,8 @@ int main(int argc, char *argv[]) {
       std::cerr << "no splats in " << argv[1] << "\n";
       return 1;
     }
+    const int before = cloud.numPoints;
+    if (keep < 1) prune(cloud, keep);
     if (flip) cloud.rotate180DegAboutX();
     if (move) transform(cloud, origin, yaw);
     spz::PackOptions pack;
@@ -213,6 +272,7 @@ int main(int argc, char *argv[]) {
     }
     std::cout << cloud.numPoints << " splats, SH degree " << cloud.shDegree
               << (to_ply ? std::string(", PLY") : ", SPZ v" + std::to_string(version))
+              << (keep < 1 ? ", pruned from " + std::to_string(before) : std::string())
               << (flip ? ", flipped" : "") << (move ? ", start view applied" : "") << "\n";
     return 0;
   } catch (const std::exception &e) {

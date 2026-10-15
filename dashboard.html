@@ -485,7 +485,7 @@ const HELP = {
     opts: {1: "On: correct geometry (held-out depth error about 2% instead of 40%), fewer floaters.", 0: "Off: geometry only has to look right from the photos."}},
   flatten: {name: "Flatten splats", what: "Pushes each splat's thinnest axis toward zero so splats lie flat on surfaces.",
     opts: {1: "On: crisper walls, ground and stone; slightly less fine texture.", 0: "Off: splats keep any shape."}},
-  prune_pct: {name: "Prune", what: "After training, removes the splats that matter least to the photos, then fine-tunes the rest for 3,000 steps. Runs on the PC; the unpruned result is kept.",
+  prune_pct: {name: "Prune", what: "After training, removes the splats that matter least to the photos, then fine-tunes the rest for 3,000 steps. Runs on the PC; the unpruned result is kept. Snapshots get a quick prune instead (by opacity and size, no fine-tuning), since the GPU is busy training.",
     val: (v) => +v ? `Removes ${v}%: keeps ${100 - v}% of the splats. In tests even 90% kept the same score; the finest texture goes first.` : "Off: keeps every splat."},
   flip_up: {name: "Flip vertical", what: "Turns the result 180° so it's the right way up in viewers that expect -Y up. Output only; never restarts training.",
     opts: {1: "On: right way up in SuperSplat and most viewers.", 0: "Off: kept in SplatKing's +Y-up orientation."}},

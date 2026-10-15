@@ -1601,14 +1601,19 @@ def trainable_model(job_dir):
         return None
 
 
-def orient_ply(cfg, src, dst, flip, view, beat=lambda: None):
-    """Write src to dst flipped and/or moved to the start view (one native pass). Returns
+def orient_ply(cfg, src, dst, flip, view, beat=lambda: None, keep=1.0):
+    """Write src to dst flipped and/or moved to the start view (one native pass), optionally
+    keeping only the `keep` fraction of most important splats (a quick prune, no GPU). Returns
     None or a short error. Without gq_spz, only the flip is possible (SplatTransform)."""
     if native_spz(cfg):
         args = [src, dst] + (["--flip"] if flip else [])
         if view:
             args += ["--origin", *view[1], "--yaw", view[2]]
+        if keep < 1:
+            args += ["--keep", round(keep, 4)]
         return run_native(cfg, args, dst, beat)
+    if keep < 1:
+        return "quick pruning needs gq_spz (scripts/install.sh builds it)"
     if view:
         return "start view needs gq_spz (scripts/install.sh builds it)"
     return splat_transform(cfg, [src, "-r", FLIP, "-N", dst], dst, beat)
@@ -2527,8 +2532,19 @@ class Snapshots:
             flip = bool(snap["settings"].get("flip_up"))
             model = trainable_model(self.paths.jobs / snap["name"]) if snap["settings"].get("start_view") else None
             view = start_view_pose(model, flip, cfg.get("start_view_forward", "+z")) if model else None
+            # Pruning without fine-tuning: the GPU is busy training, so score splats by opacity
+            # and size only (gq_spz --keep) instead of running the full pruning stage.
+            pct = int(snap["settings"].get("prune_pct") or 0)
+            keep = 1 - pct / 100 if 0 < pct < 100 else 1.0
             ply, errors = src, []
-            if flip or view:
+            if keep < 1:
+                err = orient_ply(cfg, src, work / f"{label}.ply", flip, view, keep=keep)
+                if err:
+                    errors.append(f"prune: {err}")
+                    keep = 1.0
+                else:
+                    ply = work / f"{label}.ply"
+            if keep == 1 and (flip or view):
                 err = orient_ply(cfg, src, work / f"{label}.ply", flip, view)
                 if err and view:
                     errors.append(f"start view: {err}")
@@ -2558,10 +2574,12 @@ class Snapshots:
                                      "forward": cfg.get("start_view_forward", "+z")}
             write_meta(dest, job, files, flip)
             meta = json.loads((dest / "meta.json").read_text())
-            meta["snapshot"] = {"of": snap["name"], "step": snap["step"], "total_steps": snap["total"]}
+            meta["snapshot"] = {"of": snap["name"], "step": snap["step"], "total_steps": snap["total"],
+                                "quick_prune_pct": pct if keep < 1 else 0}
             (dest / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
             share_result(cfg, dest)
             detail = (f"step {snap['step']:,}/{(snap['total'] or 0):,} · "
+                      + (f"quick-pruned {pct}% · " if keep < 1 else "")
                       + f"{files['ply'] / 1e6:.0f} MB ply" + "".join(f" · {b / 1e6:.0f} MB {f}" for f, b in sizes.items())
                       + (f"  ({'; '.join(errors)})" if errors else ""))
             record(self.state, job, "snapshot", fmt_dur(time.time() - t0), detail)
