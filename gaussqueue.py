@@ -72,6 +72,9 @@ DEFAULTS = {
     # along start_view_forward, the viewer's default forward ("-z": OpenGL-style viewers, which
     # look down -Z from the origin; "+z" for viewers that look down +Z). Output-only, per capture.
     "start_view": True,
+    # iMessage updates (received, progress, done) for each capture: the default for new
+    # captures; each one can be switched on or off from its card, even while it runs.
+    "notify": False,
     "start_view_forward": "-z",
     # Refine the capture's camera poses with COLMAP (features, matching, bundle
     # adjustment) before training. Slower, usually sharper. Needs `colmap` on PATH.
@@ -150,11 +153,11 @@ DEFAULTS = {
 TRAIN_KEYS = ("total_steps", "max_resolution", "sh_degree", "max_splats", "subsample_frames")
 GSPLAT_KEYS = ("trainer", "densify", "depth_supervision", "flatten")
 RESTART_KEYS = TRAIN_KEYS + ("refine_poses",) + GSPLAT_KEYS   # changing these restarts training
-OUTPUT_KEYS = ("flip_up", "start_view", "prune_pct", "spz_v3", "spz_v4")   # only affect the output files
+OUTPUT_KEYS = ("flip_up", "start_view", "prune_pct", "spz_v3", "spz_v4", "notify")   # only affect the output files
 SETTING_KEYS = RESTART_KEYS + OUTPUT_KEYS
 SETTING_LIMITS = {"total_steps": (500, 100_000), "max_resolution": (256, 4096),
                   "sh_degree": (0, 4), "max_splats": (50_000, 20_000_000),
-                  "subsample_frames": (1, 20), "flip_up": (0, 1), "refine_poses": (0, 1),
+                  "subsample_frames": (1, 20), "flip_up": (0, 1), "refine_poses": (0, 1), "notify": (0, 1),
                   "depth_supervision": (0, 1), "flatten": (0, 1), "prune_pct": (0, 95),
                   "start_view": (0, 1), "spz_v3": (0, 1), "spz_v4": (0, 1)}
 SETTING_CHOICES = {"trainer": ("brush", "gsplat"), "densify": ("mcmc", "default", "absgrad")}
@@ -181,6 +184,7 @@ def effective_settings(cfg, ov):
     out = dict(base)
     out["flip_up"] = int(bool(cfg.get("flip_up")))
     out["start_view"] = int(bool(cfg.get("start_view", True)))
+    out["notify"] = int(bool(cfg.get("notify", False)))
     for v in (3, 4):
         out[f"spz_v{v}"] = int(v in (cfg.get("spz_versions") or []))
     out["refine_poses"] = int(bool(cfg.get("refine_poses")))
@@ -1609,9 +1613,10 @@ def train(cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
                     notified.update(crossed)  # one text even if several were passed
                     img = paths.attach / job["preview"]
                     shutil.copyfile(paths.previews / job["preview"], img)
-                    imessage(cfg, f"🟡 {job['name']}: {100 * step // total}% "
-                                  f"({step:,}/{total:,} steps), "
-                                  f"ETA ~{dt.datetime.fromtimestamp(job['eta']):%H:%M}", img)
+                    if pending_settings().get("notify"):
+                        imessage(cfg, f"🟡 {job['name']}: {100 * step // total}% "
+                                      f"({step:,}/{total:,} steps), "
+                                      f"ETA ~{dt.datetime.fromtimestamp(job['eta']):%H:%M}", img)
             beat()
     finally:
         if proc.poll() is None:
@@ -2216,9 +2221,10 @@ class RemoteWorker:
                 notified.update(crossed)
                 img = paths.attach / job["preview"]
                 shutil.copyfile(paths.previews / job["preview"], img)
-                imessage(cfg, f"🟡 {name} on {self.label}: {100 * step // total}% "
-                              f"({step:,}/{total:,} steps), "
-                              f"ETA ~{dt.datetime.fromtimestamp(job['eta']):%H:%M}", img)
+                if pending_settings().get("notify"):
+                    imessage(cfg, f"🟡 {name} on {self.label}: {100 * step // total}% "
+                                  f"({step:,}/{total:,} steps), "
+                                  f"ETA ~{dt.datetime.fromtimestamp(job['eta']):%H:%M}", img)
 
         job.update(paused=False, paused_at=None, request=None)
         try:
@@ -2387,8 +2393,11 @@ def process(cfg, paths, state, status, item, beat, worker=None):
     status.jobs[worker.name] = job
     beat(force=True)
     t0 = time.time()
-    imessage(cfg, f"📥 {name}: received, starting"
-                  + (f". {quality_text(item.quality)}" if item.quality else ""))
+
+    def say(text, image=None):   # only if this capture's iMessage box is ticked (checked when sending)
+        if effective_settings(load_config(), status.overrides.get(name)).get("notify"):
+            imessage(cfg, text, image)
+    say(f"📥 {name}: received, starting" + (f". {quality_text(item.quality)}" if item.quality else ""))
     try:
         local_zip = fetch_local(item, job_dir, beat)
         if local_zip:
@@ -2437,7 +2446,7 @@ def process(cfg, paths, state, status, item, beat, worker=None):
                 old.unlink()
             job.pop("preview", None)
             job["settings"] = pending()
-            imessage(cfg, f"🔁 {name}: restarting with new settings "
+            say(f"🔁 {name}: restarting with new settings "
                           f"({settings_summary(job['settings'])})")
 
         # Pruning and the output flip are read at the end, so they can change while training runs.
@@ -2530,7 +2539,7 @@ def process(cfg, paths, state, status, item, beat, worker=None):
         if job.get("preview"):
             img = paths.attach / job["preview"]
             shutil.copyfile(paths.previews / job["preview"], img)
-        imessage(cfg, f"✅ {name}: done in {dur} on {worker.label}. In the outbox: {files}"
+        say(f"✅ {name}: done in {dur} on {worker.label}. In the outbox: {files}"
                       + (f". Compression problem: {'; '.join(cerrors)}" if cerrors else ""), img)
     except Cancelled:
         dur = fmt_dur(time.time() - t0)
@@ -2538,7 +2547,7 @@ def process(cfg, paths, state, status, item, beat, worker=None):
         if item.path.exists():   # kept with the failed ones, so Recent can requeue it
             shutil.move(str(item.path), paths.failed / item.path.name)
         record(state, job, "cancelled", dur, f"cancelled while {job.get('phase') or 'starting'}")
-        imessage(cfg, f"⏹ {name}: cancelled after {dur}")
+        say(f"⏹ {name}: cancelled after {dur}")
     except Exception as e:
         if not item.path.exists():
             # Pulled out of the inbox (moved, renamed, re-zipped): not a failure.
@@ -2550,7 +2559,7 @@ def process(cfg, paths, state, status, item, beat, worker=None):
         if item.path.exists():
             shutil.move(str(item.path), paths.failed / item.path.name)
         record(state, job, "FAILED", dur, str(e)[:160])
-        imessage(cfg, f"❌ {name}: failed after {dur}: {e}")
+        say(f"❌ {name}: failed after {dur}: {e}")
     finally:
         try:
             worker.finish(name)
@@ -2849,7 +2858,10 @@ class Snapshots:
             if snap.get("preview") and (self.paths.previews / snap["preview"]).exists():
                 img = self.paths.attach / snap["preview"]
                 shutil.copyfile(self.paths.previews / snap["preview"], img)
-            imessage(cfg, f"📸 {label}: snapshot ready ({detail})", img)
+            live = self.status.job_for(snap["name"])
+            on = (effective_settings(cfg, self.status.overrides.get(snap["name"])) if live else snap["settings"]).get("notify")
+            if on:
+                imessage(cfg, f"📸 {label}: snapshot ready ({detail})", img)
         except Exception as e:
             log(f"snapshot failed: {label}: {e}\n{traceback.format_exc()}")
             with STATE_LOCK:

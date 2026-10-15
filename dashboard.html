@@ -339,7 +339,7 @@ function jobPanel(c) {
           ? `<span class="badge b-paused">paused</span>
              <button data-act="snapshot" title="Turn the latest checkpoint into a result you can open now (as <name>-step<N>).">Publish snapshot</button>`
           : `<button data-act="snapshot" title="Turn the latest checkpoint into a result you can open now (as <name>-step<N>). Training keeps going; processing waits until it can't slow the run.">Publish snapshot</button>
-             ${flipBox(pend && pend.flip_up)} ${startViewBox(pend && pend.start_view)} ${spzBoxes(pend)}`}
+             ${flipBox(pend && pend.flip_up)} ${startViewBox(pend && pend.start_view)} ${spzBoxes(pend)} ${notifyBox(pend && pend.notify)}`}
       </div>
       ${!c.paused && itemErrors[c.name] ? `<div class="serr">${esc(itemErrors[c.name])}</div>` : ""}
       ${(c.snapshots || []).length ? `<div class="snaps">${c.snapshots.map(sn => {
@@ -434,6 +434,12 @@ function flipBox(on) {
 function startViewBox(on) {
   return `<label class="flip" title="Move the result so its origin is where you took the first photo, turned (left/right only) to face that photo's direction. Viewers that start at the origin open on your first shot. Applied to the output files after training; never restarts training.">
     <input type="checkbox" data-set="start_view"${on ? " checked" : ""}> Start at first photo</label>`;
+}
+
+// iMessage updates for this capture (received, progress, done); checked when each message is sent.
+function notifyBox(on) {
+  return `<label class="flip" title="Send iMessage updates for this capture (received, progress, snapshots, done). Takes effect immediately, even while it trains.">
+    <input type="checkbox" data-set="notify"${on ? " checked" : ""}> iMessage</label>`;
 }
 
 // SPZ versions written (output-only): <name>.v3.spz and/or <name>.v4.spz.
@@ -550,6 +556,8 @@ const HELP = {
                   "": "None: only the .ply is written."})[v]},
   start_view: {name: "Start at first photo", what: "Moves the result so its origin is where you took the first photo, turned (left/right only) to face that photo's direction. Viewers that start at the origin open on your first shot. Output only.",
     opts: {1: "On: opens at your first photo, horizon level.", 0: "Off: original capture coordinates."}},
+  notify: {name: "iMessage", what: "Texts you when this capture is received, at progress checkpoints, for snapshots, and when it's done or fails. Can be switched any time, even while it trains.",
+    opts: {1: "On: updates for this capture.", 0: "Off: no messages for this capture."}},
 };
 
 function helpValue(key, st, it) {
@@ -683,6 +691,7 @@ function settingsHTML(it, isCurrent) {
         <div class="flipfield" data-help-key="flip_up">${flipBox(st.flip_up)}</div>
         <div class="flipfield" data-help-key="start_view">${startViewBox(st.start_view)}</div>
         <div class="flipfield" data-help-key="spz">${spzBoxes(st)}</div>
+        <div class="flipfield" data-help-key="notify">${notifyBox(st.notify)}</div>
       </div>
       <div class="actions">
         ${isCurrent ? "" : `<button data-act="run_next">Run next</button>

@@ -159,6 +159,10 @@ class DashboardAPITest(unittest.TestCase):
         try:
             self.assertEqual(self.post({"name": "capB", "action": "set", "key": "flip_up",
                                         "value": 1})[0], 200)
+            # iMessage is per capture, off by default, and switchable while it trains
+            self.assertEqual(self.gq.effective_settings(self.cfg, {})["notify"], 0)
+            self.assertEqual(self.post({"name": "capB", "action": "set", "key": "notify", "value": 1})[0], 200)
+            self.assertEqual(self.overrides.get("capB").get("notify"), 1)
             self.assertEqual(self.post({"name": "capB", "action": "set", "key": "sh_degree",
                                         "value": 1})[0], 400)
         finally:
