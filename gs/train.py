@@ -81,6 +81,11 @@ def parse(argv=None):
                    help="position learning rate at the end of the decay, as a fraction of the start")
     p.add_argument("--refine-stop", type=int, default=0,
                    help="stop densifying at this step (0 = 85%% of the run for MCMC, half for default/absgrad)")
+    p.add_argument("--pose-opt", action="store_true",
+                   help="fine-tune each training photo's camera pose (small shift + rotation) against "
+                        "the splats; the corrections are reported in metrics.json")
+    p.add_argument("--pose-lr", type=float, default=1e-5, help="--pose-opt learning rate")
+    p.add_argument("--pose-reg", type=float, default=1e-6, help="--pose-opt pull towards no correction")
     p.add_argument("--track-cameras", help="a COLMAP folder of extra cameras (e.g. novel angles) rendered "
                                            "at every --test-every step into <out>/track")
     p.add_argument("--holdout-every", type=int, default=0)
@@ -252,12 +257,39 @@ def shape_stats(params):
             "flat_pct": round(100 * float((s[:, 0] < 0.1 * s[:, 1]).float().mean()), 2)}
 
 
+def axis_angle_to_R(v):
+    """Rotation matrices [N,3,3] from axis-angle vectors [N,3] (Rodrigues), differentiable."""
+    th = v.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    k = v / th
+    K = torch.zeros(v.shape[0], 3, 3, device=v.device, dtype=v.dtype)
+    K[:, 0, 1], K[:, 0, 2], K[:, 1, 0] = -k[:, 2], k[:, 1], k[:, 2]
+    K[:, 1, 2], K[:, 2, 0], K[:, 2, 1] = -k[:, 0], -k[:, 1], k[:, 0]
+    s, c = torch.sin(th)[..., None], torch.cos(th)[..., None]
+    return torch.eye(3, device=v.device, dtype=v.dtype)[None] + s * K + (1 - c) * (K @ K)
+
+
+class PoseCorrection(torch.nn.Module):
+    """Per-photo correction applied in the camera's own frame: camera-to-world becomes
+    camera-to-world @ [R(rot) | shift]. Starts at zero."""
+
+    def __init__(self, n, dev):
+        super().__init__()
+        self.shift = torch.nn.Parameter(torch.zeros(n, 3, device=dev))
+        self.rot = torch.nn.Parameter(torch.zeros(n, 3, device=dev))
+
+    def viewmat(self, vm, i):
+        c2w = torch.linalg.inv(vm)
+        R = axis_angle_to_R(self.rot[i:i + 1])[0]
+        T = torch.cat([torch.cat([R, self.shift[i][:, None]], 1), torch.tensor([[0., 0, 0, 1]], device=vm.device)], 0)
+        return torch.linalg.inv(c2w @ T)
+
+
 def make_params(splats, device):
     return torch.nn.ParameterDict({k: torch.nn.Parameter(v.to(device).contiguous()) for k, v in splats.items()})
 
 
 def render(params, views, idx, sh_degree, mode="3dgs", antialiased=False, absgrad=False,
-           packed=True, colors=None, scales=None, means=None):
+           packed=True, colors=None, scales=None, means=None, viewmat=None):
     """Render view(s) idx -> (rgb [H,W,3], depth [H,W], alpha [H,W], meta, extras)."""
     w, h = views.size(idx)
     means = params["means"] if means is None else means
@@ -266,7 +298,7 @@ def render(params, views, idx, sh_degree, mode="3dgs", antialiased=False, absgra
     sh = colors is None
     if sh:
         colors = torch.cat([params["sh0"], params["shN"]], 1)
-    vm, K = views.viewmats[idx:idx + 1], views.K[idx:idx + 1]
+    vm, K = (views.viewmats[idx:idx + 1] if viewmat is None else viewmat[None]), views.K[idx:idx + 1]
     if mode == "2dgs":
         out, alpha, normals, surf_normals, distort, _median, meta = rasterization_2dgs(
             means, params["quats"], scales, opac, colors, vm, K, w, h,
@@ -435,6 +467,8 @@ def train(a, splats=None, log=print):
     lrs = {"means": a.means_lr * scene_scale, "scales": 5e-3, "quats": 1e-3, "opacities": 5e-2,
            "sh0": 2.5e-3, "shN": 2.5e-3 / 20}
     opts = {k: torch.optim.Adam([{"params": params[k], "lr": lr, "name": k}], eps=1e-15) for k, lr in lrs.items()}
+    pose = PoseCorrection(len(tv), dev) if a.pose_opt else None
+    pose_opt = torch.optim.Adam(pose.parameters(), lr=a.pose_lr, weight_decay=a.pose_reg) if pose else None
     decay = a.lr_decay_steps or a.steps
     means_lr0 = lrs["means"]
 
@@ -473,8 +507,9 @@ def train(a, splats=None, log=print):
         else:
             i = int(torch.randint(len(tv), (1,)))
         deg = sh_degree if fine_tune else min(sh_degree, (step - 1) // 1000)
+        vmi = pose.viewmat(tv.viewmats[i], i) if pose is not None else None
         rgb_r, depth, alpha, meta, ex = render(params, tv, i, deg, a.mode, a.antialiased,
-                                               absgrad=a.strategy == "absgrad", packed=packed)
+                                               absgrad=a.strategy == "absgrad", packed=packed, viewmat=vmi)
         gt = tv.image(i)
         if strategy:
             strategy.step_pre_backward(params, opts, state, step, meta)
@@ -517,6 +552,9 @@ def train(a, splats=None, log=print):
         for o in opts.values():
             o.step()
             o.zero_grad(set_to_none=True)
+        if pose_opt is not None:
+            pose_opt.step()
+            pose_opt.zero_grad(set_to_none=True)
         for g in opts["means"].param_groups:
             g["lr"] = means_lr(step)
         if mcmc:
@@ -573,7 +611,18 @@ def train(a, splats=None, log=print):
             inside = box.inside(params["means"])
             params = make_params({k: v[inside] for k, v in params.items()}, dev)
     gsdata.save_ply(out / f"export_{a.steps}.ply", dict(params))
+    pose_report = None
+    if pose is not None:   # how far each training photo's camera moved
+        with torch.no_grad():
+            sh_mm = (pose.shift.norm(dim=-1) * 1000).cpu().tolist()
+            rot_deg = (pose.rot.norm(dim=-1) * 180 / math.pi).cpu().tolist()
+        pose_report = [{"name": n, "shift_mm": round(s_, 2), "turn_deg": round(r_, 3)}
+                       for n, s_, r_ in zip(tv.names, sh_mm, rot_deg)]
+        ss = sorted(sh_mm)
+        log(f"pose corrections: median shift {ss[len(ss) // 2]:.1f} mm, max {ss[-1]:.1f} mm; "
+            f"median turn {sorted(rot_deg)[len(rot_deg) // 2]:.2f} deg, max {max(rot_deg):.2f} deg")
     metrics = {"steps": a.steps, "splats": len(params["means"]), "train_seconds": round(time.time() - t0, 1),
+               "pose_corrections": pose_report,
                "peak_gpu_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
                "carved": {"removed": carved[0], "shortened": carved[1]}, "left_box": boxed,
                "shapes": shape_stats(params),

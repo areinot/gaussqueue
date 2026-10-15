@@ -3,7 +3,7 @@
   python render.py <ply> <data> --out <dir> [--names file] [--save name ...] [--sh-degree 3]
 
 Scores every photo in <data> (or those listed in --names): PSNR/SSIM, over the box mask for
-box datasets. Writes <out>/views.json; --save also writes those renders as PNGs.
+box datasets. Writes <out>/views.json; --save also writes those renders as PNGs ("all" for every one).
 """
 import argparse
 import json
@@ -43,7 +43,7 @@ def main(argv=None):
                 m = v.masks[i] == 255 if v.masks[i] is not None else None
                 res.append({"name": v.names[i], "psnr": gsdata.psnr(rgb, gt, m),
                             "ssim": float(gsdata.ssim(rgb, gt, m))})
-                if Path(v.names[i]).stem in a.save or v.names[i] in a.save:
+                if "all" in a.save or Path(v.names[i]).stem in a.save or v.names[i] in a.save:
                     gsdata.save_png(out / (Path(v.names[i]).stem + ".png"), rgb)
         del v
         torch.cuda.empty_cache()
