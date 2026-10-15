@@ -322,9 +322,13 @@ class DashboardAPITest(unittest.TestCase):
             self.assertTrue(snap["jobs"][0]["remote"])
             self.assertFalse({"capA", "capB"} & {q["name"] for q in snap["queue"]})   # busy, not queued
             self.assertEqual({w["name"] for w in snap["workers"]}, {"pc", "mac"})
-            # Pause is refused on the remote machine, allowed on the Mac.
-            self.assertIn("remote", self.post({"name": "capA", "action": "pause"})[1])
+            # Pause works on both machines; Cancel is a request the job's thread acts on.
+            self.assertEqual(self.post({"name": "capA", "action": "pause"})[0], 200)
+            self.assertEqual(self.status.jobs["pc"]["request"], "pause")
             self.assertEqual(self.post({"name": "capB", "action": "pause"})[0], 200)
+            self.assertEqual(self.post({"name": "capA", "action": "cancel"})[0], 200)
+            self.assertEqual(self.status.jobs["pc"]["request"], "cancel")
+            self.assertEqual(self.post({"name": "capC", "action": "cancel"})[0], 400)   # not running
         finally:
             self.status.jobs = {}
             self.status.workers = {}

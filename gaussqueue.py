@@ -1073,8 +1073,6 @@ def start_dashboard(cfg, paths, status, overrides):
                     overrides.apply(name, body)
                     status.write(load_config())
                     return self.send(200, b'{"ok":true}', "application/json")
-                remote = bool(cur and status.workers.get(cur.get("worker"))
-                              and status.workers[cur.get("worker")].remote)
                 if cur:
                     if action == "snapshot":
                         if cur.get("phase") not in ("training", "paused"):
@@ -1082,9 +1080,10 @@ def start_dashboard(cfg, paths, status, overrides):
                         step = status.snapshots.request(cur)
                         return self.send(200, json.dumps({"ok": True, "step": step}).encode(),
                                          "application/json")
+                    if action == "cancel":
+                        cur["request"] = "cancel"
+                        return self.send(200, b'{"ok":true}', "application/json")
                     if action in ("pause", "resume"):
-                        if remote:
-                            raise ValueError("pause isn't available on remote machines yet")
                         if cur.get("phase") not in ("training", "paused"):
                             raise ValueError("can only pause while training")
                         if action == "resume" and not cur.get("paused"):
@@ -1096,7 +1095,7 @@ def start_dashboard(cfg, paths, status, overrides):
                     output_only = action == "set" and body.get("key") in OUTPUT_KEYS
                     if not cur.get("paused") and not output_only:
                         raise ValueError("pause training before changing its settings")
-                elif action in ("pause", "resume", "snapshot"):
+                elif action in ("pause", "resume", "snapshot", "cancel"):
                     raise ValueError("only the running capture can be paused or snapshotted")
                 overrides.apply(name, body)
                 status.write(load_config())
@@ -1369,6 +1368,15 @@ def refine_locally(cfg, colmap_dir, work, out, beat, job):
 RESTART = object()  # train() result: settings changed while paused, run again
 
 
+class Restart(Exception):
+    """A remote run stopped to restart with settings changed while it was paused."""
+
+
+class Cancelled(BaseException):
+    """The dashboard's Cancel: unwinds a job from wherever it is (a BaseException, so the
+    "skip this optional step" handlers along the way don't swallow it)."""
+
+
 def same_settings(a, b):
     return all(a.get(k) == b.get(k) for k in RESTART_KEYS)
 
@@ -1413,6 +1421,8 @@ def train(cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
         while proc.poll() is None:
             time.sleep(1)
             req, job["request"] = job.get("request"), None
+            if req == "cancel":
+                raise Cancelled()   # finally: kills Brush
             if req == "pause" and not job["paused"]:
                 os.kill(proc.pid, signal.SIGSTOP)
                 awake.terminate()  # let the Mac sleep while paused
@@ -1790,9 +1800,14 @@ class RemoteWorker:
         up = subprocess.Popen(self._ssh(f'tar -xf - -C "{dest}"'), stdin=tar.stdout,
                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         tar.stdout.close()
-        while up.poll() is None:
-            beat()
-            time.sleep(1)
+        try:
+            while up.poll() is None:
+                beat()
+                time.sleep(1)
+        except BaseException:   # cancelled: don't leave the transfer running
+            tar.kill()
+            up.kill()
+            raise
         tar.wait()
         if up.returncode or tar.returncode:
             raise RuntimeError(f"upload to {self.label} failed: {up.stderr.read().decode()[-200:]}")
@@ -1866,9 +1881,12 @@ class RemoteWorker:
         if r.returncode:
             raise RuntimeError(f"copying the gsplat scripts to {self.label} failed: {r.stderr.strip()[:200]}")
 
-    def run(self, exe, args, cwd, d, name, beat, poll=None):
+    def run(self, exe, args, cwd, d, name, beat, poll=None, job=None, pending_settings=None):
         """Run a program on the worker and wait for it, logging to <d>/<name>.log/.err.
-        poll() is called about every 10 s. Stopping (an exception here) kills it."""
+        poll() is called about every 10 s. Stopping (an exception here) kills it.
+        With job: honours job["request"] = "pause" | "resume" by suspending the process in
+        place (it keeps its GPU memory) and resuming it; a resume after settings that need a
+        restart were changed raises Restart (pending_settings gives the new ones)."""
         arglist = ", ".join("'" + str(a).replace("'", "''") + "'" for a in args)
         script = (f"$env:PYTHONUNBUFFERED='1'\n"
                   f"$p = Start-Process -FilePath '{exe}' -ArgumentList @({arglist}) "
@@ -1884,8 +1902,13 @@ class RemoteWorker:
         try:
             while proc.poll() is None:
                 time.sleep(1)
+                if job is not None:
+                    req = job.get("request")
+                    if req in ("pause", "resume"):
+                        job["request"] = None
+                        self.control(job, d, req, pending_settings)
                 beat()
-                if poll and time.time() - last_poll >= 10:
+                if poll and not (job and job.get("paused")) and time.time() - last_poll >= 10:
                     last_poll = time.time()
                     poll()
         except BaseException:
@@ -1894,6 +1917,33 @@ class RemoteWorker:
             proc.kill()
             raise
         return proc.returncode
+
+    def control(self, job, d, req, pending_settings):
+        """Suspend or resume the process in <d>/pid.txt (and its children) on the worker."""
+        if req == "resume" and job.get("paused") and pending_settings:
+            if not same_settings(pending_settings(), job["settings"]):
+                log(f"settings changed while paused; restarting {job['name']} on {self.label}")
+                raise Restart()
+        if (req == "pause") == bool(job.get("paused")):
+            return
+        call = "NtSuspendProcess" if req == "pause" else "NtResumeProcess"
+        self.ps("Add-Type -Name P -Namespace GQ -MemberDefinition '"
+                "[DllImport(\"ntdll.dll\")] public static extern int NtSuspendProcess(IntPtr h);"
+                "[DllImport(\"ntdll.dll\")] public static extern int NtResumeProcess(IntPtr h);'\n"
+                f"$root = [int](Get-Content '{d}/pid.txt')\n"
+                "$all = @($root) + @(Get-CimInstance Win32_Process -Filter \"ParentProcessId=$root\" | "
+                "ForEach-Object { $_.ProcessId })\n"
+                f"foreach ($i in $all) {{ $p = Get-Process -Id $i -ErrorAction SilentlyContinue; "
+                f"if ($p) {{ [void][GQ.P]::{call}($p.Handle) }} }}", timeout=60)
+        if req == "pause":
+            job.update(paused=True, paused_at=time.time(), phase="paused", eta=None)
+            log(f"paused: {job['name']} at step {job.get('step')} on {self.label}")
+        else:
+            gap = time.time() - job["paused_at"]
+            job["started"] += gap   # keep elapsed/ETA honest
+            job["train_started"] += gap
+            job.update(paused=False, paused_at=None, phase="training")
+            log(f"resumed: {job['name']} on {self.label}")
 
     def failure(self, d, name):
         """The most telling line from a failed run's logs."""
@@ -1991,7 +2041,13 @@ class RemoteWorker:
                               f"({step:,}/{total:,} steps), "
                               f"ETA ~{dt.datetime.fromtimestamp(job['eta']):%H:%M}", img)
 
-        code = self.run(exe, args, cwd, d, "train", beat, poll)
+        job.update(paused=False, paused_at=None, request=None)
+        try:
+            code = self.run(exe, args, cwd, d, "train", beat, poll, job, pending_settings)
+        except Restart:
+            return RESTART
+        finally:
+            job.update(paused=False, paused_at=None)
         if code:
             raise RuntimeError(f"{what} on {self.label} exited with {code} {self.failure(d, 'train')}")
         job["train_seconds"] = time.time() - job["train_started"]
@@ -2133,6 +2189,13 @@ def wait_for_mac_memory(cfg, status, job, beat):
 
 def process(cfg, paths, state, status, item, beat, worker=None):
     worker = worker or LocalWorker()
+    outer_beat = beat
+
+    def beat(force=False):   # every wait loop calls this: Cancel takes effect in any phase
+        outer_beat(force)
+        if job.get("request") == "cancel":
+            raise Cancelled()
+
     name = item.name
     job_dir = paths.jobs / name
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -2285,6 +2348,13 @@ def process(cfg, paths, state, status, item, beat, worker=None):
             shutil.copyfile(paths.previews / job["preview"], img)
         imessage(cfg, f"✅ {name}: done in {dur} on {worker.label}. In the outbox: {files}"
                       + (f". Compression problem: {'; '.join(cerrors)}" if cerrors else ""), img)
+    except Cancelled:
+        dur = fmt_dur(time.time() - t0)
+        log(f"cancelled: {name} after {dur} ({job.get('phase')})")
+        if item.path.exists():   # kept with the failed ones, so Recent can requeue it
+            shutil.move(str(item.path), paths.failed / item.path.name)
+        record(state, job, "cancelled", dur, f"cancelled while {job.get('phase') or 'starting'}")
+        imessage(cfg, f"⏹ {name}: cancelled after {dur}")
     except Exception as e:
         if not item.path.exists():
             # Pulled out of the inbox (moved, renamed, re-zipped): not a failure.
@@ -2304,7 +2374,7 @@ def process(cfg, paths, state, status, item, beat, worker=None):
             log(f"cleanup on {worker.label} failed: {e}")
         status.overrides.clear(name)
         status.jobs.pop(worker.name, None)
-        beat(force=True)
+        outer_beat(force=True)
 
 
 def find_sensor_data(data_dir):
