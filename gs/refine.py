@@ -106,7 +106,7 @@ def intrinsics(c):
     return (v[0], v[0], v[1], v[2]) if c[1].startswith("SIMPLE") else tuple(v[:4])
 
 
-def calibrate_lens(colmap, ba, work, log):
+def calibrate_lens(colmap, ba, work, log, focal_blend=1.0):
     """Fit the capture's lens on the bundle-adjusted model (no new features or matches):
     shared OPENCV distortion first, then each photo's focal with it fixed. Returns
     (model folder, distortion [k1 k2 p1 p2], reprojection before, after)."""
@@ -155,7 +155,9 @@ def calibrate_lens(colmap, ba, work, log):
     per_cams = []
     for cid, c0 in params.items():
         fx_, fy_, cx_, cy_ = intr[cid]
-        per_cams.append(" ".join([cid, "RADIAL", c0[2], c0[3], repr((fx_ + fy_) / 2 * scale), repr(cx_), repr(cy_)] + dist))
+        f_own = (fx_ + fy_) / 2 * scale   # this photo's ARKit focal, scaled to the fit
+        f = f_fit + focal_blend * (f_own - f_fit)   # 0 = one shared focal, 1 = each photo's own
+        per_cams.append(" ".join([cid, "RADIAL", c0[2], c0[3], repr(f), repr(cx_), repr(cy_)] + dist))
     write_txt_model(last, per_cams, pairs, rigs, frames, txt)
     clamped = 0
     out_ = work / "lens_ba"
@@ -167,7 +169,7 @@ def calibrate_lens(colmap, ba, work, log):
     return out_, [float(x) for x in dist], clamped, mean_reprojection(colmap, ba), mean_reprojection(colmap, out_)
 
 
-def refine(colmap, images, src, work, out, gpu=False, lens=False):
+def refine(colmap, images, src, work, out, gpu=False, lens=False, focal_blend=1.0):
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
     out.mkdir(parents=True, exist_ok=True)
@@ -263,7 +265,7 @@ def refine(colmap, images, src, work, out, gpu=False, lens=False):
     if lens:
         phase("lens calibration")
         try:
-            lba, dist, clamped, lb, la = calibrate_lens(colmap, ba, work, log)
+            lba, dist, clamped, lb, la = calibrate_lens(colmap, ba, work, log, focal_blend)
             if la is not None and lb is not None and la <= lb * 1.02:
                 ba = lba
                 fs = sorted(float(l.split()[4]) for l in read_txt_model(work / "lens_final")[0])
@@ -333,9 +335,11 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--gpu", action="store_true", help="SIFT extraction and matching on the GPU (CUDA)")
     p.add_argument("--lens", action="store_true", help="also calibrate the lens (distortion + per-photo focal)")
+    p.add_argument("--focal-blend", type=float, default=1.0,
+                   help="with --lens: how much of each photo's own focal to keep (0 = one shared focal, 1 = own)")
     a = p.parse_args(argv)
     try:
-        stats = refine(a.colmap, Path(a.images), Path(a.model), Path(a.work), Path(a.out), a.gpu, a.lens)
+        stats = refine(a.colmap, Path(a.images), Path(a.model), Path(a.work), Path(a.out), a.gpu, a.lens, a.focal_blend)
         print(json.dumps(stats), flush=True)
     except Exception as e:
         print(f"error: {e}", flush=True)
