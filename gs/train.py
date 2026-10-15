@@ -65,6 +65,9 @@ def parse(argv=None):
                    help="make splats outside the scanned region thin along the line to its centre (billboards)")
     p.add_argument("--antialiased", action="store_true")
     p.add_argument("--box", help="box.json from box.py: keep splats inside the box")
+    p.add_argument("--max-radius", type=float, default=0.0,
+                   help="ignore pixels farther than this from the lens centre (pixels of the full "
+                        "photo; works on box crops too): a test of how much edge distortion costs")
     p.add_argument("--empty-weight", type=float, default=0.1,
                    help="masked datasets: weight of rendered opacity where the box must be empty")
     p.add_argument("--needle-weight", type=float, default=0.0)
@@ -204,6 +207,19 @@ def keep_in_box(params, box, min_logit=-6.0):
     out = ~box.inside(params["means"])
     params["opacities"][out] = min_logit   # MCMC relocates them, default densification prunes
     return int(out.sum())
+
+
+def radius_mask(views, i, radius, mask):
+    """mask (or all-train) with pixels beyond `radius` (full-photo pixels) from the principal
+    point set to ignore (0)."""
+    w, h = views.size(i)
+    K = views.K[i]
+    dev = views.K.device
+    y, x = torch.meshgrid(torch.arange(h, device=dev) + 0.5, torch.arange(w, device=dev) + 0.5, indexing="ij")
+    far = (x - K[0, 2]) ** 2 + (y - K[1, 2]) ** 2 > radius ** 2
+    m = mask.clone() if mask is not None else torch.full((h, w), 255, dtype=torch.uint8, device=dev)
+    m[far] = 0
+    return m
 
 
 def needle_loss(params, ratio):
@@ -416,6 +432,8 @@ def train(a, splats=None, log=print):
         if strategy:
             strategy.step_pre_backward(params, opts, state, step, meta)
         mask = tv.masks[i]
+        if a.max_radius > 0:
+            mask = radius_mask(tv, i, a.max_radius, mask)
         if mask is None:
             loss = 0.8 * (rgb_r - gt).abs().mean() + 0.2 * (1 - gsdata.ssim(rgb_r, gt))
         else:
