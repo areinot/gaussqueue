@@ -78,6 +78,9 @@ def parse(argv=None):
     p.add_argument("--holdout-names", help="file listing the photos to hold out (one name per line), "
                                            "so runs on different datasets are scored on the same views")
     p.add_argument("--subsample", type=int, default=1, help="train on every Nth photo")
+    p.add_argument("--exclude-names", help="file listing photos not to train on (one name per line)")
+    p.add_argument("--ssim-weight", type=float, default=0.2,
+                   help="share of the photo loss given to SSIM (edges, texture); the rest is L1")
     p.add_argument("--export-every", type=int, default=0)
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--seed", type=int, default=0)
@@ -356,6 +359,9 @@ def train(a, splats=None, log=print):
     else:
         tr_ims, te_ims = gsdata.split(images, a.holdout_every)
     tr_ims = tr_ims[::max(1, a.subsample)]
+    if a.exclude_names:
+        skip = {l.strip() for l in Path(a.exclude_names).read_text().splitlines() if l.strip()}
+        tr_ims = [im for im in tr_ims if im["name"] not in skip]
     tv = gsdata.Views(root, tr_ims, a.max_res, dev, a.depth_dir if a.depth_weight > 0 else None)
     ev = gsdata.Views(root, te_ims, a.max_res, dev, a.eval_depth_dir or a.depth_dir)
     centers = tv.centers()
@@ -417,11 +423,11 @@ def train(a, splats=None, log=print):
             strategy.step_pre_backward(params, opts, state, step, meta)
         mask = tv.masks[i]
         if mask is None:
-            loss = 0.8 * (rgb_r - gt).abs().mean() + 0.2 * (1 - gsdata.ssim(rgb_r, gt))
+            loss = (1 - a.ssim_weight) * (rgb_r - gt).abs().mean() + a.ssim_weight * (1 - gsdata.ssim(rgb_r, gt))
         else:
             keep, empty = mask == 255, mask == 128
             l1 = (rgb_r - gt).abs()[keep].mean() if keep.any() else rgb_r.sum() * 0
-            loss = 0.8 * l1 + 0.2 * (1 - gsdata.ssim(rgb_r, gt, keep))
+            loss = (1 - a.ssim_weight) * l1 + a.ssim_weight * (1 - gsdata.ssim(rgb_r, gt, keep))
             if empty.any() and a.empty_weight > 0:
                 loss = loss + a.empty_weight * alpha[empty].mean()
         if a.depth_weight > 0 and tv.depth[i] is not None:
