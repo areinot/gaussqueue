@@ -50,6 +50,8 @@ def parse(argv=None):
     p.add_argument("--eval-depth-dir", help="depth maps for scoring held-out photos (default: --depth-dir)")
     p.add_argument("--depth-weight", type=float, default=0.0)
     p.add_argument("--depth-conf", type=int, default=2)
+    p.add_argument("--depth-deadband", type=float, default=0.0,
+                   help="metres of depth disagreement that cost nothing (LiDAR is good to ~1 cm)")
     p.add_argument("--flat-weight", type=float, default=0.0)
     p.add_argument("--mode", choices=["3dgs", "2dgs"], default="3dgs")
     p.add_argument("--space", help="space.npz from fuse.py --grid-only: known-empty / surface / unknown")
@@ -247,16 +249,16 @@ def render(params, views, idx, sh_degree, mode="3dgs", antialiased=False, absgra
     return out[..., :-1], out[..., -1], alpha[0, ..., 0], meta, extras
 
 
-def depth_loss(depth, alpha, gt, conf, min_conf):
+def depth_loss(depth, alpha, gt, conf, min_conf, deadband=0.0):
     """Relative L1 between rendered depth (pooled to the LiDAR map's size) and LiDAR depth,
-    only where the LiDAR is confident."""
+    only where the LiDAR is confident; disagreement within the deadband (metres) is free."""
     h, w = gt.shape
     d = F.adaptive_avg_pool2d(depth[None, None], (h, w))[0, 0]
     a = F.adaptive_avg_pool2d(alpha[None, None], (h, w))[0, 0]
     m = (conf >= min_conf) & (gt > 0.05) & torch.isfinite(gt) & (a > 0.5)
     if not m.any():
         return depth.new_zeros(())
-    return ((d[m] - gt[m]).abs() / gt[m]).mean()
+    return (((d[m] - gt[m]).abs() - deadband).clamp_min(0) / gt[m]).mean()
 
 
 # ---------------------------------------------------------------- training
@@ -388,7 +390,8 @@ def train(a, splats=None, log=print):
             if empty.any() and a.empty_weight > 0:
                 loss = loss + a.empty_weight * alpha[empty].mean()
         if a.depth_weight > 0 and tv.depth[i] is not None:
-            loss = loss + a.depth_weight * depth_loss(depth, alpha, tv.depth[i], tv.conf[i], a.depth_conf)
+            loss = loss + a.depth_weight * depth_loss(depth, alpha, tv.depth[i], tv.conf[i], a.depth_conf,
+                                                      a.depth_deadband)
         if a.flat_weight > 0 and a.mode == "3dgs":
             loss = loss + a.flat_weight * torch.exp(params["scales"]).min(dim=-1).values.mean()
         if a.mode == "2dgs":
