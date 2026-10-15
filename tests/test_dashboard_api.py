@@ -449,6 +449,32 @@ class DashboardAPITest(unittest.TestCase):
             hist.pop()
             self.status.write(self.cfg)
 
+    def test_downloads(self):
+        gq, root = self.gq, Path(self.tmp.name)
+        res = root / "outbox" / "dl-cap"
+        res.mkdir(parents=True, exist_ok=True)
+        (res / "dl-cap.ply").write_bytes(b"ply-bytes")
+        (res / "dl-cap.v3.spz").write_bytes(b"spz3")
+        (res / "secret.txt").write_text("no")
+        paths = self.inbox.paths
+        self.assertEqual([d["file"] for d in gq.result_downloads(paths, "dl-cap")], ["dl-cap.ply", "dl-cap.v3.spz"])
+
+        def get(path, host=None):
+            req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+            if host:
+                req.add_header("Host", host)
+            try:
+                with urllib.request.urlopen(req) as r:
+                    return r.status, r.read(), r.headers.get("Content-Disposition")
+            except urllib.error.HTTPError as e:
+                return e.code, b"", None
+        code, body, disp = get("/download/dl-cap/dl-cap.ply")
+        self.assertEqual((code, body), (200, b"ply-bytes"))
+        self.assertIn('filename="dl-cap.ply"', disp)
+        self.assertEqual(get("/download/dl-cap/secret.txt")[0], 404)          # only result files
+        self.assertEqual(get("/download/..%2Foutbox/dl-cap.ply")[0], 404)     # no path tricks
+        self.assertEqual(get("/download/dl-cap/dl-cap.ply", host="evil.example")[0], 403)
+
     def test_snapshot_has_estimates_and_presets(self):
         snap = self.snapshot()
         self.assertEqual(set(snap["presets"]), {"preview", "fast", "standard", "high"})

@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 import zipfile
 from pathlib import Path
 
@@ -896,6 +897,7 @@ class Status:
                 if h["quality"] == "?":
                     h["quality"] = self.quality_cache[h["name"]] = find_capture_quality(
                         self.paths.jobs / h["name"] / "data")
+            h["downloads"] = result_downloads(self.paths, h["name"]) if h.get("result") == "done" else []
             h["requeueable"] = (h["name"] not in seen and h["name"] not in in_inbox
                                 and find_processed(self.paths, h["name"]) is not None)
             seen.add(h["name"])
@@ -995,6 +997,8 @@ def start_dashboard(cfg, paths, status, overrides):
 
         def do_GET(self):
             path = self.path.split("?")[0]
+            if path.startswith("/download/"):
+                return self.download(path)
             if path in ("/", "/index.html"):
                 self.send(200, DASHBOARD_HTML.read_bytes(), "text/html; charset=utf-8")
             elif path == "/api/status":
@@ -1008,6 +1012,29 @@ def start_dashboard(cfg, paths, status, overrides):
                     self.send(404, b"not found", "text/plain")
             else:
                 self.send(404, b"not found", "text/plain")
+
+        def download(self, path):
+            """Stream a result file as an attachment. Only to our own host name, so a page
+            from elsewhere can't read results through DNS rebinding."""
+            host = (self.headers.get("Host") or "").split(":")[0]
+            if host not in ("127.0.0.1", "localhost"):
+                return self.send(403, b"forbidden", "text/plain")
+            parts = [urllib.parse.unquote(x) for x in path[len("/download/"):].split("/")]
+            f = download_path(paths, *parts) if len(parts) == 2 else None
+            if f is None:
+                return self.send(404, b"not found", "text/plain")
+            size = f.stat().st_size
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f'attachment; filename="{f.name}"')
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                with open(f, "rb") as fh:
+                    shutil.copyfileobj(fh, self.wfile, 1 << 20)
+            except (BrokenPipeError, ConnectionResetError):
+                pass   # the browser cancelled
 
         def do_POST(self):
             # Only the dashboard itself may change settings: require our own Origin
@@ -2288,6 +2315,34 @@ def prune_result(cfg, status, job, worker, colmap_dir, sensor, ply, pct, out_dir
         if pw is None:
             raise RuntimeError("needs an online CUDA worker with gsplat")
     return pw.prune(cfg, job, colmap_dir, sensor, ply, pct, out_dir, beat, trained_here=pw is worker)
+
+
+DOWNLOAD_SUFFIXES = (".ply", ".v3.spz", ".v4.spz", ".spz")
+
+
+def result_downloads(paths, name):
+    """[{"file", "size"}] for the result files the dashboard offers for download."""
+    out = []
+    for suffix in DOWNLOAD_SUFFIXES:
+        f = paths.outbox / name / f"{name}{suffix}"
+        try:
+            if f.is_file():
+                out.append({"file": f.name, "size": f.stat().st_size})
+        except OSError:
+            pass
+    return out
+
+
+def download_path(paths, name, fname):
+    """The outbox file behind /download/<name>/<file>, or None if it isn't one we offer."""
+    if not name or "/" in name or "\\" in name or name.startswith(".") or fname not in [
+            f"{name}{s}" for s in DOWNLOAD_SUFFIXES]:
+        return None
+    f = paths.outbox / name / fname
+    try:
+        return f if f.is_file() and f.resolve().parent == (paths.outbox / name).resolve() else None
+    except OSError:
+        return None
 
 
 def history_id(h):

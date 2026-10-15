@@ -142,6 +142,11 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .now .settings { border: 1px solid var(--line); border-radius: 10px; }
 .now.paused .bar > div { background: var(--warn); }
 .history .when { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+.dls { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.dl { font-size: 12px; padding: 3px 9px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel);
+  color: var(--text); text-decoration: none; display: inline-flex; gap: 6px; align-items: baseline; }
+.dl span { color: var(--muted); font-size: 11px; }
+.dl:hover { background: var(--track); }
 .history .when .top { display: flex; align-items: center; gap: 8px; }
 .dismiss { background: none; border: 0; padding: 0 2px; font: inherit; font-size: 17px; line-height: 1;
   color: var(--muted); cursor: pointer; border-radius: 4px; }
@@ -730,6 +735,9 @@ function renderHistory(h) {
         <div class="name">${esc(r.name)} <span class="badge b-${esc(r.result)}">${esc(r.result)}</span></div>
         <div class="detail">${esc(r.duration)}${r.detail ? " · " + esc(r.detail) : ""}${r.result === "done" ? ` · outbox/${esc(r.name)}/` : ""}</div>
         ${captureQuality(r.quality)}
+        ${(r.downloads || []).length ? `<div class="dls">${r.downloads.map(d =>
+          `<a class="dl" href="/download/${encodeURIComponent(r.name)}/${encodeURIComponent(d.file)}" download="${esc(d.file)}"
+             title="Save ${esc(d.file)} (${size(d.size)})">${esc(d.file.slice(r.name.length))} <span>${size(d.size)}</span></a>`).join("")}</div>` : ""}
       </div>
       <div class="when">
         <div class="top"><span class="meta">${esc(r.finished)}</span>
