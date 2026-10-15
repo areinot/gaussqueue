@@ -128,6 +128,11 @@ DEFAULTS = {
     "eval_every": 500,
     "eval_split_every": 16,
     "extra_args": [],
+    # Brush densification. Brush's own defaults grow splats slowly (10% of candidates every
+    # 200 steps, until step 15000), which leaves short runs with ~10x fewer splats than gsplat
+    # and visibly blurrier; these grow half the candidates every 100 steps until growth_stop
+    # of the run. Tested on a 7k-step capture: 54k -> 614k splats, sharper texture, ~2x time.
+    "brush_growth": {"select_fraction": 0.5, "refine_every": 100, "growth_stop": 0.6, "ssim_weight": 0.4},
     "keep_work_days": 7,
     # When a capture is requeued and rerun, move the earlier result into
     # <outbox>/<name>/previous/ instead of overwriting it.
@@ -1507,6 +1512,23 @@ def refine_locally(cfg, colmap_dir, work, out, beat, job):
     return json.loads((out / "stats.json").read_text())
 
 
+def brush_growth_args(cfg, total_steps):
+    """Brush densification flags from config "brush_growth" (empty/null keeps Brush's own)."""
+    g = cfg.get("brush_growth")
+    if not g:
+        return []
+    out = []
+    if g.get("select_fraction"):
+        out += ["--growth-select-fraction", g["select_fraction"]]
+    if g.get("refine_every"):
+        out += ["--refine-every", int(g["refine_every"])]
+    if g.get("growth_stop"):
+        out += ["--growth-stop-iter", max(1, int(float(g["growth_stop"]) * int(total_steps)))]
+    if g.get("ssim_weight") is not None:
+        out += ["--ssim-weight", g["ssim_weight"]]
+    return out
+
+
 RESTART = object()  # train() result: settings changed while paused, run again
 BRUSH_MAX_SH = 3     # Brush trains SH degree 0-3 (asked for more, it silently uses 3)
 
@@ -1542,7 +1564,7 @@ def train(cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
            "--eval-every", str(cfg["eval_every"]),
            "--eval-split-every", str(cfg["eval_split_every"]),
            "--eval-save-to-disk",
-           "--export-path", str(out_dir)] + [str(a) for a in cfg["extra_args"]]
+           "--export-path", str(out_dir)] + [str(a) for a in brush_growth_args(cfg, total) + list(cfg["extra_args"])]
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
@@ -2179,7 +2201,7 @@ class RemoteWorker:
                     "--subsample-frames", st["subsample_frames"],
                     "--export-every", cfg["checkpoint_every"], "--eval-every", cfg["eval_every"],
                     "--eval-split-every", cfg["eval_split_every"], "--eval-save-to-disk",
-                    "--export-path", f"{d}/out"] + list(cfg["extra_args"])
+                    "--export-path", f"{d}/out"] + brush_growth_args(cfg, total) + list(cfg["extra_args"])
         log(f"run on {self.label}: {what} {' '.join(map(str, args))}")
         job.update(phase="training", step=0, total=total, started=time.time(),
                    train_started=time.time(), eta=None)

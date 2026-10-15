@@ -235,6 +235,11 @@ from its own ARKit intrinsics, fits one radial distortion and focal length for t
 (keeping each photo's autofocus changes), re-settles the poses, and training uses undistorted
 photos. It adds about a minute; on a test scene it was worth +0.8 dB.
 
+**Brush growth** (`brush_growth`): Brush's own defaults grow splats slowly, so short runs end up
+with ~10x fewer splats than gsplat and look blurry. GaussQueue passes faster growth (half the
+candidates every 100 steps, growth stopping at 60% of the run, SSIM weight 0.4). Set
+`"brush_growth": null` to use Brush's defaults.
+
 **Dashboard on the worker** (optional): `"dashboard_tunnel": true` keeps an SSH reverse tunnel
 open so the dashboard also opens at `http://localhost:8765` on that machine. The service
 reconnects it whenever it drops; the machine's card shows whether it's up.
