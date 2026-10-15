@@ -27,7 +27,8 @@
 
 namespace {
 
-// Real SH basis for bands 1..3 in the 3DGS/gsplat ordering and signs. Any consistent basis
+// Real SH basis for bands 1..4 in the 3DGS/gsplat ordering and signs (band 4 as in gsplat's
+// _eval_sh_bases_fast, after Sloan 2013; directions are unit vectors). Any consistent basis
 // works for building rotation matrices; this one matches how the coefficients are stored.
 void shBasis(int band, double x, double y, double z, double *out) {
   const double xx = x * x, yy = y * y, zz = z * z;
@@ -40,6 +41,24 @@ void shBasis(int band, double x, double y, double z, double *out) {
     out[2] = 0.31539156525252005 * (2 * zz - xx - yy);
     out[3] = -1.0925484305920792 * x * z;
     out[4] = 0.5462742152960396 * (xx - yy);
+  } else if (band == 4) {
+    const double c1 = xx - yy, s1 = 2 * x * y;
+    const double c2 = x * c1 - y * s1, s2 = x * s1 + y * c1;
+    const double c3 = x * c2 - y * s2, s3 = x * s2 + y * c2;
+    const double d = z * (-4.683325804901025 * zz + 2.007139630671868);
+    const double cc = 3.31161143515146 * zz - 0.47308734787878;
+    const double b = -1.770130769779931 * z;
+    const double a = 0.6258357354491763;
+    out[0] = a * s3;
+    out[1] = b * s2;
+    out[2] = cc * s1;
+    out[3] = d * y;
+    out[4] = 1.984313483298443 * zz * (1.865881662950577 * zz - 1.119528997770346)
+             - 1.006230589874905 * (0.9461746957575601 * zz - 0.3153915652525201);
+    out[5] = d * x;
+    out[6] = cc * c1;
+    out[7] = b * c2;
+    out[8] = a * c3;
   } else {
     out[0] = -0.5900435899266435 * y * (3 * xx - yy);
     out[1] = 2.890611442640554 * x * y * z;
@@ -101,12 +120,12 @@ void rotateSh(spz::GaussianCloud &cloud, const double R[9]) {
   if (cloud.shDegree < 1 || cloud.numPoints == 0) return;
   const int perPoint = static_cast<int>(cloud.sh.size() / 3 / cloud.numPoints);   // coefficients
   std::vector<std::vector<double>> M;
-  for (int l = 1; l <= std::min(cloud.shDegree, 3); ++l) M.push_back(shRotation(l, R));
-  std::vector<double> tmp(7);
+  for (int l = 1; l <= std::min(cloud.shDegree, 4); ++l) M.push_back(shRotation(l, R));
+  std::vector<double> tmp(9);
   for (int p = 0; p < cloud.numPoints; ++p) {
     float *c = &cloud.sh[static_cast<size_t>(p) * perPoint * 3];
     int start = 0;
-    for (int l = 1; l <= std::min(cloud.shDegree, 3); ++l) {
+    for (int l = 1; l <= std::min(cloud.shDegree, 4); ++l) {
       const int n = 2 * l + 1;
       const auto &m = M[l - 1];
       for (int ch = 0; ch < 3; ++ch) {
@@ -144,25 +163,65 @@ void transform(spz::GaussianCloud &cloud, const double origin[3], double yawDeg)
   if (yawDeg != 0.0) rotateSh(cloud, R);
 }
 
+int selfTestDegree(int deg);
+
 int selfTest() {
-  // Generic SH rotation by 180 degrees about X must match the library's exact sign flip.
+  int fails = 0;
+  for (int deg = 3; deg <= 4; ++deg) fails += selfTestDegree(deg);
+  return fails;
+}
+
+// View-dependent colour (bands 1..deg, one channel) of coefficients c in direction d.
+double evalSh(const float *c, int deg, int ch, const double d[3]) {
+  double sum = 0, b[9];
+  int start = 0;
+  for (int l = 1; l <= deg; ++l) {
+    shBasis(l, d[0], d[1], d[2], b);
+    for (int i = 0; i < 2 * l + 1; ++i) sum += b[i] * c[(start + i) * 3 + ch];
+    start += 2 * l + 1;
+  }
+  return sum;
+}
+
+int selfTestDegree(int deg) {
+  // Rotating the coefficients by R must give, in direction R d, the colour the originals had
+  // in direction d; checked for a flip about X and an arbitrary yaw. For degrees up to 3 the
+  // flip must also match the library's sign table exactly.
+  const int nsh = ((deg + 1) * (deg + 1) - 1) * 3;
   spz::GaussianCloud a;
-  a.numPoints = 1; a.shDegree = 3;
+  a.numPoints = 1; a.shDegree = deg;
   a.positions = {0, 0, 0}; a.scales = {0, 0, 0}; a.rotations = {0, 0, 0, 1}; a.alphas = {0}; a.colors = {0, 0, 0};
-  for (int i = 0; i < 45; ++i) a.sh.push_back(std::sin(1.7f * i + 0.3f));
+  for (int i = 0; i < nsh; ++i) a.sh.push_back(std::sin(1.7f * i + 0.3f));
+  const spz::GaussianCloud orig = a;
   spz::GaussianCloud b = a;
   b.rotate180DegAboutX();
   const double Rx[9] = {1, 0, 0, 0, -1, 0, 0, 0, -1};
   rotateSh(a, Rx);
   double err = 0;
-  for (int i = 0; i < 45; ++i) err = std::max(err, std::fabs(double(a.sh[i]) - b.sh[i]));
+  if (deg <= 3)
+    for (int i = 0; i < nsh; ++i) err = std::max(err, std::fabs(double(a.sh[i]) - b.sh[i]));
+  const double yw = 0.7, cy = std::cos(yw), sy = std::sin(yw);
+  const double Ry[9] = {cy, 0, sy, 0, 1, 0, -sy, 0, cy};
+  for (const double *R : {Rx, Ry}) {
+    spz::GaussianCloud r = orig;
+    rotateSh(r, R);
+    for (int k = 0; k < 20; ++k) {
+      const double t = (k + 0.5) / 20, ph = std::acos(1 - 2 * t), th = 2.39996 * k;
+      const double d[3] = {std::cos(th) * std::sin(ph), std::sin(th) * std::sin(ph), std::cos(ph)};
+      const double rd[3] = {R[0] * d[0] + R[1] * d[1] + R[2] * d[2], R[3] * d[0] + R[4] * d[1] + R[5] * d[2],
+                            R[6] * d[0] + R[7] * d[1] + R[8] * d[2]};
+      for (int ch = 0; ch < 3; ++ch)
+        err = std::max(err, std::fabs(evalSh(r.sh.data(), deg, ch, rd) - evalSh(orig.sh.data(), deg, ch, d)));
+    }
+  }
   // Yaw by +90 then -90 must round-trip.
   spz::GaussianCloud c = b;
   const double o[3] = {0, 0, 0};
   transform(c, o, 90); transform(c, o, -90);
   double err2 = 0;
-  for (int i = 0; i < 45; ++i) err2 = std::max(err2, std::fabs(double(c.sh[i]) - b.sh[i]));
-  std::cout << "SH rotation vs exact flip: max error " << err << "; yaw round trip: " << err2 << "\n";
+  for (int i = 0; i < nsh; ++i) err2 = std::max(err2, std::fabs(double(c.sh[i]) - b.sh[i]));
+  std::cout << "SH degree " << deg << ": rotation vs exact flip max error " << err
+            << "; yaw round trip " << err2 << "\n";
   return (err < 1e-4 && err2 < 1e-4) ? 0 : 1;
 }
 
@@ -259,7 +318,14 @@ int main(int argc, char *argv[]) {
     }
     const int before = cloud.numPoints;
     if (keep < 1) prune(cloud, keep);
-    if (flip) cloud.rotate180DegAboutX();
+    if (flip) {   // positions and orientations by the library; SH by our exact rotation, since
+                  // the library's sign table is wrong for one band-4 coefficient
+      const std::vector<float> sh = cloud.sh;
+      cloud.rotate180DegAboutX();
+      cloud.sh = sh;
+      const double Rx[9] = {1, 0, 0, 0, -1, 0, 0, 0, -1};
+      rotateSh(cloud, Rx);
+    }
     if (move) transform(cloud, origin, yaw);
     spz::PackOptions pack;
     pack.version = static_cast<uint32_t>(version);

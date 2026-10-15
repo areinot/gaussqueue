@@ -149,7 +149,7 @@ RESTART_KEYS = TRAIN_KEYS + ("refine_poses",) + GSPLAT_KEYS   # changing these r
 OUTPUT_KEYS = ("flip_up", "start_view", "prune_pct", "spz_v3", "spz_v4")   # only affect the output files
 SETTING_KEYS = RESTART_KEYS + OUTPUT_KEYS
 SETTING_LIMITS = {"total_steps": (500, 100_000), "max_resolution": (256, 4096),
-                  "sh_degree": (0, 3), "max_splats": (50_000, 20_000_000),
+                  "sh_degree": (0, 4), "max_splats": (50_000, 20_000_000),
                   "subsample_frames": (1, 20), "flip_up": (0, 1), "refine_poses": (0, 1),
                   "depth_supervision": (0, 1), "flatten": (0, 1), "prune_pct": (0, 95),
                   "start_view": (0, 1), "spz_v3": (0, 1), "spz_v4": (0, 1)}
