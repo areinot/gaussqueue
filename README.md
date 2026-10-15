@@ -228,6 +228,10 @@ refined there, with SIFT features and matching on the GPU. Their photos are uplo
 reused for training. If it fails, the Mac refines instead. GPU SIFT needs a recent NVIDIA driver;
 `"colmap_gpu": false` runs COLMAP on the worker's CPU, which is only worth it if that CPU is fast.
 
+**Dashboard on the worker** (optional): `"dashboard_tunnel": true` keeps an SSH reverse tunnel
+open so the dashboard also opens at `http://localhost:8765` on that machine. The service
+reconnects it whenever it drops; the machine's card shows whether it's up.
+
 Captures set to gsplat wait for a machine that has it. If no machine does, or the capture
 is pinned to the Mac with *Run on*, it trains with Brush and says so in the history.
 The scripts also run by hand on any CUDA machine:

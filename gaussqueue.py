@@ -1773,6 +1773,44 @@ class RemoteWorker:
         self.online = False
         self.checked = 0.0
         self.stats = {}
+        self.tunnel = None   # {"state", "since", "drops"} when dashboard_tunnel is on
+        self.tunnel_proc = None
+
+    # -- dashboard on the worker
+    def start_tunnel(self, port):
+        """With "dashboard_tunnel": true, keep this machine's localhost:<port> forwarded to the
+        dashboard (ssh -R), reconnecting whenever the link drops, so the dashboard opens there too."""
+        self.tunnel = {"state": "connecting", "since": time.time(), "drops": 0}
+
+        def loop():
+            while True:
+                started = time.time()
+                try:
+                    self.tunnel_proc = subprocess.Popen(
+                        ["ssh", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
+                         "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+                         "-o", "ConnectTimeout=10", "-N",
+                         "-R", f"127.0.0.1:{port}:127.0.0.1:{port}", self.ssh],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                    while self.tunnel_proc.poll() is None:
+                        if self.tunnel["state"] != "up" and time.time() - started > 5:
+                            self.tunnel.update(state="up", since=time.time())
+                            log(f"dashboard tunnel to {self.label} is up")
+                        time.sleep(1)
+                    err = (self.tunnel_proc.stderr.read() or "").strip().splitlines()
+                    reason = err[-1][:120] if err else f"exit {self.tunnel_proc.returncode}"
+                except Exception as e:
+                    reason = str(e)[:120]
+                if self.tunnel["state"] == "up":
+                    self.tunnel["drops"] += 1
+                    log(f"dashboard tunnel to {self.label} dropped: {reason}")
+                self.tunnel.update(state="down", since=time.time(), reason=reason)
+                time.sleep(10)
+        threading.Thread(target=loop, daemon=True).start()
+
+    def stop_tunnel(self):
+        if self.tunnel_proc and self.tunnel_proc.poll() is None:
+            self.tunnel_proc.terminate()
 
     # -- plumbing
     def _ssh(self, *args):
@@ -1819,7 +1857,7 @@ class RemoteWorker:
 
     def info(self, job):
         return {"name": self.name, "label": self.label, "remote": True, "online": self.online,
-                "gsplat": bool(self.gsplat),
+                "gsplat": bool(self.gsplat), "tunnel": self.tunnel and dict(self.tunnel),
                 "job": job and {"name": job["name"], "phase": job.get("phase"),
                                 "step": job.get("step"), "total": job.get("total")},
                 **self.stats}
@@ -2803,6 +2841,7 @@ def cleanup_jobs(paths, days):
             log(f"cleaned local job dir {d.name}")
 
 
+WORKERS = []   # the running machines (main() fills it), for cleanup before a reload
 SCRIPT = Path(__file__).resolve()
 SCRIPT_MTIME = SCRIPT.stat().st_mtime
 
@@ -2843,6 +2882,9 @@ def reload_if_changed():
         globals()["SCRIPT_MTIME"] = SCRIPT.stat().st_mtime
         return
     log("script changed; reloading")
+    for w in WORKERS:   # the new process opens its own tunnels; these would hold the ports
+        if hasattr(w, "stop_tunnel"):
+            w.stop_tunnel()
     os.execv(sys.executable, [sys.executable, "-I", "-u"] + sys.argv)
 
 
@@ -2860,6 +2902,10 @@ def main():
     status = Status(paths, state, inbox, overrides)
     status.snapshots = Snapshots(paths, state, status)
     status.workers = make_workers(cfg)
+    for w in status.workers.values():
+        if w.remote and w.spec.get("dashboard_tunnel"):
+            w.start_tunnel(int(cfg["dashboard_port"]))
+    WORKERS[:] = list(status.workers.values())
     threading.Thread(target=status.snapshots.run_forever, daemon=True).start()
 
     def monitor():   # machine status for the dashboard and the scheduler

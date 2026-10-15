@@ -389,11 +389,16 @@ function renderMachines(ws) {
     const extra = w.remote
       ? (w.online && w.vram_total_mb ? `GPU ${w.gpu_util}% · ${(w.vram_used_mb / 1024).toFixed(1)}/${(w.vram_total_mb / 1024).toFixed(0)} GB VRAM` : "")
       : (w.mem_free_pct != null ? `memory ${w.mem_free_pct}% free` : "");
+    const t = w.tunnel;
+    const tun = !t ? "" : t.state === "up"
+      ? `<span title="This dashboard also opens on ${esc(w.label)} at localhost (SSH tunnel)${t.drops ? `; reconnected ${t.drops}×` : ""}">dashboard tunnel ✓</span>`
+      : `<span class="err" title="${esc(t.reason || "")}">dashboard tunnel ${esc(t.state)}</span>`;
     return `<div class="panel machine">
       <div class="mname"><span class="mdot ${!w.online ? "off" : j ? "busy" : ""}"></span>${esc(w.label)}</div>
       <div class="mstate">${state}</div>
       ${j ? `<div class="mbar"><div style="width:${pct.toFixed(1)}%"></div></div>` : ""}
       <div class="meta">${extra}</div>
+      ${tun ? `<div class="meta">${tun}</div>` : ""}
     </div>`; }).join(""));
 }
 
