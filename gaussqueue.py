@@ -1413,6 +1413,7 @@ def refine_locally(cfg, colmap_dir, work, out, beat, job):
 
 
 RESTART = object()  # train() result: settings changed while paused, run again
+BRUSH_MAX_SH = 3     # Brush trains SH degree 0-3 (asked for more, it silently uses 3)
 
 
 class Restart(Exception):
@@ -1439,7 +1440,7 @@ def train(cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
     cmd = [cfg["brush"], str(colmap_dir),
            "--total-steps", str(total),
            "--max-resolution", str(st["max_resolution"]),
-           "--sh-degree", str(st["sh_degree"]),
+           "--sh-degree", str(min(int(st["sh_degree"]), BRUSH_MAX_SH)),
            "--max-splats", str(st["max_splats"]),
            "--subsample-frames", str(st["subsample_frames"]),
            "--export-every", str(cfg["checkpoint_every"]),
@@ -2076,7 +2077,7 @@ class RemoteWorker:
         else:
             what, exe, cwd = "brush", self.brush, d
             args = [f"{d}/data", "--total-steps", total, "--max-resolution", st["max_resolution"],
-                    "--sh-degree", st["sh_degree"], "--max-splats", st["max_splats"],
+                    "--sh-degree", min(int(st["sh_degree"]), BRUSH_MAX_SH), "--max-splats", st["max_splats"],
                     "--subsample-frames", st["subsample_frames"],
                     "--export-every", cfg["checkpoint_every"], "--eval-every", cfg["eval_every"],
                     "--eval-split-every", cfg["eval_split_every"], "--eval-save-to-disk",
@@ -2313,6 +2314,8 @@ def process(cfg, paths, state, status, item, beat, worker=None):
         job["trainer"] = "gsplat" if job["settings"].get("trainer") == "gsplat" and worker.gsplat else "brush"
         if job["settings"].get("trainer") == "gsplat" and not worker.gsplat:
             warnings.append(f"gsplat needs a CUDA worker; trained with Brush on {worker.label}")
+        if job["trainer"] == "brush" and int(job["settings"].get("sh_degree", 0)) > BRUSH_MAX_SH:
+            warnings.append(f"Brush trains at most SH degree {BRUSH_MAX_SH} (4 bands); used {BRUSH_MAX_SH}")
         while True:
             source = colmap
             if job["settings"].get("refine_poses"):

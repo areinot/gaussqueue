@@ -243,7 +243,8 @@ const kfmt = (n) => n >= 1e6 ? `${+(n/1e6).toFixed(1)}M` : n >= 1000 ? `${+(n/10
 const qualityText = (st) => st ? `<b>${PRESET_LABEL[st.preset] || esc(st.preset)}</b> · ${kfmt(st.total_steps)} steps · ${st.max_resolution}px · SH${st.sh_degree} · ≤${kfmt(st.max_splats)} splats${st.subsample_frames > 1 ? ` · every ${st.subsample_frames} frames` : ""}${st.refine_poses ? " · refined poses" : ""}${st.trainer === "gsplat" ? ` · gsplat ${esc(st.densify || "")}${st.depth_supervision ? " +depth" : ""}${st.flatten ? " +flat" : ""}` : ""}${st.prune_pct ? ` · prune ${st.prune_pct}%` : ""}${st.flip_up ? " · flipped" : ""}${st.start_view ? " · starts at first photo" : ""}${(() => { const v = [3, 4].filter(n => st[`spz_v${n}`]); return v.join() === "3" ? "" : ` · spz ${v.length ? v.map(n => "v" + n).join("+") : "off"}`; })()}` : "";
 const FIELD_OPTS = {
   max_resolution: [720, 960, 1080, 1280, 1440, 1920, 2560, 3840],
-  sh_degree: [[0, "0 · flat colour"], [1, "1"], [2, "2"], [3, "3 · full sheen"], [4, "4 · finest sheen"]],
+  sh_degree: [[0, "0 · flat colour (1 band)"], [1, "1 (2 bands)"], [2, "2 (3 bands)"], [3, "3 · full sheen (4 bands)"],
+              [4, "4 · finest, gsplat only (5 bands)"]],
   max_splats: [500000, 1000000, 1500000, 3000000, 5000000, 10000000, 20000000],
   subsample_frames: [[1, "all"], [2, "every 2nd"], [3, "every 3rd"], [4, "every 4th"]],
 };
@@ -512,10 +513,10 @@ const HELP = {
     val: (v) => `${(+v).toLocaleString()} steps. Time grows roughly in proportion.`},
   max_resolution: {name: "Max resolution", what: "Photos are scaled down to this width for training. Higher keeps fine texture but costs time and memory; photos are never upscaled.",
     val: (v) => `Trains on photos up to ${v} px wide.`},
-  sh_degree: {name: "Colour detail (SH)", what: "How much a splat's colour can change with viewing angle: sheen, reflections, glints.",
+  sh_degree: {name: "Colour detail (SH degree)", what: "How much a splat's colour can change with viewing angle: sheen, reflections, glints. Counted as SH degree, like Brush, gsplat and the file formats; degree N has N+1 bands, so the standard 3 is \"4 bands\".",
     opts: {0: "Flat colour per splat. Smallest files; matte look.", 1: "Gentle view-dependent shading.",
            2: "Most sheen and reflections.", 3: "Full view-dependent colour (the 3DGS standard).",
-           4: "Finer reflections and glints than the standard; ~40% bigger files. Few viewers show the extra detail (Brush does; most apps, and gaussviewer for now, render it as 3)."}},
+           4: "Finer reflections and glints than the standard; ~40% bigger files. gsplat only: Brush trains at most 3 and uses 3 if asked for 4. Most viewers (gaussviewer for now) show it as 3."}},
   max_splats: {name: "Splat cap", what: "Upper limit on splats. Brush and Default densify stop growing at it; MCMC always ends exactly at it. gsplat runs are capped at 6M regardless.",
     val: (v) => `Up to ${kfmt(+v)} splats.`},
   subsample_frames: {name: "Frames used", what: "Train on every Nth photo. Faster, but less overlap between neighbouring photos, which hurts sharpness.",
@@ -669,7 +670,7 @@ function settingsHTML(it, isCurrent) {
         ${field("max_resolution", "Max resolution (px)", selectHTML("max_resolution", st.max_resolution,
             // no point offering more than the capture's own photos (they're never upscaled)
             it.photo_px ? FIELD_OPTS.max_resolution.filter(v => v <= it.photo_px) : FIELD_OPTS.max_resolution))}
-        ${field("sh_degree", "Colour detail (SH)", selectHTML("sh_degree", st.sh_degree, FIELD_OPTS.sh_degree))}
+        ${field("sh_degree", "Colour detail (SH degree)", selectHTML("sh_degree", st.sh_degree, FIELD_OPTS.sh_degree))}
         ${field("max_splats", "Splat cap", selectHTML("max_splats", st.max_splats, FIELD_OPTS.max_splats))}
         ${field("subsample_frames", "Frames used", selectHTML("subsample_frames", st.subsample_frames, FIELD_OPTS.subsample_frames))}
         ${!isCurrent && last.workers && last.workers.length > 1 ? `<div class="flipfield runon" data-help-key="run_on">Run on
