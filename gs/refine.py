@@ -9,6 +9,10 @@ positions as priors) -> triangulate with the known poses -> bundle-adjust poses 
 (intrinsics fixed) -> similarity-align back onto the original camera centres, so the capture's
 LiDAR points and "up" still line up.
 
+The model may have one camera for all photos or one per photo (PINHOLE, e.g. each photo's
+own ARKit intrinsics: autofocus changes the focal length by several percent); either way
+the intrinsics are kept as given.
+
 Writes to --out: images.txt (refined poses, in the capture's order and camera id),
 cameras.txt (unchanged intrinsics), points3D_features.txt (COLMAP's triangulated feature
 points) and stats.json. Prints "PHASE: ..." lines for progress. Exits non-zero, with the
@@ -76,21 +80,37 @@ def refine(colmap, images, src, work, out, gpu=False):
     log, db = work / "colmap.log", work / "database.db"
     use_gpu = 1 if gpu else 0
     cams = [l.split() for l in open(src / "cameras.txt") if l.strip() and not l.startswith("#")]
-    if len(cams) != 1:
-        raise RuntimeError("pose refinement supports single-camera captures only")
+    per_image = len(cams) > 1
+    if per_image and any(c[1] != "PINHOLE" for c in cams):
+        raise RuntimeError("per-photo cameras must be PINHOLE")
+    cam_by_id = {c[0]: c for c in cams}
     model, params = cams[0][1], ",".join(cams[0][4:])
     orig = read_poses(src / "images.txt")
     n = len(orig)
     t0 = time.time()
 
     phase(f"features ({n} photos)")
-    run([colmap, "feature_extractor", "--database_path", db, "--image_path", images,
-         "--ImageReader.camera_model", model, "--ImageReader.single_camera", 1,
-         "--ImageReader.camera_params", params, "--FeatureExtraction.use_gpu", use_gpu,
+    cam_args = (["--ImageReader.camera_model", "PINHOLE", "--ImageReader.single_camera_per_image", 1]
+                if per_image else
+                ["--ImageReader.camera_model", model, "--ImageReader.single_camera", 1,
+                 "--ImageReader.camera_params", params])
+    run([colmap, "feature_extractor", "--database_path", db, "--image_path", images, *cam_args,
+         "--FeatureExtraction.use_gpu", use_gpu,
          "--FeatureExtraction.max_image_size", 1600, "--log_target", "stderr"], log)
 
     con = sqlite3.connect(db)
     ids = {nm: (iid, cid) for iid, nm, cid in con.execute("select image_id, name, camera_id from images")}
+    own = {}   # db camera id -> the photo's camera line (per-photo intrinsics)
+    if per_image:   # give each photo's database camera its real intrinsics (used in matching too)
+        for nm, (iid, cid) in ids.items():
+            if nm not in orig:
+                continue
+            c = cam_by_id[orig[nm][0][8]]
+            own[cid] = c
+            con.execute("update cameras set model = 1, params = ?, prior_focal_length = 1 where camera_id = ?",
+                        (struct.pack("<4d", *map(float, c[4:8])), cid))
+        con.commit()
+    rigs = {cid: rid for rid, cid in con.execute("select rig_id, ref_sensor_id from rigs where ref_sensor_type = 0")}
     frames = {d: (f, r) for f, r, d in con.execute(
         "select f.frame_id, f.rig_id, d.data_id from frames f join frame_data d on f.frame_id = d.frame_id")}
     phase("matching")
@@ -114,9 +134,13 @@ def refine(colmap, images, src, work, out, gpu=False):
     # Known-pose model with the database's ids (COLMAP 4 also wants rigs + frames).
     known = work / "known"
     known.mkdir()
-    cid = next(iter(ids.values()))[1]
-    (known / "cameras.txt").write_text(" ".join([str(cid)] + cams[0][1:]) + "\n")
-    (known / "rigs.txt").write_text(f"1 1 CAMERA {cid}\n")
+    if per_image:
+        (known / "cameras.txt").write_text("".join(" ".join([str(cid)] + c[1:]) + "\n" for cid, c in own.items()))
+        (known / "rigs.txt").write_text("".join(f"{rigs[cid]} 1 CAMERA {cid}\n" for cid in own))
+    else:
+        cid = next(iter(ids.values()))[1]
+        (known / "cameras.txt").write_text(" ".join([str(cid)] + cams[0][1:]) + "\n")
+        (known / "rigs.txt").write_text(f"{rigs.get(cid, 1)} 1 CAMERA {cid}\n")
     img_lines, frame_lines = [], []
     for nm, (p, _, _) in orig.items():
         iid, c = ids[nm]
@@ -164,11 +188,11 @@ def refine(colmap, images, src, work, out, gpu=False):
         raise RuntimeError(f"refinement looked worse than the original poses: {stats}")
 
     lines = []
-    for nm in orig:   # the capture's order and camera id, poses from the refined model
+    for nm in orig:   # the capture's order and camera ids, poses from the refined model
         p = new[nm][0] if nm in new else orig[nm][0]
-        lines += [" ".join(p[:8] + [cams[0][0], nm]), ""]
+        lines += [" ".join(p[:8] + [orig[nm][0][8], nm]), ""]
     (out / "images.txt").write_text("\n".join(lines) + "\n")
-    (out / "cameras.txt").write_text(" ".join(cams[0]) + "\n")   # intrinsics unchanged
+    (out / "cameras.txt").write_text("".join(" ".join(c) + "\n" for c in cams))   # intrinsics unchanged
     shutil.copyfile(txt / "points3D.txt", out / "points3D_features.txt")
     (out / "stats.json").write_text(json.dumps(stats, indent=1) + "\n")
     phase("done")

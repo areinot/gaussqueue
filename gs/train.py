@@ -13,7 +13,12 @@ the queue can follow either trainer the same way: <out>/export_<step>.ply checkp
 Depth supervision compares rendered depth with the photo's LiDAR depth only where ARKit's
 confidence is at least --depth-conf (2 = high); sky and far geometry have no LiDAR return
 (confidence 0) and are left to the photos alone. --flat-weight penalises each splat's
-smallest axis so splats lie flat on surfaces.
+smallest axis so splats lie flat on surfaces. --needle-weight penalises needles: splats
+whose longest axis is more than --needle-max times their middle one (flat disks are fine).
+
+Box datasets (box.py) have per-photo masks: colour is trained only on pixels whose surface
+lies inside the box, pixels where the box must be empty push transparency (--empty-weight),
+the rest are ignored; with --box box.json, splats that leave the box are removed.
 """
 import argparse
 import json
@@ -53,6 +58,11 @@ def parse(argv=None):
     p.add_argument("--far-flat-weight", type=float, default=0.0,
                    help="make splats outside the scanned region thin along the line to its centre (billboards)")
     p.add_argument("--antialiased", action="store_true")
+    p.add_argument("--box", help="box.json from box.py: keep splats inside the box")
+    p.add_argument("--empty-weight", type=float, default=0.1,
+                   help="masked datasets: weight of rendered opacity where the box must be empty")
+    p.add_argument("--needle-weight", type=float, default=0.0)
+    p.add_argument("--needle-max", type=float, default=5.0)
     p.add_argument("--init-ply")
     p.add_argument("--points", help="points3D.txt to initialise from instead of the model's")
     p.add_argument("--sky-points", type=int, default=0,
@@ -170,6 +180,42 @@ def far_flat_loss(params, space):
     return (sigma_r / s.max(-1).values).mean()
 
 
+class Box:
+    def __init__(self, path, dev):
+        b = json.loads(Path(path).read_text())
+        self.center = torch.tensor(b["center"], dtype=torch.float32, device=dev)
+        self.axes = torch.tensor(b["axes"], dtype=torch.float32, device=dev)
+        self.half = torch.tensor(b["half"], dtype=torch.float32, device=dev)
+
+    def inside(self, P, pad=0.02):
+        return (((P - self.center) @ self.axes).abs() <= self.half * (1 + pad)).all(-1)
+
+
+@torch.no_grad()
+def keep_in_box(params, box, min_logit=-6.0):
+    out = ~box.inside(params["means"])
+    params["opacities"][out] = min_logit   # MCMC relocates them, default densification prunes
+    return int(out.sum())
+
+
+def needle_loss(params, ratio):
+    s = torch.exp(params["scales"]).sort(-1).values   # ascending: min, mid, max
+    return F.relu(s[:, 2] / s[:, 1].clamp_min(1e-9) - ratio).mean()
+
+
+@torch.no_grad()
+def shape_stats(params):
+    """Share of visible splats (opacity > 0.1) that are needles (longest axis > 10x the middle)
+    and that are flat (smallest axis < 0.1x the middle)."""
+    vis = torch.sigmoid(params["opacities"]) > 0.1
+    s = torch.exp(params["scales"][vis]).sort(-1).values
+    if not len(s):
+        return {"visible": 0}
+    return {"visible": int(vis.sum()),
+            "needle_pct": round(100 * float((s[:, 2] > 10 * s[:, 1]).float().mean()), 2),
+            "flat_pct": round(100 * float((s[:, 0] < 0.1 * s[:, 1]).float().mean()), 2)}
+
+
 def make_params(splats, device):
     return torch.nn.ParameterDict({k: torch.nn.Parameter(v.to(device).contiguous()) for k, v in splats.items()})
 
@@ -243,7 +289,8 @@ def evaluate(params, views, sh_degree, mode, antialiased, out_dir=None):
             rgb, depth, alpha, *_ = render(params, views, i, sh_degree, mode, antialiased)
             gt = views.image(i)
             rgb = rgb.clamp(0, 1)
-            r = {"name": views.names[i], "psnr": gsdata.psnr(rgb, gt), "ssim": float(gsdata.ssim(rgb, gt))}
+            m = views.masks[i] == 255 if views.masks and views.masks[i] is not None else None
+            r = {"name": views.names[i], "psnr": gsdata.psnr(rgb, gt, m), "ssim": float(gsdata.ssim(rgb, gt, m))}
             if views.depth[i] is not None:
                 r["depth_err"] = depth_error(depth, alpha, views.depth[i], views.conf[i])
             res.append(r)
@@ -318,6 +365,8 @@ def train(a, splats=None, log=print):
 
     packed = a.mode == "3dgs"
     space = Space(a.space, dev) if a.space else None
+    box = Box(a.box, dev) if a.box else None
+    boxed = 0
     carved = [0, 0]
     eval_view = ev if len(ev) else tv
     t0, last = time.time(), time.time()
@@ -329,7 +378,15 @@ def train(a, splats=None, log=print):
         gt = tv.image(i)
         if strategy:
             strategy.step_pre_backward(params, opts, state, step, meta)
-        loss = 0.8 * (rgb_r - gt).abs().mean() + 0.2 * (1 - gsdata.ssim(rgb_r, gt))
+        mask = tv.masks[i]
+        if mask is None:
+            loss = 0.8 * (rgb_r - gt).abs().mean() + 0.2 * (1 - gsdata.ssim(rgb_r, gt))
+        else:
+            keep, empty = mask == 255, mask == 128
+            l1 = (rgb_r - gt).abs()[keep].mean() if keep.any() else rgb_r.sum() * 0
+            loss = 0.8 * l1 + 0.2 * (1 - gsdata.ssim(rgb_r, gt, keep))
+            if empty.any() and a.empty_weight > 0:
+                loss = loss + a.empty_weight * alpha[empty].mean()
         if a.depth_weight > 0 and tv.depth[i] is not None:
             loss = loss + a.depth_weight * depth_loss(depth, alpha, tv.depth[i], tv.conf[i], a.depth_conf)
         if a.flat_weight > 0 and a.mode == "3dgs":
@@ -340,6 +397,8 @@ def train(a, splats=None, log=print):
                 loss = loss + 0.05 * n_err.mean()
             if step > a.steps // 10:
                 loss = loss + 0.01 * ex["distort"].mean()
+        if a.needle_weight > 0:
+            loss = loss + a.needle_weight * needle_loss(params, a.needle_max)
         if mcmc:
             loss = loss + 0.01 * torch.sigmoid(params["opacities"]).mean() + 0.01 * torch.exp(params["scales"]).mean()
         if space is not None and a.far_flat_weight > 0:
@@ -357,6 +416,8 @@ def train(a, splats=None, log=print):
                 strategy.refine_stop_iter = step   # cap reached: stop growing
                 log(f"splat cap {a.max_splats:,} reached at step {step}; densification stopped")
 
+        if box is not None and step % 100 == 0 and step <= a.steps - 200:
+            boxed += keep_in_box(params, box)
         if space is not None and a.carve and step % 100 == 0 and step <= a.steps - 200:
             d, sh = carve(params, space)
             carved[0] += d
@@ -373,10 +434,15 @@ def train(a, splats=None, log=print):
         if a.export_every and step % a.export_every == 0 and step != a.steps:
             gsdata.save_ply(out / f"export_{step}.ply", dict(params))
 
+    if box is not None:   # drop what ended up outside the box
+        with torch.no_grad():
+            inside = box.inside(params["means"])
+            params = make_params({k: v[inside] for k, v in params.items()}, dev)
     gsdata.save_ply(out / f"export_{a.steps}.ply", dict(params))
     metrics = {"steps": a.steps, "splats": len(params["means"]), "train_seconds": round(time.time() - t0, 1),
                "peak_gpu_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
-               "carved": {"removed": carved[0], "shortened": carved[1]},
+               "carved": {"removed": carved[0], "shortened": carved[1]}, "left_box": boxed,
+               "shapes": shape_stats(params),
                "views_train": len(tv), "views_test": len(ev), "settings": vars(a)}
     if len(ev):
         metrics["test"] = evaluate(params, ev, sh_degree, a.mode, a.antialiased, out / "test_renders")

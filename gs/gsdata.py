@@ -159,11 +159,13 @@ def split(images, holdout_every):
 
 class Views:
     """Images (uint8 on the GPU), intrinsics and view matrices at a capped resolution,
-    plus LiDAR depth/confidence when a SplatKing sensor_data folder is given."""
+    plus LiDAR depth/confidence when a SplatKing sensor_data folder is given, and the
+    per-photo masks of a box dataset (box.py: 255 train colour, 128 must be empty, 0 ignore)."""
 
     def __init__(self, root, images, max_res, device="cuda", depth_dir=None):
         root = Path(root)
         self.names, self.rgb, self.K, self.viewmats, self.depth, self.conf = [], [], [], [], [], []
+        self.masks = []
         for im in images:
             img = Image.open(root / "images" / im["name"]).convert("RGB")
             cam = im["cam"]
@@ -174,6 +176,14 @@ class Views:
             self.K.append(torch.tensor([[cam["fx"] * sx, 0, cam["cx"] * sx],
                                         [0, cam["fy"] * sy, cam["cy"] * sy], [0, 0, 1]], dtype=torch.float32))
             self.rgb.append(torch.from_numpy(np.array(img)).to(device))
+            mp = root / "masks" / (Path(im["name"]).stem + ".png")
+            m = None
+            if mp.exists():
+                mi = Image.open(mp)
+                if mi.size != img.size:
+                    mi = mi.resize(img.size, Image.NEAREST)
+                m = torch.from_numpy(np.array(mi)).to(device)
+            self.masks.append(m)
             self.viewmats.append(torch.tensor(im["viewmat"], dtype=torch.float32))
             self.names.append(im["name"])
             d = c = None
@@ -231,8 +241,9 @@ def _gauss_window(size=11, sigma=1.5, device="cuda"):
     return (g[:, None] @ g[None, :]).expand(3, 1, size, size).contiguous()
 
 
-def ssim(a, b):
-    """SSIM of two [H,W,3] images in 0..1 (differentiable)."""
+def ssim(a, b, mask=None):
+    """SSIM of two [H,W,3] images in 0..1 (differentiable); with a [H,W] bool mask, the
+    mean over the masked pixels only."""
     import torch.nn.functional as F
     x, y = a.permute(2, 0, 1)[None], b.permute(2, 0, 1)[None]
     w = _gauss_window(device=a.device)
@@ -242,11 +253,17 @@ def ssim(a, b):
     sxy = F.conv2d(x * y, w, groups=3) - mu_x * mu_y
     c1, c2 = 0.01 ** 2, 0.03 ** 2
     m = ((2 * mu_x * mu_y + c1) * (2 * sxy + c2)) / ((mu_x ** 2 + mu_y ** 2 + c1) * (sxx + syy + c2))
-    return m.mean()
+    if mask is None:
+        return m.mean()
+    k = (w.shape[-1] - 1) // 2
+    mm = mask[k:-k, k:-k]
+    return m[0].mean(0)[mm].mean() if mm.any() else m.mean()
 
 
-def psnr(a, b):
-    return float(-10 * torch.log10(((a - b) ** 2).mean().clamp_min(1e-10)))
+def psnr(a, b, mask=None):
+    e = (a - b) ** 2
+    e = e[mask] if mask is not None and mask.any() else e
+    return float(-10 * torch.log10(e.mean().clamp_min(1e-10)))
 
 
 def save_png(path, img):

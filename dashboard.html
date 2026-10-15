@@ -56,6 +56,14 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .card .body { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .card .name { font-size: 14px; }
 .meta { font-size: 12px; color: var(--muted); }
+.exp { margin-top: 14px; }
+.exp-rows { display: flex; flex-direction: column; gap: 6px; }
+.exp-row { display: grid; grid-template-columns: minmax(90px, 160px) 90px 1fr; gap: 10px; align-items: center; font-size: 13px; }
+.exp-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.exp-bar { height: 6px; background: var(--track); border-radius: 3px; overflow: hidden; }
+.exp-bar > span { display: block; height: 100%; background: var(--accent); }
+.exp-row.s-done .exp-bar > span { background: var(--ok); } .exp-row.s-failed { color: var(--bad); }
+.exp-row.s-queued, .exp-row.s-waiting { color: var(--muted); }
 .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 99px;
   border: 1px solid currentColor; text-transform: uppercase; letter-spacing: .04em; }
 .b-queued { color: var(--accent); } .b-arriving { color: var(--warn); }
@@ -281,12 +289,36 @@ function renderJobs(jobs) {
   const el = $("now");
   if (editing(el)) return;
   for (const k of Object.keys(selectedBy)) if (!jobs.some(j => j.name === k)) delete selectedBy[k];
+  const exp = experimentsPanel(last && last.experiments);
   if (!jobs.length) {
-    setHTML(el, `<div class="panel"><div class="idle">Idle. Drop a capture (zip or folder with a COLMAP model) into <b>${esc(last && last.inbox_dir || "the inbox")}</b>.</div></div>`);
+    setHTML(el, exp || `<div class="panel"><div class="idle">Idle. Drop a capture (zip or folder with a COLMAP model) into <b>${esc(last && last.inbox_dir || "the inbox")}</b>.</div></div>`);
     return;
   }
-  setHTML(el, jobs.map(jobPanel).join(""));
+  setHTML(el, jobs.map(jobPanel).join("") + exp);
   fillHelp();
+}
+
+// An experiment batch (tools/experiments.py): one row per variant. While it runs, the queue
+// doesn't start captures on its machine.
+function experimentsPanel(e) {
+  if (!e || !(e.variants || []).length) return "";
+  const w = (last.workers || []).find(x => x.name === e.worker);
+  const row = (v) => {
+    const res = v.psnr != null ? `PSNR ${v.psnr.toFixed(2)}${v.depth_err != null ? ` · depth ${(100 * v.depth_err).toFixed(1)}%` : ""}` : "";
+    const st = v.state === "done" ? `✓ ${res}`
+      : v.state === "running" ? `${v.step != null ? `step ${v.step.toLocaleString()} / ${(v.total || 0).toLocaleString()}` : "starting"}${v.eta ? ` · ends ${clock(v.eta)}` : ""}`
+      : v.state === "failed" ? `failed${v.error ? ": " + esc(v.error) : ""}`
+      : v.state === "waiting" ? `waiting: ${esc(v.waiting || "")}` : "queued";
+    const pct = v.state === "done" ? 100 : v.step && v.total ? Math.min(100, 100 * v.step / v.total) : 0;
+    return `<div class="exp-row s-${esc(v.state)}"><span class="exp-name" title="${esc((v.args || []).join(" "))}">${esc(v.name)}</span>
+      <span class="exp-bar"><span style="width:${pct.toFixed(1)}%"></span></span><span class="exp-state">${st}</span></div>`;
+  };
+  const state = e.live ? (e.eta ? `done ~${clock(e.eta)}` : "running") : e.finished ? `finished ${clock(e.finished)}` : "stopped";
+  return `<div class="panel exp"><div class="info">
+    <div class="name">🧪 ${esc(e.name || "Experiments")}${w ? `<span class="onbadge">on ${esc(w.label)}</span>` : ""}</div>
+    <div class="phase">${esc(state)}${e.live ? " · new captures wait for this machine" : ""}</div>
+    ${e.note ? `<div class="meta">${esc(e.note)}</div>` : ""}
+    <div class="exp-rows">${e.variants.map(row).join("")}</div></div></div>`;
 }
 
 function jobPanel(c) {

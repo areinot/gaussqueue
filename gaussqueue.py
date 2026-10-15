@@ -36,6 +36,7 @@ APP_HOME = Path(os.environ.get("GAUSSQUEUE_HOME",
 CONFIG_PATH = APP_HOME / "config.json"
 STATE_PATH = APP_HOME / "state.json"
 OVERRIDES_PATH = APP_HOME / "overrides.json"
+EXPERIMENTS_PATH = APP_HOME / "experiments.json"   # written by tools/experiments.py
 DASHBOARD_HTML = Path(__file__).resolve().parent / "dashboard.html"
 GS_DIR = Path(__file__).resolve().parent / "gs"   # gsplat trainer/pruner, copied to CUDA workers
 SF_DATALESS = 0x40000000   # st_flags bit for iCloud placeholder ("dataless") files
@@ -950,6 +951,7 @@ class Status:
             "presets": {k: (v or standard_settings(cfg)) for k, v in PRESETS.items()},
             "limits": SETTING_LIMITS,
             "choices": SETTING_CHOICES,
+            "experiments": read_experiments(),
         }
         self.write_text(jobs, queue, hist)
 
@@ -2805,6 +2807,19 @@ SCRIPT = Path(__file__).resolve()
 SCRIPT_MTIME = SCRIPT.stat().st_mtime
 
 
+def read_experiments():
+    """Progress of an experiment batch (tools/experiments.py), for the dashboard and so the
+    queue leaves its machine alone. The runner rewrites the file at least every 30 s, so a
+    file not updated for 2 minutes is a batch that stopped. Finished ones show for 12 hours."""
+    try:
+        e = json.loads(EXPERIMENTS_PATH.read_text())
+    except (OSError, ValueError):
+        return None
+    age = time.time() - float(e.get("updated") or 0)
+    e["live"] = not e.get("finished") and age < 120
+    return e if e["live"] or age < 12 * 3600 else None
+
+
 def can_take(cfg, worker, ov, any_gsplat):
     """Whether a worker may start a queued capture: honours "Run on", and keeps gsplat
     captures for workers that have gsplat (if there are any; pinned ones fall back to Brush)."""
@@ -2901,8 +2916,10 @@ def main():
                 reload_if_changed()
             claimed = {n for _, n in list(running.values())}
             any_gsplat = any(w.gsplat for w in status.workers.values())
+            exp = read_experiments()
+            experimenting = exp.get("worker") if exp and exp["live"] else None
             for w in list(status.workers.values()):   # remote GPUs first, then the Mac
-                if w.name in running or (w.remote and not w.online):
+                if w.name in running or (w.remote and not w.online) or w.name == experimenting:
                     continue
                 item = next((i for i in inbox.ready(overrides) if i.name not in claimed
                              and can_take(cfg, w, overrides.get(i.name), any_gsplat)), None)
