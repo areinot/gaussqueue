@@ -863,6 +863,9 @@ class Status:
         v["remote"] = bool(w and w.remote)
         if self.snapshots:
             v["snapshots"] = self.snapshots.for_job(c["name"])
+            for sn in v["snapshots"]:   # published snapshots are results of their own
+                sn["result"] = f"{sn['name']}-step{sn['step']}"
+                sn["downloads"] = result_downloads(self.paths, sn["result"]) if sn.get("state") == "done" else []
         v["pending_settings"] = effective_settings(cfg, self.overrides.get(c["name"]))
         v["previews"] = sorted(p.name for p in self.paths.previews.glob(f"{c['name']}_step*.jpg"))
         return v

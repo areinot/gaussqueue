@@ -312,7 +312,7 @@ function jobPanel(c) {
             : sn.state === "processing" ? "processing…"
             : sn.state === "failed" ? `failed: ${esc(sn.error || "")}`
             : `queued${sn.waiting ? `: ${esc(sn.waiting)}` : ""}`;
-          return `<div class="s-${esc(sn.state)}">📸 step ${(sn.step || 0).toLocaleString()}: ${label}</div>`; }).join("")}</div>` : ""}
+          return `<div class="s-${esc(sn.state)}">📸 step ${(sn.step || 0).toLocaleString()}: ${label}${dlButtons(sn.result, sn.downloads)}</div>`; }).join("")}</div>` : ""}
       ${c.paused ? `${settingsHTML({name: c.name, settings: pend, photo_px: c.photo_px}, true)}
         <div class="meta">${changed ? "Changed settings restart training from step 0 (the capture stays on local disk)." : "Change settings to restart from step 0 with them, or resume where it stopped."}</div>` : ""}` : "";
   // Time-dependent values (elapsed, ETA) are left as empty slots and filled by tick().
@@ -432,6 +432,14 @@ function etaLine(it) {
     .map(w => `${est[w.name] ? dur(est[w.name]) : "?"} (${esc(shortLabel(w))})`);
   if (!parts.length && it.est_seconds) parts.push(dur(it.est_seconds));
   return parts.length ? `<div class="quality"><b>Est. time</b> ${parts.join(" · ")}</div>` : "";
+}
+
+// Download buttons for a result's files (<name>.ply, .v3.spz, .v4.spz), saved by the browser.
+function dlButtons(name, downloads) {
+  if (!name || !(downloads || []).length) return "";
+  return `<div class="dls">${downloads.map(d =>
+    `<a class="dl" href="/download/${encodeURIComponent(name)}/${encodeURIComponent(d.file)}" download="${esc(d.file)}"
+       title="Save ${esc(d.file)} (${size(d.size)})">${esc(d.file.slice(name.length))} <span>${size(d.size)}</span></a>`).join("")}</div>`;
 }
 
 function selectHTML(key, value, opts) {
@@ -735,9 +743,7 @@ function renderHistory(h) {
         <div class="name">${esc(r.name)} <span class="badge b-${esc(r.result)}">${esc(r.result)}</span></div>
         <div class="detail">${esc(r.duration)}${r.detail ? " · " + esc(r.detail) : ""}${r.result === "done" ? ` · outbox/${esc(r.name)}/` : ""}</div>
         ${captureQuality(r.quality)}
-        ${(r.downloads || []).length ? `<div class="dls">${r.downloads.map(d =>
-          `<a class="dl" href="/download/${encodeURIComponent(r.name)}/${encodeURIComponent(d.file)}" download="${esc(d.file)}"
-             title="Save ${esc(d.file)} (${size(d.size)})">${esc(d.file.slice(r.name.length))} <span>${size(d.size)}</span></a>`).join("")}</div>` : ""}
+        ${dlButtons(r.name, r.downloads)}
       </div>
       <div class="when">
         <div class="top"><span class="meta">${esc(r.finished)}</span>
