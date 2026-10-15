@@ -81,6 +81,10 @@ DEFAULTS = {
     # not just the LiDAR points. LiDAR only reaches ~5 m, so without them distant trees,
     # buildings and sky have nothing to grow from and end up as blur near the camera.
     "init_feature_points": True,
+    # With pose refinement, also calibrate the lens: each photo's own focal length (ARKit's,
+    # which follows autofocus) and the capture's lens distortion; training then uses
+    # undistorted photos. In tests this was the largest single gain (+0.8 dB).
+    "lens_correction": True,
     # Trainer: "brush" (runs anywhere) or "gsplat" (CUDA; only on remote workers that have
     # a "gsplat" entry, see workers below). Per-capture override on the dashboard.
     "trainer": "brush",
@@ -1262,7 +1266,7 @@ def mean_reprojection(colmap, model):
     return float(m.group(1)) if m else None
 
 
-REFINE_VERSION = "1"   # bump when the refinement method changes, to invalidate the cache
+REFINE_VERSION = "2"   # bump when the refinement method changes, to invalidate the cache
 POSE_CACHE = APP_HOME / "pose_cache"
 
 
@@ -1272,7 +1276,7 @@ def pose_cache_dir(cfg, colmap_dir, name):
     different capture or method never reuses stale results."""
     import hashlib
     src = colmap_dir / "sparse" / "0"
-    h = hashlib.sha256(REFINE_VERSION.encode())
+    h = hashlib.sha256((REFINE_VERSION + ("+lens" if cfg.get("lens_correction", True) else "")).encode())
     for f in ("cameras.txt", "images.txt"):
         h.update((src / f).read_bytes())
     colmap = shutil.which(cfg.get("colmap") or "colmap") or ""
@@ -1286,15 +1290,87 @@ FEATURE_POINTS = "points3D_features.txt"   # written by gs/refine.py
 SPACE_VERSION = "space1"   # bump when gs/fuse.py's space map changes, to invalidate cached maps
 
 
-def build_refined_model(colmap_dir, cache, out):
-    """A trainable COLMAP folder: cached refined poses, original photos, LiDAR points
-    (+ the cached feature points, when there are any)."""
+def per_photo_cameras(colmap_dir, sensor, out):
+    """A copy of the capture's COLMAP folder (photos linked) with one PINHOLE camera per photo
+    from SplatKing's per-photo ARKit intrinsics, which follow autofocus. None if the capture
+    has no per-photo intrinsics."""
     src = colmap_dir / "sparse" / "0"
+    if not sensor:
+        return None
+    cams = [l.split() for l in (src / "cameras.txt").read_text().splitlines() if l.strip() and not l.startswith("#")]
+    if len(cams) != 1:
+        return None
+    w, h = cams[0][2], cams[0][3]
+    lines = [l for l in (src / "images.txt").read_text().splitlines() if not l.startswith("#")]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    cam_lines, img_lines = [], []
+    for k in range(0, len(lines), 2):
+        p = lines[k].split()
+        if len(p) < 10:
+            continue
+        try:
+            K = json.loads((sensor / (Path(p[9]).stem + ".json")).read_text())["metadata"]["camera"]["intrinsics"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        cid = str(len(cam_lines) + 1)
+        cam_lines.append(f"{cid} PINHOLE {w} {h} {K[0]} {K[4]} {K[6]} {K[7]}")
+        img_lines += [" ".join(p[:8] + [cid, p[9]]), lines[k + 1] if k + 1 < len(lines) else ""]
     shutil.rmtree(out, ignore_errors=True)
     (out / "sparse" / "0").mkdir(parents=True)
     (out / "images").symlink_to((colmap_dir / "images").resolve())
-    for f in ("images.txt", "cameras.txt"):
-        shutil.copyfile(cache / f, out / "sparse" / "0" / f)
+    (out / "sparse" / "0" / "cameras.txt").write_text("\n".join(cam_lines) + "\n")
+    (out / "sparse" / "0" / "images.txt").write_text("\n".join(img_lines) + "\n")
+    if (src / "points3D.txt").exists():
+        shutil.copyfile(src / "points3D.txt", out / "sparse" / "0" / "points3D.txt")
+    return out
+
+
+def lens_distorted(cameras_txt):
+    return any(l.split()[1] not in ("PINHOLE", "SIMPLE_PINHOLE") for l in Path(cameras_txt).read_text().splitlines()
+               if l.strip() and not l.startswith("#"))
+
+
+def undistort(cfg, photos, cameras_txt, images_txt, out):
+    """Undistorted photos + PINHOLE cameras for a calibrated (RADIAL/OPENCV) model, with COLMAP's
+    image_undistorter, into out/images and out/sparse/0 (text). Same poses and photo names."""
+    colmap = shutil.which(cfg.get("colmap") or "colmap") or cfg.get("colmap")
+    tmp = out.with_name(out.name + ".undistort")
+    shutil.rmtree(tmp, ignore_errors=True)
+    (tmp / "in").mkdir(parents=True)
+    shutil.copyfile(cameras_txt, tmp / "in" / "cameras.txt")
+    shutil.copyfile(images_txt, tmp / "in" / "images.txt")
+    (tmp / "in" / "points3D.txt").write_text("")
+    r = subprocess.run([colmap, "image_undistorter", "--image_path", str(photos), "--input_path", str(tmp / "in"),
+                        "--output_path", str(tmp / "out"), "--output_type", "COLMAP"], capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(f"undistorting photos failed: {(r.stderr or r.stdout).strip().splitlines()[-1:]}")
+    sp = tmp / "out" / "sparse"
+    (out / "sparse" / "0").mkdir(parents=True, exist_ok=True)
+    r = subprocess.run([colmap, "model_converter", "--input_path", str(sp), "--output_path", str(out / "sparse" / "0"),
+                        "--output_type", "TXT"], capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError("converting the undistorted model failed")
+    if (out / "images").is_symlink() or (out / "images").exists():
+        (out / "images").unlink() if (out / "images").is_symlink() else shutil.rmtree(out / "images")
+    shutil.move(str(tmp / "out" / "images"), out / "images")
+    for f in ("rigs.txt", "frames.txt", "points3D.txt"):
+        (out / "sparse" / "0" / f).unlink(missing_ok=True)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def build_refined_model(colmap_dir, cache, out, cfg=None):
+    """A trainable COLMAP folder: cached refined poses, original photos (undistorted when the
+    lens was calibrated), LiDAR points (+ the cached feature points, when there are any)."""
+    src = colmap_dir / "sparse" / "0"
+    shutil.rmtree(out, ignore_errors=True)
+    (out / "sparse" / "0").mkdir(parents=True)
+    if cfg is not None and lens_distorted(cache / "cameras.txt"):
+        undistort(cfg, colmap_dir / "images", cache / "cameras.txt", cache / "images.txt", out)
+    else:
+        (out / "images").symlink_to((colmap_dir / "images").resolve())
+        for f in ("images.txt", "cameras.txt"):
+            shutil.copyfile(cache / f, out / "sparse" / "0" / f)
     if (cache / FEATURE_POINTS).exists():
         shutil.copyfile(cache / FEATURE_POINTS, out / "sparse" / "0" / FEATURE_POINTS)
     pts = src / "points3D.txt" if (src / "points3D.txt").exists() else cache / "points3D.txt"
@@ -1307,8 +1383,9 @@ def save_pose_cache(cache, model, stats):
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
     for f in ("images.txt", "cameras.txt", FEATURE_POINTS):
-        if (model / "sparse" / "0" / f).exists():
-            shutil.copyfile(model / "sparse" / "0" / f, tmp / f)
+        cal = model / "sparse" / "0" / f"calibrated_{f}"   # the lens-calibrated cameras, not the undistorted ones
+        if cal.exists() or (model / "sparse" / "0" / f).exists():
+            shutil.copyfile(cal if cal.exists() else model / "sparse" / "0" / f, tmp / f)
     (tmp / "stats.json").write_text(json.dumps(
         dict(stats, saved=dt.datetime.now().isoformat(timespec="seconds")), indent=2) + "\n")
     shutil.rmtree(cache, ignore_errors=True)
@@ -1325,7 +1402,7 @@ def refined_model(cfg, colmap_dir, work, beat, job, worker=None):
             and (not want_features or (cache / FEATURE_POINTS).exists())):
         stats = json.loads((cache / "stats.json").read_text())
         log(f"using cached pose refinement for {job['name']} ({cache.name})")
-        model, stats = build_refined_model(colmap_dir, cache, work / "model"), dict(stats, cached=True)
+        model, stats = build_refined_model(colmap_dir, cache, work / "model", cfg), dict(stats, cached=True)
     else:
         model, stats = refine_poses(cfg, colmap_dir, work, beat, job, worker)
         try:
@@ -1370,6 +1447,11 @@ def refine_poses(cfg, colmap_dir, work, beat, job, worker=None):
     work.mkdir(parents=True)
     out = work / "refined"
     stats = None
+    if cfg.get("lens_correction", True):   # start from each photo's own ARKit intrinsics
+        pp = per_photo_cameras(colmap_dir, find_sensor_data(colmap_dir.parent) or find_sensor_data(colmap_dir),
+                               work / "input")
+        if pp is not None:
+            colmap_dir, src = pp, pp / "sparse" / "0"
     if worker is not None and worker.remote and worker.can_refine():
         try:
             stats = worker.refine(cfg, job, colmap_dir, out, beat)
@@ -1381,9 +1463,18 @@ def refine_poses(cfg, colmap_dir, work, beat, job, worker=None):
         stats = refine_locally(cfg, colmap_dir, work, out, beat, job)
     model = work / "model"
     (model / "sparse" / "0").mkdir(parents=True)
-    (model / "images").symlink_to((colmap_dir / "images").resolve())
-    for f in ("images.txt", "cameras.txt", FEATURE_POINTS):
-        shutil.copyfile(out / f, model / "sparse" / "0" / f)
+    if lens_distorted(out / "cameras.txt"):
+        job["phase"] = "undistorting photos"
+        beat(force=True)
+        undistort(cfg, colmap_dir / "images", out / "cameras.txt", out / "images.txt", model)
+        job.pop("images_on", None)   # a worker's copies are the originals; upload these instead
+        shutil.copyfile(out / FEATURE_POINTS, model / "sparse" / "0" / FEATURE_POINTS)
+        for f in ("images.txt", "cameras.txt"):   # the cache keeps the calibrated cameras
+            shutil.copyfile(out / f, model / "sparse" / "0" / f"calibrated_{f}")
+    else:
+        (model / "images").symlink_to((colmap_dir / "images").resolve())
+        for f in ("images.txt", "cameras.txt", FEATURE_POINTS):
+            shutil.copyfile(out / f, model / "sparse" / "0" / f)
     pts = src / "points3D.txt" if (src / "points3D.txt").exists() else out / FEATURE_POINTS
     shutil.copyfile(pts, model / "sparse" / "0" / "points3D.txt")
     log(f"refined poses for {job['name']}: {stats}")
@@ -1396,7 +1487,7 @@ def refine_locally(cfg, colmap_dir, work, out, beat, job):
         raise RuntimeError("colmap not found (brew install colmap)")
     cmd = [sys.executable, "-I", "-u", str(GS_DIR / "refine.py"), "--colmap", colmap,
            "--images", str(colmap_dir / "images"), "--model", str(colmap_dir / "sparse" / "0"),
-           "--work", str(work / "colmap"), "--out", str(out)]
+           "--work", str(work / "colmap"), "--out", str(out)] + (["--lens"] if cfg.get("lens_correction", True) else [])
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     last = ""
     for line in proc.stdout:   # PHASE lines drive the dashboard; the last line is the result
@@ -1940,6 +2031,8 @@ class RemoteWorker:
                 "--work", f"{d}/refine", "--out", f"{d}/refined"]
         if self.spec.get("colmap_gpu", True):
             args.append("--gpu")
+        if cfg.get("lens_correction", True):
+            args.append("--lens")
         log(f"run on {self.label}: refine {' '.join(map(str, args))}")
         job["phase"] = f"refining poses on {self.label}"
         beat(force=True)

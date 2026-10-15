@@ -10,8 +10,16 @@ positions as priors) -> triangulate with the known poses -> bundle-adjust poses 
 LiDAR points and "up" still line up.
 
 The model may have one camera for all photos or one per photo (PINHOLE, e.g. each photo's
-own ARKit intrinsics: autofocus changes the focal length by several percent); either way
-the intrinsics are kept as given.
+own ARKit intrinsics: autofocus changes the focal length by several percent).
+
+With --lens, the lens is calibrated after the poses: one radial distortion (k1, k2) and focal
+length for the whole capture, fitted on a shared camera. Each photo keeps its own starting
+focal length (ARKit's, which tracks autofocus) scaled so their median matches the fitted one;
+fitting each photo's focal freely is unreliable (a photo of mostly flat surfaces can trade
+focal length for distance, the "dolly zoom"). Poses then settle again with these cameras.
+cameras.txt holds RADIAL cameras (one per photo); undistort the photos with them (colmap
+image_undistorter) before training. Without --lens the
+intrinsics are kept as given.
 
 Writes to --out: images.txt (refined poses, in the capture's order and camera id),
 cameras.txt (unchanged intrinsics), points3D_features.txt (COLMAP's triangulated feature
@@ -73,7 +81,93 @@ def mean_reprojection(colmap, model):
     return float(m.group(1)) if m else None
 
 
-def refine(colmap, images, src, work, out, gpu=False):
+def read_txt_model(d):
+    """(camera lines, image header lines with their 2D-point lines, rigs lines, frames lines)."""
+    keep = lambda f: [l.rstrip("\n") for l in open(d / f) if l.strip() and not l.startswith("#")] if (d / f).exists() else []
+    lines = [l.rstrip("\n") for l in open(d / "images.txt") if not l.startswith("#")]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    pairs = [(lines[i], lines[i + 1] if i + 1 < len(lines) else "") for i in range(0, len(lines), 2)]
+    return keep("cameras.txt"), pairs, keep("rigs.txt"), keep("frames.txt")
+
+
+def write_txt_model(d, cams, pairs, rigs, frames, points_from):
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "cameras.txt").write_text("\n".join(cams) + "\n")
+    (d / "images.txt").write_text("".join(f"{h}\n{p}\n" for h, p in pairs))
+    (d / "rigs.txt").write_text("\n".join(rigs) + "\n")
+    (d / "frames.txt").write_text("\n".join(frames) + "\n")
+    shutil.copyfile(points_from / "points3D.txt", d / "points3D.txt")
+
+
+def intrinsics(c):
+    """(fx, fy, cx, cy) of a camera line's fields (PINHOLE, SIMPLE_PINHOLE, OPENCV...)."""
+    v = list(map(float, c[4:]))
+    return (v[0], v[0], v[1], v[2]) if c[1].startswith("SIMPLE") else tuple(v[:4])
+
+
+def calibrate_lens(colmap, ba, work, log):
+    """Fit the capture's lens on the bundle-adjusted model (no new features or matches):
+    shared OPENCV distortion first, then each photo's focal with it fixed. Returns
+    (model folder, distortion [k1 k2 p1 p2], reprojection before, after)."""
+    txt = work / "lens_in"
+    txt.mkdir()
+    run([colmap, "model_converter", "--input_path", ba, "--output_path", txt, "--output_type", "TXT",
+         "--log_target", "stderr"], log)
+    cams, pairs, rigs, frames = read_txt_model(txt)
+    params = {c.split()[0]: c.split() for c in cams}
+    intr = {cid: intrinsics(c) for cid, c in params.items()}
+    first = next(iter(params.values()))
+    w, h = first[2], first[3]
+    fxm, fym, cxm, cym = (sorted(v[i] for v in intr.values())[len(intr) // 2] for i in range(4))
+    fm = (fxm + fym) / 2
+    # 1. one shared OPENCV camera: every image, frame and rig points at camera 1
+    shared = work / "lens_shared"
+    one_pairs = [(" ".join(h_.split()[:8] + ["1"] + h_.split()[9:]), p) for h_, p in pairs]
+    one_frames = []
+    for f in frames:
+        t = f.split()
+        n = int(t[9])
+        data = []
+        for k in range(n):
+            st_, _sid, did = t[10 + 3 * k: 13 + 3 * k]
+            data += [st_, "1", did]
+        one_frames.append(" ".join([t[0], "1"] + t[2:10] + data))
+    write_txt_model(shared, [f"1 RADIAL {w} {h} {fm} {cxm} {cym} 0 0"], one_pairs,
+                    ["1 1 CAMERA 1"], one_frames, txt)
+    shared_out = work / "lens_shared_ba"
+    shared_out.mkdir()
+    run([colmap, "bundle_adjuster", "--input_path", shared, "--output_path", shared_out,
+         "--BundleAdjustment.refine_focal_length", 1, "--BundleAdjustment.refine_principal_point", 0,
+         "--BundleAdjustment.refine_extra_params", 1, "--BundleAdjustment.refine_sensor_from_rig", 0,
+         "--log_target", "stderr"], log)
+    sh = work / "lens_shared_txt"
+    sh.mkdir()
+    run([colmap, "model_converter", "--input_path", shared_out, "--output_path", sh, "--output_type", "TXT",
+         "--log_target", "stderr"], log)
+    c = read_txt_model(sh)[0][0].split()
+    dist = c[7:9]   # RADIAL: f cx cy k1 k2
+    # 2. each photo's own focal (scaled to the fitted median) with the shared distortion;
+    #    poses and points settle again, intrinsics fixed
+    f_fit = float(c[4])
+    scale = f_fit / fm
+    last = work / "lens_final"
+    per_cams = []
+    for cid, c0 in params.items():
+        fx_, fy_, cx_, cy_ = intr[cid]
+        per_cams.append(" ".join([cid, "RADIAL", c0[2], c0[3], repr((fx_ + fy_) / 2 * scale), repr(cx_), repr(cy_)] + dist))
+    write_txt_model(last, per_cams, pairs, rigs, frames, txt)
+    clamped = 0
+    out_ = work / "lens_ba"
+    out_.mkdir()
+    run([colmap, "bundle_adjuster", "--input_path", last, "--output_path", out_,
+         "--BundleAdjustment.refine_focal_length", 0, "--BundleAdjustment.refine_principal_point", 0,
+         "--BundleAdjustment.refine_extra_params", 0, "--BundleAdjustment.refine_sensor_from_rig", 0,
+         "--log_target", "stderr"], log)
+    return out_, [float(x) for x in dist], clamped, mean_reprojection(colmap, ba), mean_reprojection(colmap, out_)
+
+
+def refine(colmap, images, src, work, out, gpu=False, lens=False):
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
     out.mkdir(parents=True, exist_ok=True)
@@ -165,6 +259,24 @@ def refine(colmap, images, src, work, out, gpu=False):
          "--BundleAdjustment.refine_extra_params", 0,
          "--BundleAdjustment.refine_sensor_from_rig", 0, "--log_target", "stderr"], log)
     after = mean_reprojection(colmap, ba)
+    lens_stats = None
+    if lens:
+        phase("lens calibration")
+        try:
+            lba, dist, clamped, lb, la = calibrate_lens(colmap, ba, work, log)
+            if la is not None and lb is not None and la <= lb * 1.02:
+                ba = lba
+                fs = sorted(float(l.split()[4]) for l in read_txt_model(work / "lens_final")[0])
+                f = fs[len(fs) // 2]
+                edge = max(abs((dist[0] * r * r + dist[1] * r ** 4) * r * f)
+                           for r in (x / f for x in (400, 600, 800, 960, 1200)))
+                lens_stats = {"distortion_k1_k2": [round(x, 6) for x in dist], "reprojection_px": round(la, 4),
+                              "max_shift_px": round(edge, 1), "focal_px": [round(fs[0]), round(f), round(fs[-1])]}
+                after = la
+            else:
+                lens_stats = {"skipped": f"no better ({lb} -> {la} px)"}
+        except Exception as e:   # keep the fixed-intrinsics result
+            lens_stats = {"skipped": str(e)[:160]}
     ref = work / "ref_centres.txt"
     ref.write_text("".join(f"{nm} {c[0]:.6f} {c[1]:.6f} {c[2]:.6f}\n" for nm, (_, _, c) in orig.items()))
     run([colmap, "model_aligner", "--input_path", ba, "--output_path", aligned,
@@ -184,6 +296,8 @@ def refine(colmap, images, src, work, out, gpu=False):
              "median_shift_cm": round(shift[len(shift) // 2], 1), "max_shift_cm": round(shift[-1], 1),
              "median_turn_deg": round(turn[len(turn) // 2], 2), "max_turn_deg": round(turn[-1], 2),
              "seconds": round(time.time() - t0), "gpu": bool(gpu)}
+    if lens_stats:
+        stats["lens"] = lens_stats
     if after is None or (before is not None and after > before * 1.05) or shift[-1] > 200:
         raise RuntimeError(f"refinement looked worse than the original poses: {stats}")
 
@@ -192,7 +306,18 @@ def refine(colmap, images, src, work, out, gpu=False):
         p = new[nm][0] if nm in new else orig[nm][0]
         lines += [" ".join(p[:8] + [orig[nm][0][8], nm]), ""]
     (out / "images.txt").write_text("\n".join(lines) + "\n")
-    (out / "cameras.txt").write_text("".join(" ".join(c) + "\n" for c in cams))   # intrinsics unchanged
+    if lens_stats and "distortion_k1_k2" in lens_stats:   # calibrated cameras, under the capture's ids
+        fitted = {c.split()[0]: c.split() for c in read_txt_model(txt)[0]}
+        db_id = {nm: str(new[nm][0][8]) for nm in new}
+        out_cams = {}
+        for nm in orig:
+            cid = orig[nm][0][8]
+            if cid not in out_cams:
+                c = fitted.get(db_id.get(nm, ""))
+                out_cams[cid] = ([cid] + c[1:]) if c else cam_by_id[cid]
+        (out / "cameras.txt").write_text("".join(" ".join(c) + "\n" for c in out_cams.values()))
+    else:
+        (out / "cameras.txt").write_text("".join(" ".join(c) + "\n" for c in cams))   # intrinsics unchanged
     shutil.copyfile(txt / "points3D.txt", out / "points3D_features.txt")
     (out / "stats.json").write_text(json.dumps(stats, indent=1) + "\n")
     phase("done")
@@ -207,9 +332,10 @@ def main(argv=None):
     p.add_argument("--work", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--gpu", action="store_true", help="SIFT extraction and matching on the GPU (CUDA)")
+    p.add_argument("--lens", action="store_true", help="also calibrate the lens (distortion + per-photo focal)")
     a = p.parse_args(argv)
     try:
-        stats = refine(a.colmap, Path(a.images), Path(a.model), Path(a.work), Path(a.out), a.gpu)
+        stats = refine(a.colmap, Path(a.images), Path(a.model), Path(a.work), Path(a.out), a.gpu, a.lens)
         print(json.dumps(stats), flush=True)
     except Exception as e:
         print(f"error: {e}", flush=True)

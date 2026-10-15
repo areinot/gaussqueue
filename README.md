@@ -228,6 +228,13 @@ refined there, with SIFT features and matching on the GPU. Their photos are uplo
 reused for training. If it fails, the Mac refines instead. GPU SIFT needs a recent NVIDIA driver;
 `"colmap_gpu": false` runs COLMAP on the worker's CPU, which is only worth it if that CPU is fast.
 
+**Lens correction** (with pose refinement; `"lens_correction": true` by default): the iPhone's
+focal length moves a few percent with autofocus and a little lens distortion survives iOS's own
+correction, so a single shared camera blurs and ghosts fine detail. Refinement starts each photo
+from its own ARKit intrinsics, fits one radial distortion and focal length for the capture
+(keeping each photo's autofocus changes), re-settles the poses, and training uses undistorted
+photos. It adds about a minute; on a test scene it was worth +0.8 dB.
+
 **Dashboard on the worker** (optional): `"dashboard_tunnel": true` keeps an SSH reverse tunnel
 open so the dashboard also opens at `http://localhost:8765` on that machine. The service
 reconnects it whenever it drops; the machine's card shows whether it's up.
