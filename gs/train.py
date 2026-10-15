@@ -75,6 +75,8 @@ def parse(argv=None):
                    help="also start with this many splats on a distant sphere (sky, far scenery)")
     p.add_argument("--means-lr", type=float, default=1.6e-4, help="times scene scale")
     p.add_argument("--holdout-every", type=int, default=0)
+    p.add_argument("--holdout-names", help="file listing the photos to hold out (one name per line), "
+                                           "so runs on different datasets are scored on the same views")
     p.add_argument("--subsample", type=int, default=1, help="train on every Nth photo")
     p.add_argument("--export-every", type=int, default=0)
     p.add_argument("--eval-every", type=int, default=500)
@@ -347,7 +349,12 @@ def train(a, splats=None, log=print):
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     images, pts, rgb = gsdata.read_model(gsdata.find_model(root))
-    tr_ims, te_ims = gsdata.split(images, a.holdout_every)
+    if a.holdout_names:
+        held = {l.strip() for l in Path(a.holdout_names).read_text().splitlines() if l.strip()}
+        te_ims = [im for im in images if im["name"] in held]
+        tr_ims = [im for im in images if im["name"] not in held]
+    else:
+        tr_ims, te_ims = gsdata.split(images, a.holdout_every)
     tr_ims = tr_ims[::max(1, a.subsample)]
     tv = gsdata.Views(root, tr_ims, a.max_res, dev, a.depth_dir if a.depth_weight > 0 else None)
     ev = gsdata.Views(root, te_ims, a.max_res, dev, a.eval_depth_dir or a.depth_dir)
