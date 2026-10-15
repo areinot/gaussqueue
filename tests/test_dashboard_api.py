@@ -426,8 +426,10 @@ class DashboardAPITest(unittest.TestCase):
             self.status.write(self.cfg)
             q = next(i for i in self.snapshot()["queue"] if i["name"] == "capA")
             self.assertEqual(set(q["est"]), {"pc", "mac"})         # Auto: every machine
-            self.assertAlmostEqual(q["est"]["pc"], 600, delta=1)   # same settings as the PC run
-            self.assertAlmostEqual(q["est"]["mac"], 1800, delta=1) # old history counts as the Mac's
+            self.assertAlmostEqual(q["est"]["pc"]["train"], 600, delta=1)    # same settings as the PC run
+            self.assertAlmostEqual(q["est"]["pc"]["total"], 600, delta=1)    # took 10m: no overhead
+            self.assertAlmostEqual(q["est"]["mac"]["train"], 1800, delta=1)  # old history counts as the Mac's
+            self.assertGreaterEqual(q["est"]["mac"]["total"], q["est"]["mac"]["train"])
             self.post({"name": "capA", "action": "run_on", "value": "mac"})
             q = next(i for i in self.snapshot()["queue"] if i["name"] == "capA")
             self.assertEqual(set(q["est"]), {"mac"})               # pinned: just that machine
@@ -436,6 +438,20 @@ class DashboardAPITest(unittest.TestCase):
             self.status.workers = {}
             self.overrides.clear("capA")
             self.status.write(self.cfg)
+
+    def test_overhead_estimate(self):
+        gq = self.gq
+        st = {"history": [
+            {"result": "done", "worker": "pc", "train_seconds": 120, "total_seconds": 540, "pre_seconds": 300,
+             "frames": 100, "settings": {"prune_pct": 0}},
+            {"result": "done", "worker": "pc", "train_seconds": 600, "duration": "1h00m",
+             "frames": 200, "settings": {"prune_pct": 70}},
+            {"result": "FAILED", "worker": "pc", "train_seconds": 5, "total_seconds": 9999}]}
+        self.assertEqual(gq.overhead_seconds(st, "pc", 100, 0), (300, 120))     # recorded split
+        self.assertEqual(gq.overhead_seconds(st, "pc", 400, 0), (1200, 480))    # scales with photos
+        self.assertEqual(gq.overhead_seconds(st, "pc", 200, 70), (1500, 1500))  # pruned runs; old: halves
+        self.assertEqual(gq.overhead_seconds(st, "mac", 100, 0), (None, None))
+        self.assertEqual(gq.parse_dur("1h38m"), 5880)
 
     def test_dismiss_from_recent(self):
         hist = self.status.state["history"]

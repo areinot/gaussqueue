@@ -38,7 +38,7 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .phase { color: var(--muted); }
 .bar { height: 8px; background: var(--track); border-radius: 99px; overflow: hidden; }
 .bar > div { height: 100%; background: var(--accent); border-radius: 99px; transition: width .6s; }
-.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
 .stat .k { font-size: 12px; color: var(--muted); }
 .stat .v { font-variant-numeric: tabular-nums; font-weight: 600; }
 .strip { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; }
@@ -118,6 +118,7 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 @media (max-width: 560px) {
   .settings.with-help { grid-template-columns: minmax(0, 1fr); }
   .settings.with-help .help { border-left: 0; border-top: 1px solid var(--line); padding: 10px 0 0; }
+  .stats { grid-template-columns: repeat(2, 1fr); }
 }
 .seg { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 .seg button { flex: 1; background: none; border: 0; border-left: 1px solid var(--line); padding: 5px 0;
@@ -334,7 +335,8 @@ function jobPanel(c) {
       <div class="stats">
         <div class="stat"><div class="k">Step</div><div class="v">${c.step != null ? `${c.step.toLocaleString()} / ${(c.total||0).toLocaleString()}` : "—"}</div></div>
         <div class="stat"><div class="k">Elapsed</div><div class="v" data-t="elapsed">—</div></div>
-        <div class="stat"><div class="k">ETA</div><div class="v" data-t="eta">—</div></div>
+        <div class="stat"><div class="k">Training ends</div><div class="v" data-t="eta">—</div></div>
+        <div class="stat" title="Training plus the usual post-processing on this machine (download, pruning, compression, copying out), from its recent runs."><div class="k">Done</div><div class="v" data-t="done">—</div></div>
       </div>
       ${previews.length ? `<div class="strip">${previews.map(p => `
         <figure><img src="/img/${encodeURIComponent(p)}" data-pick="${esc(p)}" data-job="${esc(c.name)}" class="${p === hero ? "sel" : ""}" alt="">${stepLabel(p)}</figure>`).join("")}</div>
@@ -430,13 +432,17 @@ function gsplatHTML(st) {
           ${choiceHTML("prune_pct", String(st.prune_pct || 0), [["0", "Off"], ["50", "50%"], ["70", "70%"], ["80", "80%"], ["90", "90%"]])}</div>`;
 }
 
-// "Est. time 52m (Mac) · 12m (RTX 4080)": training time on every machine that could run it on
-// Auto, else on the chosen one.
+// "Est. time 1h05m (Mac: 52m training) · 21m (RTX 4080: 12m training)": the whole job, start to
+// result, on every machine that could run it on Auto, else on the chosen one.
 const shortLabel = (w) => (w.label.match(/\(([^)]+)\)/) || [])[1] || w.label;
 function etaLine(it) {
   const est = it.est || {};
   const parts = (last.workers || []).filter(w => w.name in est)
-    .map(w => `${est[w.name] ? dur(est[w.name]) : "?"} (${esc(shortLabel(w))})`);
+    .map(w => { const e = est[w.name] || {};
+      if (!e.total) return `? (${esc(shortLabel(w))})`;
+      return e.train && e.total - e.train >= 60
+        ? `${dur(e.total)} (${esc(shortLabel(w))}: ${dur(e.train)} training)`
+        : `${dur(e.total)} (${esc(shortLabel(w))})`; });
   if (!parts.length && it.est_seconds) parts.push(dur(it.est_seconds));
   return parts.length ? `<div class="quality"><b>Est. time</b> ${parts.join(" · ")}</div>` : "";
 }
@@ -775,6 +781,7 @@ function tick() {
     const sel = (k) => `[data-job="${CSS.escape(c.name)}"] [data-t="${k}"]`;
     set(sel("elapsed"), c.started ? dur(t - c.started) : "—");
     set(sel("eta"), c.paused ? "paused" : c.eta ? `${clock(c.eta)} (${dur(c.eta - now)})` : "—");
+    set(sel("done"), c.paused ? "paused" : c.done_eta ? `~${clock(c.done_eta)} (${dur(Math.max(0, c.done_eta - now))})` : "—");
   }
   document.querySelectorAll("[data-since]").forEach(e => {
     const t = dur(now - +e.dataset.since);

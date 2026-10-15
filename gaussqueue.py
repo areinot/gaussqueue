@@ -626,7 +626,7 @@ class Inbox:
             d["run_on"] = ov.get("run_on", "auto")
             if estimates:
                 d["est"] = estimates(d["settings"], d["frames"], ov)
-                known = [v for v in d["est"].values() if v]
+                known = [v["total"] for v in d["est"].values() if v and v.get("total")]
                 if known:
                     d["est_seconds"] = min(known)
             out.append(d)
@@ -868,6 +868,13 @@ class Status:
                 sn["result"] = f"{sn['name']}-step{sn['step']}"
                 sn["downloads"] = result_downloads(self.paths, sn["result"]) if sn.get("state") == "done" else []
         v["pending_settings"] = effective_settings(cfg, self.overrides.get(c["name"]))
+        # When the whole job (not just training) should be done: training's end plus the
+        # usual post-processing on this machine.
+        _, post = overhead_seconds(self.state, c.get("worker") or "mac", c.get("frames"),
+                                     (v["pending_settings"] or {}).get("prune_pct"))
+        train_end = c.get("eta") or (c["train_started"] + c["train_seconds"]
+                                     if c.get("train_seconds") and c.get("train_started") else None)
+        v["done_eta"] = train_end + post if train_end and post is not None and not c.get("paused") else None
         v["previews"] = sorted(p.name for p in self.paths.previews.glob(f"{c['name']}_step*.jpg"))
         return v
 
@@ -887,7 +894,10 @@ class Status:
                     continue
                 trainer = "gsplat" if st.get("trainer") == "gsplat" and w.gsplat else "brush"
                 r = current_rate(self.jobs.get(w.name), self.state, w.name, trainer)
-                out[w.name] = estimate_seconds(st, frames, r)
+                train = estimate_seconds(st, frames, r)
+                pre, post = overhead_seconds(self.state, w.name, frames, st.get("prune_pct"))
+                out[w.name] = {"total": train + pre + post if train and pre is not None else train,
+                               "train": train}
             return out
         queue = self.inbox.snapshot(cfg, self.overrides, rate, busy, estimates)
         hist, seen = [], set()
@@ -2340,6 +2350,9 @@ def process(cfg, paths, state, status, item, beat, worker=None):
                 log(f"shared {', '.join(shared)} to {cfg['share_dir']}")
         except Exception as e:
             cerrors.append(f"share: {e}")
+        job["total_seconds"] = round(time.time() - t0)
+        if job.get("train_started"):   # before training: upload, refinement, depth maps
+            job["pre_seconds"] = round(job["train_started"] - t0)
         record(state, job, "done", dur, files + ("  (" + "; ".join(cerrors) + ")" if cerrors else ""))
         log(f"done: {name} in {dur}")
         img = None
@@ -2449,6 +2462,7 @@ def record(state, job, result, duration, detail):
             "preview": job.get("preview"), "thumb": job.get("thumb"),
             "kind": job.get("kind"), "frames": job.get("frames"),
             "settings": job.get("settings"), "train_seconds": job.get("train_seconds"),
+            "total_seconds": job.get("total_seconds"), "pre_seconds": job.get("pre_seconds"),
             "worker": job.get("worker"), "trainer": job.get("trainer"),
             "file": job.get("file"),
             "files": job.get("files"), "quality": job.get("quality")})
@@ -2691,6 +2705,48 @@ def current_rate(job, state, worker=None, trainer=None):
     for h in reversed(done):
         return norm(h["train_seconds"] / h["settings"]["total_steps"], h["settings"])
     return None
+
+
+def parse_dur(text):
+    """Seconds from fmt_dur's "1h38m" / "9m" (history entries from before total_seconds)."""
+    m = re.fullmatch(r"(?:(\d+)h)?(\d+)m", str(text or ""))
+    return (int(m.group(1) or 0) * 3600 + int(m.group(2)) * 60) if m else None
+
+
+def overhead_seconds(state, worker, frames, prune):
+    """(before training, after training) seconds a capture needs on this machine besides
+    training: uploads, pose refinement and depth maps before; downloads, pruning, orienting,
+    compression and copying out after. From the last few finished runs there (preferring
+    ones with Prune set the same way), scaled by photo count. (None, None) if unknown."""
+    runs = []
+    for h in state.get("history", []):
+        if h.get("result") != "done" or not h.get("train_seconds"):
+            continue
+        if (h.get("worker") or "mac") != worker:
+            continue
+        total = h.get("total_seconds") or parse_dur(h.get("duration"))
+        if not total:
+            continue
+        extra = max(0.0, total - h["train_seconds"])
+        pre = h.get("pre_seconds")
+        pruned = bool((h.get("settings") or {}).get("prune_pct"))
+        runs.append((h.get("frames"), extra, pre, pruned))
+    same = [r for r in runs if r[3] == bool(prune)]
+    runs = (same or runs)[-3:]
+    if not runs:
+        return None, None
+    pres, posts = [], []
+    for f, extra, pre, _ in runs:
+        k = (frames / f) if frames and f else 1.0
+        k = min(4.0, max(0.25, k))   # transfers scale with photos; don't extrapolate wildly
+        if pre is not None:
+            pre = min(pre, extra)
+            pres.append(pre * k)
+            posts.append((extra - pre) * k)
+        else:   # older runs didn't record the split
+            pres.append(extra * k / 2)
+            posts.append(extra * k / 2)
+    return sum(pres) / len(pres), sum(posts) / len(posts)
 
 
 def estimate_seconds(st, frames, rate):
