@@ -900,7 +900,8 @@ class Status:
                 if h["quality"] == "?":
                     h["quality"] = self.quality_cache[h["name"]] = find_capture_quality(
                         self.paths.jobs / h["name"] / "data")
-            h["downloads"] = result_downloads(self.paths, h["name"]) if h.get("result") == "done" else []
+            h["downloads"] = (result_downloads(self.paths, h["name"])
+                              if h.get("result") in ("done", "snapshot") else [])
             h["requeueable"] = (h["name"] not in seen and h["name"] not in in_inbox
                                 and find_processed(self.paths, h["name"]) is not None)
             seen.add(h["name"])
