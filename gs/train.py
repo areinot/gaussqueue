@@ -50,6 +50,10 @@ def parse(argv=None):
     p.add_argument("--eval-depth-dir", help="depth maps for scoring held-out photos (default: --depth-dir)")
     p.add_argument("--depth-weight", type=float, default=0.0)
     p.add_argument("--depth-conf", type=int, default=2)
+    p.add_argument("--depth-align-after", type=float, default=0.0,
+                   help="from this fraction of training on, align each photo's LiDAR depth to the "
+                        "rendered surface (per-photo scale + offset) before comparing: LiDAR keeps "
+                        "the shape, the photos decide where it sits (0 = off)")
     p.add_argument("--depth-deadband", type=float, default=0.0,
                    help="metres of depth disagreement that cost nothing (LiDAR is good to ~1 cm)")
     p.add_argument("--flat-weight", type=float, default=0.0)
@@ -249,15 +253,39 @@ def render(params, views, idx, sh_degree, mode="3dgs", antialiased=False, absgra
     return out[..., :-1], out[..., -1], alpha[0, ..., 0], meta, extras
 
 
-def depth_loss(depth, alpha, gt, conf, min_conf, deadband=0.0):
+@torch.no_grad()
+def align_depth(d, gt):
+    """Scale and offset taking this photo's LiDAR depth onto the rendered surface: least
+    squares, refitted twice without the worst fifth (edges, glass), kept small (LiDAR's
+    errors are a centimetre or two, not a different scene)."""
+    keep = torch.ones_like(gt, dtype=torch.bool)
+    s, b = gt.new_tensor(1.0), gt.new_tensor(0.0)
+    for _ in range(3):
+        x, y = gt[keep], d[keep]
+        if len(x) < 50:
+            break
+        xm, ym = x.mean(), y.mean()
+        var = ((x - xm) ** 2).mean()
+        s = (((x - xm) * (y - ym)).mean() / var).clamp(0.97, 1.03) if var > 1e-8 else gt.new_tensor(1.0)
+        b = (ym - s * xm).clamp(-0.03, 0.03)
+        r = (s * gt + b - d).abs()
+        keep = r <= torch.quantile(r[:1_000_000] if r.numel() > 1_000_000 else r, 0.8)
+    return s, b
+
+
+def depth_loss(depth, alpha, gt, conf, min_conf, deadband=0.0, align=False):
     """Relative L1 between rendered depth (pooled to the LiDAR map's size) and LiDAR depth,
-    only where the LiDAR is confident; disagreement within the deadband (metres) is free."""
+    only where the LiDAR is confident; disagreement within the deadband (metres) is free.
+    With align, the LiDAR depth is first fitted onto the rendered surface (align_depth)."""
     h, w = gt.shape
     d = F.adaptive_avg_pool2d(depth[None, None], (h, w))[0, 0]
     a = F.adaptive_avg_pool2d(alpha[None, None], (h, w))[0, 0]
     m = (conf >= min_conf) & (gt > 0.05) & torch.isfinite(gt) & (a > 0.5)
     if not m.any():
         return depth.new_zeros(())
+    if align and m.sum() > 100:
+        sc, off = align_depth(d.detach()[m], gt[m])
+        gt = gt * sc + off
     return (((d[m] - gt[m]).abs() - deadband).clamp_min(0) / gt[m]).mean()
 
 
@@ -390,8 +418,9 @@ def train(a, splats=None, log=print):
             if empty.any() and a.empty_weight > 0:
                 loss = loss + a.empty_weight * alpha[empty].mean()
         if a.depth_weight > 0 and tv.depth[i] is not None:
-            loss = loss + a.depth_weight * depth_loss(depth, alpha, tv.depth[i], tv.conf[i], a.depth_conf,
-                                                      a.depth_deadband)
+            loss = loss + a.depth_weight * depth_loss(
+                depth, alpha, tv.depth[i], tv.conf[i], a.depth_conf, a.depth_deadband,
+                align=a.depth_align_after > 0 and step >= a.depth_align_after * a.steps)
         if a.flat_weight > 0 and a.mode == "3dgs":
             loss = loss + a.flat_weight * torch.exp(params["scales"]).min(dim=-1).values.mean()
         if a.mode == "2dgs":
