@@ -46,6 +46,8 @@ def parse(argv=None):
                    help="fused depth needs at least this much evidence (1 = one confident reading at 1 m)")
     p.add_argument("--agree", type=float, default=0.10,
                    help="relative tolerance between fused depth and the photo's own reading")
+    p.add_argument("--grid-factor", type=int, default=4,
+                   help="space grid cell = this many fusion voxels (default 4; 1 for small, detailed boxes)")
     p.add_argument("--grid-only", action="store_true",
                    help="only write space.npz (known-empty / surface / unknown), no depth maps")
     p.add_argument("--exclude-every", type=int, default=0,
@@ -222,10 +224,10 @@ def main(a):
         vol.integrate(f, a.max_range)
     t1 = time.time()
     print(f"integrated in {t1 - t0:.0f}s", flush=True)
-    space = vol.space_grid()
+    space = vol.space_grid(factor=a.grid_factor)
     np.savez_compressed(out / "space.npz", **space)
     g = space["grid"]
-    print(f"space grid {g.shape[2]}x{g.shape[1]}x{g.shape[0]} at {100 * float(space['voxel']):.0f} cm: "
+    print(f"space grid {g.shape[2]}x{g.shape[1]}x{g.shape[0]} at {100 * float(space['voxel']):.1f} cm: "
           f"{100 * (g == 1).mean():.0f}% known empty, {100 * (g == 2).mean():.0f}% surface", flush=True)
     if a.grid_only:
         return {"space": {"empty": float((g == 1).mean()), "surface": float((g == 2).mean())}}

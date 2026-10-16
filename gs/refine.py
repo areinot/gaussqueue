@@ -107,7 +107,7 @@ def intrinsics(c):
     return (v[0], v[0], v[1], v[2]) if c[1].startswith("SIMPLE") else tuple(v[:4])
 
 
-def calibrate_lens(colmap, ba, work, log, focal_blend=1.0):
+def calibrate_lens(colmap, ba, work, log, focal_blend=1.0, fit_focal=True):
     """Fit the capture's lens on the bundle-adjusted model (no new features or matches):
     shared OPENCV distortion first, then each photo's focal with it fixed. Returns
     (model folder, distortion [k1 k2 p1 p2], reprojection before, after)."""
@@ -139,7 +139,7 @@ def calibrate_lens(colmap, ba, work, log, focal_blend=1.0):
     shared_out = work / "lens_shared_ba"
     shared_out.mkdir()
     run([colmap, "bundle_adjuster", "--input_path", shared, "--output_path", shared_out,
-         "--BundleAdjustment.refine_focal_length", 1, "--BundleAdjustment.refine_principal_point", 0,
+         "--BundleAdjustment.refine_focal_length", int(fit_focal), "--BundleAdjustment.refine_principal_point", 0,
          "--BundleAdjustment.refine_extra_params", 1, "--BundleAdjustment.refine_sensor_from_rig", 0,
          "--log_target", "stderr"], log)
     sh = work / "lens_shared_txt"
@@ -170,7 +170,7 @@ def calibrate_lens(colmap, ba, work, log, focal_blend=1.0):
     return out_, [float(x) for x in dist], clamped, mean_reprojection(colmap, ba), mean_reprojection(colmap, out_)
 
 
-def refine(colmap, images, src, work, out, gpu=False, lens=False, focal_blend=1.0,
+def refine(colmap, images, src, work, out, gpu=False, lens=False, focal_blend=1.0, fit_focal=True,
            matcher="auto", max_image_size=1600, extract_args=(), match_args=()):
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
@@ -267,7 +267,7 @@ def refine(colmap, images, src, work, out, gpu=False, lens=False, focal_blend=1.
     if lens:
         phase("lens calibration")
         try:
-            lba, dist, clamped, lb, la = calibrate_lens(colmap, ba, work, log, focal_blend)
+            lba, dist, clamped, lb, la = calibrate_lens(colmap, ba, work, log, focal_blend, fit_focal)
             if la is not None and lb is not None and la <= lb * 1.02:
                 ba = lba
                 fs = sorted(float(l.split()[4]) for l in read_txt_model(work / "lens_final")[0])
@@ -343,12 +343,14 @@ def main(argv=None):
     p.add_argument("--extract-args", default="", help='extra feature_extractor options, one quoted string '
                                                       '(--extract-args="--SiftExtraction.max_num_features 16384")')
     p.add_argument("--match-args", default="", help="extra matcher options, one quoted string")
+    p.add_argument("--keep-focal", action="store_true",
+                   help="with --lens: fit only the distortion; keep the capture's (ARKit) focal length")
     p.add_argument("--focal-blend", type=float, default=1.0,
                    help="with --lens: how much of each photo's own focal to keep (0 = one shared focal, 1 = own)")
     a = p.parse_args(argv)
     try:
         stats = refine(a.colmap, Path(a.images), Path(a.model), Path(a.work), Path(a.out), a.gpu, a.lens,
-                       a.focal_blend, a.matcher, a.max_image_size, shlex.split(a.extract_args), shlex.split(a.match_args))
+                       a.focal_blend, not a.keep_focal, a.matcher, a.max_image_size, shlex.split(a.extract_args), shlex.split(a.match_args))
         print(json.dumps(stats), flush=True)
     except Exception as e:
         print(f"error: {e}", flush=True)

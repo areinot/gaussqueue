@@ -19,7 +19,7 @@ import shutil
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 import box as boxmod
 import gsdata
@@ -32,23 +32,42 @@ def edges(x):
     return np.hypot(gx, gy)
 
 
-def shift_vec(a, b, m):
-    """(dx, dy) in working pixels: where the region in b sits relative to a (subpixel)."""
+def soft_mask(m, r=4):
+    """The overlap mask shrunk by r and feathered, so its border carries no edges of its own."""
+    im = Image.fromarray(m.astype(np.uint8) * 255).filter(ImageFilter.MinFilter(2 * r + 1))
+    return np.asarray(im.filter(ImageFilter.GaussianBlur(r)), float) / 255
+
+
+def shift_vec(a, b, m, min_peak=1.2):
+    """(dx, dy) in working pixels between a and b over the mask m (subpixel), or None.
+
+    Only the overlap counts: edges outside it are faded out with a feathered mask (pixels the
+    two photos don't share must not vote - they would pull the answer to zero), the images are
+    zero-padded so the correlation can't wrap around, and a match whose peak isn't at least
+    min_peak x the next best one is rejected as ambiguous."""
     ys, xs = np.nonzero(m)
     if len(ys) < 400:
         return None
     y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
     if (y1 - y0) < 24 or (x1 - x0) < 24:
         return None
-    a, b = a[y0:y1, x0:x1], b[y0:y1, x0:x1]
-    win = np.outer(np.hanning(a.shape[0]), np.hanning(a.shape[1]))
-    ea, eb = edges(a), edges(b)
-    A, B = np.fft.fft2((ea - ea.mean()) * win), np.fft.fft2((eb - eb.mean()) * win)
-    X = A * np.conj(B)
+    sm = soft_mask(m[y0:y1, x0:x1])
+    if sm.sum() < 200:
+        return None
+
+    def prep(x):
+        e = edges(x[y0:y1, x0:x1])
+        return (e - (e * sm).sum() / sm.sum()) * sm
+
+    h, w = 2 * (y1 - y0), 2 * (x1 - x0)
+    X = np.fft.fft2(prep(a), (h, w)) * np.conj(np.fft.fft2(prep(b), (h, w)))
     X /= np.abs(X) + 1e-9
     c = np.fft.ifft2(X).real
-    h, w = c.shape
     i = np.unravel_index(np.argmax(c), c.shape)
+    dy, dx = np.ogrid[:h, :w]
+    dy, dx = np.minimum(abs(dy - i[0]), h - abs(dy - i[0])), np.minimum(abs(dx - i[1]), w - abs(dx - i[1]))
+    if c[i] < min_peak * c[(dy > 3) | (dx > 3)].max():
+        return None
 
     def sub(axis):
         k, n = i[axis], c.shape[axis]
@@ -95,6 +114,10 @@ class Photo:
         vv = o.K[1] * q[..., 1] / np.maximum(q[..., 2], 1e-6) + o.K[3] - .5
         ok &= (uu >= 0) & (uu < W - 1) & (vv >= 0) & (vv < H - 1)
         ui, vi = np.clip(uu.astype(int), 0, W - 2), np.clip(vv.astype(int), 0, H - 2)
+        # visibility: a point behind the surface the neighbour's own LiDAR sees there is hidden from it
+        # (e.g. the inside of a cup seen from the side); leave it out instead of pulling a wrong colour
+        oz = o.z[np.clip(vv.round().astype(int), 0, H - 1), np.clip(uu.round().astype(int), 0, W - 1)]
+        ok &= (oz <= 0.05) | (q[..., 2] <= oz + np.maximum(0.015, 0.05 * oz))
         fu, fv = np.clip(uu - ui, 0, 1), np.clip(vv - vi, 0, 1)
         g = o.g
         w = (g[vi, ui] * (1 - fu) * (1 - fv) + g[vi, ui + 1] * fu * (1 - fv)
@@ -119,7 +142,40 @@ def neighbours(p, photos, k):
     return cand[:k]
 
 
-def measure(photos, k, agree=0.0):
+def pose_shift(a, b, m, tiles=3, tol=2.0):
+    """The shift between a and b that a camera pose error would cause, or None.
+
+    A pose error moves everything in the overlap the same way; a wrong LiDAR surface (smeared
+    cup rims, a dark opening) moves only the part of the picture lying on it. So the overlap is
+    cut into tiles x tiles regions, each is measured on its own, and only a shift that most of
+    the measurable regions agree on (within tol working px of their median) counts. tiles=1
+    measures the whole overlap at once."""
+    if tiles <= 1:
+        return shift_vec(a, b, m)
+    ys, xs = np.nonzero(m)
+    if len(ys) < 400:
+        return None
+    yb = np.linspace(ys.min(), ys.max() + 1, tiles + 1).astype(int)
+    xb = np.linspace(xs.min(), xs.max() + 1, tiles + 1).astype(int)
+    found = []
+    for y0, y1 in zip(yb[:-1], yb[1:]):
+        for x0, x1 in zip(xb[:-1], xb[1:]):
+            t = np.zeros_like(m)
+            t[y0:y1, x0:x1] = m[y0:y1, x0:x1]
+            v = shift_vec(a, b, t)
+            if v is not None:
+                found.append(v)
+    if len(found) < 3:
+        return None
+    found = np.array(found)
+    med = np.median(found, axis=0)
+    agree = np.linalg.norm(found - med, axis=1) <= tol
+    if agree.sum() < 3 or agree.sum() < 0.6 * len(found):
+        return None
+    return found[agree].mean(axis=0)
+
+
+def measure(photos, k, agree=0.0, tiles=3):
     """Median shift per photo over its neighbours. With agree > 0, photos whose neighbours'
     shifts scatter more than that fraction of the median shift are left out (no consensus)."""
     out = {}
@@ -129,7 +185,7 @@ def measure(photos, k, agree=0.0):
         vs = []
         for o in neighbours(p, photos, k):
             w, ok = p.warp_from(o)
-            s = shift_vec(p.g, w, ok)
+            s = pose_shift(p.g, w, ok, tiles)
             if s is not None and np.hypot(*s) < W / 4:
                 vs.append(s)
         if len(vs) >= 3:
@@ -172,6 +228,8 @@ def main(argv=None):
     p.add_argument("--iterations", type=int, default=4)
     p.add_argument("--step", type=float, default=0.5)
     p.add_argument("--neighbours", type=int, default=8)
+    p.add_argument("--tiles", type=int, default=3,
+                   help="measure each pair in tiles x tiles regions and keep only the shift most agree on")
     p.add_argument("--max-turn", type=float, default=2.0, help="largest total correction per photo, degrees")
     p.add_argument("--agree", type=float, default=1.0,
                    help="only turn a photo when its neighbours' shifts scatter less than this x their median")
@@ -183,7 +241,7 @@ def main(argv=None):
     photos = [Photo(im, a.images, a.depth_dir, center, axes, half) for im in gsdata.read_model(Path(a.model))[0]]
     scale = 1920 / W
     if a.report:   # just score
-        sh = measure(photos, a.neighbours)
+        sh = measure(photos, a.neighbours, tiles=a.tiles)
         mags = {n: float(np.hypot(*v) * scale) for n, v in sh.items()}
         m = np.array(list(mags.values()))
         print(f"{len(m)} photos: disagreement median {np.median(m):.1f} px, p90 {np.percentile(m, 90):.1f} px, "
@@ -193,7 +251,7 @@ def main(argv=None):
     turned = {ph.im["name"]: np.zeros(2) for ph in photos}
     cap = math.radians(a.max_turn)
     for it in range(a.iterations + 1):
-        sh = measure(photos, a.neighbours, a.agree if it < a.iterations else 0.0)
+        sh = measure(photos, a.neighbours, a.agree if it < a.iterations else 0.0, a.tiles)
         mags = np.array([np.hypot(*v) for v in sh.values()]) * scale
         print(f"iteration {it}: disagreement median {np.median(mags):.1f} px, p90 {np.percentile(mags, 90):.1f} px, "
               f">10 px: {int((mags > 10).sum())}, >20 px: {int((mags > 20).sum())}", flush=True)

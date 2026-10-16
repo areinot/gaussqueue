@@ -964,7 +964,7 @@ class Status:
             "presets": {k: (v or standard_settings(cfg)) for k, v in PRESETS.items()},
             "limits": SETTING_LIMITS,
             "choices": SETTING_CHOICES,
-            "experiments": read_experiments(),
+            "experiments": read_experiments(self.paths),
         }
         self.write_text(jobs, queue, hist)
 
@@ -2976,10 +2976,12 @@ SCRIPT = Path(__file__).resolve()
 SCRIPT_MTIME = SCRIPT.stat().st_mtime
 
 
-def read_experiments():
+def read_experiments(paths=None):
     """Experiment batches (tools/experiments.py), newest first, for the dashboard and so the
     queue leaves their machines alone. A runner rewrites its file at least every 30 s, so one
-    not updated for 2 minutes is a batch that stopped. Finished ones show for 12 hours."""
+    not updated for 2 minutes is a batch that stopped. Finished ones show for 12 hours.
+    With paths, each variant's downloads are re-checked against the outbox, so results
+    that were since deleted lose their buttons."""
     out = []
     files = list(EXPERIMENTS_DIR.glob("*.json")) if EXPERIMENTS_DIR.is_dir() else []
     files += [p for p in [APP_HOME / "experiments.json"] if p.exists()]   # older runners
@@ -2991,6 +2993,12 @@ def read_experiments():
         age = time.time() - float(e.get("updated") or 0)
         e["live"] = not e.get("finished") and age < 120
         if e["live"] or age < 12 * 3600:
+            if paths is not None:
+                for v in e.get("variants") or []:
+                    if v.get("result"):
+                        v["downloads"] = result_downloads(paths, v["result"])
+                        if not v["downloads"]:
+                            v["result"] = None
             out.append(e)
     return sorted(out, key=lambda e: -float(e.get("started") or 0))
 

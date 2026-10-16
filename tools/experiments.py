@@ -7,12 +7,21 @@ the batch is done.
 plan.json:
   {"name": "Shelf box: lens fix",          shown on the card
    "worker": "pc",                          a worker from config.json, or "mac" (this Mac)
-   "program": "gsplat",                     "gsplat" (default; the worker's gs scripts) or "brush"
+   "program": "gsplat",                     "gsplat" (default; the worker's gs scripts), "brush", or
+                                            "command" (each variant's "run": a command line run as is
+                                            on the worker, e.g. a COLMAP test; nothing is published)
    "out": "D:/experiments/round2",          each variant writes to <out>/<variant name>
    "script": "train.py",                    gsplat: in the gs scripts folder (default train.py)
    "common": ["<data dir>", "--steps", "15000", ...],
    "variants": [{"name": "A", "desc": "depth on", "args": ["--depth-weight", "0.3"]}, ...],
-   "note": "optional line for the card"}
+   "note": "optional line for the card",
+   "greedy": {...}}                         optional, gsplat: see below
+
+Greedy batches ("greedy": {} or with settings) treat each variant's args as a change to try on
+top of the changes kept so far: the first variant is the baseline (unless "start" gives kept
+args and "best" their scores), and a change is kept when its held-out PSNR beats the best by
+"min_gain" dB (default 0.05), or costs at most "max_loss" dB (default 0.1) while cutting needles
+or in-front (floater) share by "count_gain" (default 20%). The card shows kept/dropped per variant.
 
 gsplat runs report steps and held-out scores from train.py's output. Brush runs (Brush is
 quiet when not on a terminal) are followed through the eval_<step> folders it writes, so give
@@ -41,6 +50,21 @@ APP_HOME = Path(os.environ.get("GAUSSQUEUE_HOME", Path.home() / "Library/Applica
 BATCHES = APP_HOME / "experiments" / "batches"
 STEP = re.compile(r"step (\d+)/(\d+) .*?([\d.]+) it/s")
 RESULT = re.compile(r"held-out PSNR ([\d.]+) SSIM ([\d.]+)(?: depth error ([\d.]+)%)?")
+COUNTS = re.compile(r"(needles|holes|in front) ([\d.]+)%")
+
+
+def greedy_keep(res, best, g):
+    """Whether a greedy step's result beats the best so far (see the module docstring)."""
+    if best is None:
+        return True
+    if res.get("psnr") is None:
+        return False
+    d = res["psnr"] - best["psnr"]
+    if d >= g.get("min_gain", 0.05):
+        return True
+    cut = any(best.get(k) and res.get(k) is not None and res[k] <= (1 - g.get("count_gain", 0.2)) * best[k]
+              for k in ("needles", "in_front"))
+    return d >= -g.get("max_loss", 0.1) and cut
 
 
 def slug(text):
@@ -177,9 +201,16 @@ class Runner:
             sys.exit(f"{name} has no gsplat set up (gsplat needs a CUDA worker)")
         if self.program == "brush" and not self.brush:
             sys.exit(f"no Brush configured for {name}")
+        if self.program == "command" and any(not v.get("run") for v in plan["variants"]):
+            sys.exit('program "command" needs a "run" command line in every variant')
 
     def command(self, variant):
-        out = f"{self.plan['out']}/{variant['name']}"
+        out = f"{self.plan.get('out', '')}/{variant['name']}"
+        if self.program == "command":
+            if self.local:
+                return ["/bin/sh", "-c", variant["run"] + " 2>&1"], None, out
+            return ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", self.worker["ssh"],
+                    variant["run"] + " 2>&1"], None, out
         args = self.plan.get("common", []) + variant.get("args", [])
         if self.program == "brush":
             argv = [self.brush] + args + ["--export-path", out]
@@ -226,8 +257,13 @@ def main(plan_path):
     logs.mkdir(parents=True, exist_ok=True)
     stop = threading.Event()
     threading.Thread(target=batch.heartbeat, args=(stop,), daemon=True).start()
+    greedy = plan.get("greedy")
+    kept = list((greedy or {}).get("start", []))
+    best = (greedy or {}).get("best")
     try:
         for v, rec in zip(plan["variants"], batch.data["variants"]):
+            if greedy is not None:
+                v = dict(v, args=kept + v.get("args", []))
             while (busy := queue_job_on(runner.worker["name"], port)):
                 rec.update(state="waiting", waiting=f"the queue is processing {busy}")
                 batch.write()
@@ -262,6 +298,8 @@ def main(plan_path):
                     if m:
                         rec.update(psnr=float(m[1]), ssim=float(m[2]),
                                    depth_err=float(m[3]) / 100 if m[3] else None)
+                        for k, val in COUNTS.findall(line):
+                            rec[k.replace(" ", "_")] = float(val) / 100
                         print(line.strip(), flush=True)
                     if time.time() - last_write > 5:
                         batch.write()
@@ -275,14 +313,26 @@ def main(plan_path):
                 rec.update(state="failed", error=(tail[-1] if tail else f"exit {proc.returncode}")[:160])
             else:
                 rec["state"] = "done"
-                if runner.program == "brush":
+                if runner.program == "command":
+                    pass
+                elif runner.program == "brush":
                     rec.update(step=rec.get("total"), splats=runner.final_splats(out, rec.get("total")))
-                label = f"exp-{slug(plan.get('name', 'batch'))[:40]}-{slug(v['name'])}"
-                try:
-                    rec["downloads"] = publish(cfg, runner.local, runner.worker.get("ssh"), out, label)
-                    rec["result"] = label if rec["downloads"] else None
-                except Exception as e:
-                    print(f"    publishing {v['name']} failed: {e}", flush=True)
+                if greedy is not None:
+                    res = {k: rec.get(k) for k in ("psnr", "needles", "in_front")}
+                    keep = greedy_keep(res, best, greedy)
+                    rec["greedy"] = "kept" if keep else "dropped"
+                    rec["desc"] = f"{rec.get('desc') or ''} [{rec['greedy']}]".strip()
+                    if keep:
+                        kept, best = v["args"], res
+                    print(f"    greedy: {rec['greedy']}" + (f" (best PSNR {best['psnr']:.2f})" if best else ""),
+                          flush=True)
+                if runner.program != "command":
+                    label = f"exp-{slug(plan.get('name', 'batch'))[:40]}-{slug(v['name'])}"
+                    try:
+                        rec["downloads"] = publish(cfg, runner.local, runner.worker.get("ssh"), out, label)
+                        rec["result"] = label if rec["downloads"] else None
+                    except Exception as e:
+                        print(f"    publishing {v['name']} failed: {e}", flush=True)
             print(f"    {rec['state']} in {rec['seconds']} s" + (f", {rec['splats']:,} splats" if rec.get("splats") else ""),
                   flush=True)
             batch.write()

@@ -63,12 +63,44 @@ def parse(argv=None):
     p.add_argument("--space", help="space.npz from fuse.py --grid-only: known-empty / surface / unknown")
     p.add_argument("--carve", action="store_true",
                    help="every 100 steps, remove splats inside known-empty space and shorten ones poking into it")
+    p.add_argument("--carve-fade", type=float, default=0.0,
+                   help="soft carve: multiply opacity by this per pass instead of removing (e.g. 0.5); "
+                        "splats the photos need (glass LiDAR sees through) regrow, floaters fade out")
+    p.add_argument("--carve-band", type=float, default=0.0,
+                   help="only carve within this many metres of a surface LiDAR measured (spikes poking out); "
+                        "empty space far from any surface (where glasses stand) is left alone (0 = everywhere)")
     p.add_argument("--far-flat-weight", type=float, default=0.0,
                    help="make splats outside the scanned region thin along the line to its centre (billboards)")
     p.add_argument("--antialiased", action="store_true")
     p.add_argument("--box", help="box.json from box.py: keep splats inside the box")
     p.add_argument("--empty-weight", type=float, default=0.1,
                    help="masked datasets: weight of rendered opacity where the box must be empty")
+    p.add_argument("--sh-ramp", type=int, default=1000,
+                   help="steps per added SH degree (colour detail waits for the shapes; default 1000)")
+    p.add_argument("--opacity-reg", type=float, default=0.01, help="MCMC: pull opacities down (default 0.01)")
+    p.add_argument("--scale-reg", type=float, default=0.01, help="MCMC: pull sizes down (default 0.01)")
+    p.add_argument("--opacity-binary", type=float, default=0.0,
+                   help="weight pushing each splat to fully opaque or fully clear (solid surfaces, no haze)")
+    p.add_argument("--opacity-binary-start", type=float, default=0.6,
+                   help="fraction of the run after which --opacity-binary applies (default 0.6)")
+    p.add_argument("--noise-stop", type=float, default=0.0,
+                   help="MCMC: fraction of the run after which splats stop being jittered (0 = never)")
+    p.add_argument("--depth-front-only", action="store_true",
+                   help="depth loss only where the render is in front of the LiDAR surface (spikes poking "
+                        "out); behind it (reflections in metal, glass) is free")
+    p.add_argument("--streak-weight", type=float, default=0.0,
+                   help="penalise splats that look like streaks on screen (a needle, or a flat disk seen "
+                        "edge-on): projected length over --streak-max times the width")
+    p.add_argument("--streak-max", type=float, default=10.0)
+    p.add_argument("--streak-off-surface", action="store_true",
+                   help="with --space: only penalise streaks away from LiDAR surfaces, so flat splats "
+                        "lying on a surface seen at a grazing angle are left alone")
+    p.add_argument("--streak-pass-every", type=int, default=0,
+                   help="every N steps, render the training views and fade splats that look like streaks "
+                        "(edge-on disks, needles) in most of the views that see them (0 = off)")
+    p.add_argument("--streak-pass-share", type=float, default=0.5,
+                   help="fade a splat when it is a streak in more than this share of the views that see it")
+    p.add_argument("--streak-pass-fade", type=float, default=0.5, help="opacity multiplier per pass")
     p.add_argument("--needle-weight", type=float, default=0.0)
     p.add_argument("--needle-max", type=float, default=5.0)
     p.add_argument("--init-ply")
@@ -88,6 +120,17 @@ def parse(argv=None):
                         "the splats; the corrections are reported in metrics.json")
     p.add_argument("--pose-lr", type=float, default=1e-5, help="--pose-opt learning rate")
     p.add_argument("--pose-reg", type=float, default=1e-6, help="--pose-opt pull towards no correction")
+    p.add_argument("--sweep-correction", action="store_true",
+                   help="sweep correction: also fine-tune one rigid correction per sweep (a run of photos "
+                        "taken in one go), moving all its cameras together. Fixes sweeps that are shifted "
+                        "wholesale against the rest (ARKit drift), which per-photo --pose-opt can't")
+    p.add_argument("--sweep-lr", type=float, default=3e-5, help="sweep correction learning rate")
+    p.add_argument("--sweep-start", type=int, default=500, help="start sweep correction at this step")
+    p.add_argument("--sweep-jump", type=float, default=0.05,
+                   help="a new sweep starts where the camera jumps further than this (m) between shots")
+    p.add_argument("--sweep-turn", type=float, default=25.0,
+                   help="... or turns more than this (degrees) between shots")
+    p.add_argument("--sweep-max", type=int, default=15, help="split sweeps longer than this many photos")
     p.add_argument("--track-cameras", help="a COLMAP folder of extra cameras (e.g. novel angles) rendered "
                                            "at every --test-every step into <out>/track")
     p.add_argument("--holdout-every", type=int, default=0)
@@ -164,6 +207,17 @@ class Space:
         self.n = torch.tensor([nx, ny, nz], device=dev)
         self.center = self.origin + self.n * self.voxel / 2
 
+    def near_surface(self, P, band):
+        """Whether points lie within `band` metres of a surface cell."""
+        k = max(1, int(round(band / self.voxel)))
+        if getattr(self, "_near", None) is None or self._near[0] != k:
+            surf = (self.grid == 2).float()[None, None]
+            self._near = (k, F.max_pool3d(surf, 2 * k + 1, stride=1, padding=k)[0, 0] > 0)
+        idx = torch.floor((P - self.origin) / self.voxel).long()
+        inside = ((idx >= 0) & (idx < self.n)).all(-1)
+        idx = torch.minimum(idx.clamp(min=0), self.n - 1)
+        return inside & self._near[1][idx[:, 2], idx[:, 1], idx[:, 0]]
+
     def lookup(self, P):
         idx = torch.floor((P - self.origin) / self.voxel).long()
         inside = ((idx >= 0) & (idx < self.n)).all(-1)
@@ -180,13 +234,19 @@ def quat_to_rotmat(q):
 
 
 @torch.no_grad()
-def carve(params, space, min_logit=-6.0):
+def carve(params, space, min_logit=-6.0, fade=0.0, band=0.0):
     """Remove splats centred in known-empty space (opacity to ~0: MCMC relocates them, default
     densification prunes them) and shorten long axes whose tips poke into it."""
     means = params["means"]
     st, _ = space.lookup(means)
     dead = st == 1
-    params["opacities"][dead] = min_logit
+    if band > 0:
+        dead &= space.near_surface(means, band)
+    if fade > 0:   # soft: fade, and let the photos decide
+        o = torch.sigmoid(params["opacities"][dead]) * fade
+        params["opacities"][dead] = torch.logit(o.clamp(1e-6, 1 - 1e-6))
+    else:
+        params["opacities"][dead] = min_logit
     s = torch.exp(params["scales"])
     k = s.argmax(-1)
     R = quat_to_rotmat(params["quats"])
@@ -198,6 +258,8 @@ def carve(params, space, min_logit=-6.0):
         reach = 2 * smax * frac
         poke = alive & ((space.lookup(means + reach[:, None] * axis)[0] == 1)
                         | (space.lookup(means - reach[:, None] * axis)[0] == 1))
+        if band > 0:
+            poke &= space.near_surface(means, band)
         if not poke.any():
             break
         new = torch.log(smax[poke] * 0.5)
@@ -241,6 +303,67 @@ def keep_in_box(params, box, min_logit=-6.0):
     return int(out.sum())
 
 
+def screen_shapes(meta):
+    """Per projected splat in a render: (length/width on screen, splat index, opacity, length px).
+    From gsplat's 2D conics (inverse screen covariance), packed or not."""
+    con = meta["conics"].reshape(-1, 3)
+    n = con.shape[0]
+    a, b, c = con.unbind(-1)
+    half, disc = (a + c) / 2, (((a - c) / 2) ** 2 + b * b).sqrt()
+    l1, l2 = half + disc, (half - disc).clamp_min(1e-12)        # conic eigenvalues: 1/sigma^2
+    aspect = (l1 / l2).clamp_min(1.0).sqrt()
+    radii = meta["radii"].reshape(n, -1)
+    ids = meta.get("gaussian_ids")
+    ids = ids.reshape(-1) if ids is not None else torch.arange(n, device=con.device)
+    vis = (radii > 0).all(-1)
+    return aspect[vis], ids[vis], meta["opacities"].reshape(-1)[vis], l2[vis].rsqrt()
+
+
+def streak_loss(meta, means, ratio, space=None):
+    """Projected streaks (long, thin on screen and opaque enough to show) cost by how far their
+    length/width exceeds ratio, weighted by opacity; with space, splats in surface cells are free."""
+    aspect, ids, opac, length = screen_shapes(meta)
+    w = opac * (length > 2.0)
+    if space is not None:
+        st, _ = space.lookup(means[ids].detach())
+        w = w * (st != 2)
+    return (w * F.relu(aspect.log() - math.log(ratio))).sum() / w.sum().clamp_min(1.0)
+
+
+def streak_share(meta):
+    """Share of visible splats (opacity > 0.1, over 2 px long) that are streaks on screen (10:1)."""
+    aspect, _, opac, length = screen_shapes(meta)
+    keep = (opac > 0.1) & (length > 2.0)
+    return float((aspect[keep] > 10).float().mean()) if keep.any() else None
+
+
+@torch.no_grad()
+def streak_pass(params, views, sh_degree, mode, antialiased, share, fade, ratio=10.0, space=None,
+                viewmat=None):
+    """Fade splats that are streaks on screen (projected over ratio:1, over 2 px long, opacity
+    over 0.1) in more than `share` of the training views that see them, by `fade`. Splats needed
+    by the photos regrow their opacity; the rest fade out (MCMC then reuses them). With space,
+    splats in LiDAR surface cells are spared. Returns the number faded."""
+    n = len(params["means"])
+    dev = params["means"].device
+    seen = torch.zeros(n, device=dev)
+    streak = torch.zeros(n, device=dev)
+    for i in range(len(views)):
+        vm = viewmat(views.viewmats[i], i) if viewmat is not None else None
+        *_, meta, _ = render(params, views, i, sh_degree, mode, antialiased, viewmat=vm)
+        aspect, ids, opac, length = screen_shapes(meta)
+        keep = (opac > 0.1) & (length > 2.0)
+        seen.index_add_(0, ids[keep], torch.ones_like(aspect[keep]))
+        streak.index_add_(0, ids[keep], (aspect[keep] > ratio).float())
+    bad = (seen >= 3) & (streak > share * seen)
+    if space is not None:
+        bad &= space.lookup(params["means"])[0] != 2
+    if bad.any():
+        o = torch.sigmoid(params["opacities"][bad]) * fade
+        params["opacities"][bad] = torch.logit(o.clamp(1e-6, 1 - 1e-6))
+    return int(bad.sum())
+
+
 def needle_loss(params, ratio):
     s = torch.exp(params["scales"]).sort(-1).values   # ascending: min, mid, max
     return F.relu(s[:, 2] / s[:, 1].clamp_min(1e-9) - ratio).mean()
@@ -270,19 +393,63 @@ def axis_angle_to_R(v):
     return torch.eye(3, device=v.device, dtype=v.dtype)[None] + s * K + (1 - c) * (K @ K)
 
 
+def find_sweeps(names, c2w, jump=0.05, turn=25.0, longest=15):
+    """Sweep id per photo: photos in capture order (their names), split where the camera jumps
+    or turns sharply between shots (a pause, or a new side of the scene), and long runs cut into
+    pieces of at most `longest` (drift builds up along a sweep too)."""
+    order = sorted(range(len(names)), key=lambda k: names[k])
+    sid, cur, run = [0] * len(names), 0, 0
+    for a_, b_ in zip(order, order[1:] + [None]):
+        sid[a_] = cur
+        run += 1
+        if b_ is None:
+            break
+        d = float((c2w[a_, :3, 3] - c2w[b_, :3, 3]).norm())
+        cosang = float((c2w[a_, :3, 2] * c2w[b_, :3, 2]).sum().clamp(-1, 1))
+        if d > jump or math.degrees(math.acos(cosang)) > turn or run >= longest:
+            cur, run = cur + 1, 0
+    return sid
+
+
 class PoseCorrection(torch.nn.Module):
     """Per-photo correction applied in the camera's own frame: camera-to-world becomes
-    camera-to-world @ [R(rot) | shift]. Starts at zero."""
+    camera-to-world @ [R(rot) | shift]. Starts at zero.
 
-    def __init__(self, n, dev):
+    With sweeps (sweep correction), each sweep also gets one rigid correction in world space,
+    a turn about the sweep's centre plus a shift, applied to all its cameras together:
+    camera-to-world becomes G(sweep) @ camera-to-world @ [R(rot) | shift]. The largest sweep
+    stays put as the anchor, so the whole scene can't wander."""
+
+    def __init__(self, n, dev, sweeps=None, viewmats=None):
         super().__init__()
         self.shift = torch.nn.Parameter(torch.zeros(n, 3, device=dev))
         self.rot = torch.nn.Parameter(torch.zeros(n, 3, device=dev))
+        self.sweeps = None
+        if sweeps is not None:
+            m = max(sweeps) + 1
+            self.sweeps = torch.tensor(sweeps, device=dev)
+            centres = torch.linalg.inv(viewmats)[:, :3, 3]
+            self.centre = torch.stack([centres[self.sweeps == g].mean(0) for g in range(m)])
+            self.anchor = int(torch.bincount(self.sweeps).argmax())
+            self.sweep_shift = torch.nn.Parameter(torch.zeros(m, 3, device=dev))
+            self.sweep_rot = torch.nn.Parameter(torch.zeros(m, 3, device=dev))
+
+    def per_photo(self):
+        return [self.shift, self.rot]
+
+    def per_sweep(self):
+        return [self.sweep_shift, self.sweep_rot] if self.sweeps is not None else []
 
     def viewmat(self, vm, i):
         c2w = torch.linalg.inv(vm)
         R = axis_angle_to_R(self.rot[i:i + 1])[0]
-        T = torch.cat([torch.cat([R, self.shift[i][:, None]], 1), torch.tensor([[0., 0, 0, 1]], device=vm.device)], 0)
+        bottom = torch.tensor([[0., 0, 0, 1]], device=vm.device)
+        T = torch.cat([torch.cat([R, self.shift[i][:, None]], 1), bottom], 0)
+        if self.sweeps is not None and int(self.sweeps[i]) != self.anchor:
+            g = int(self.sweeps[i])
+            Rg = axis_angle_to_R(self.sweep_rot[g:g + 1])[0]
+            tg = self.centre[g] - Rg @ self.centre[g] + self.sweep_shift[g]
+            c2w = torch.cat([torch.cat([Rg, tg[:, None]], 1), bottom], 0) @ c2w
         return torch.linalg.inv(c2w @ T)
 
 
@@ -337,7 +504,7 @@ def align_depth(d, gt):
     return s, b
 
 
-def depth_loss(depth, alpha, gt, conf, min_conf, deadband=0.0, align=False):
+def depth_loss(depth, alpha, gt, conf, min_conf, deadband=0.0, align=False, front_only=False):
     """Relative L1 between rendered depth (pooled to the LiDAR map's size) and LiDAR depth,
     only where the LiDAR is confident; disagreement within the deadband (metres) is free.
     With align, the LiDAR depth is first fitted onto the rendered surface (align_depth)."""
@@ -350,7 +517,8 @@ def depth_loss(depth, alpha, gt, conf, min_conf, deadband=0.0, align=False):
     if align and m.sum() > 100:
         sc, off = align_depth(d.detach()[m], gt[m])
         gt = gt * sc + off
-    return (((d[m] - gt[m]).abs() - deadband).clamp_min(0) / gt[m]).mean()
+    err = (gt[m] - d[m]).clamp_min(0) if front_only else (d[m] - gt[m]).abs()
+    return ((err - deadband).clamp_min(0) / gt[m]).mean()
 
 
 # ---------------------------------------------------------------- training
@@ -367,6 +535,29 @@ def depth_error(depth, alpha, gt, conf):
     return float(err.median())
 
 
+def in_front(depth, alpha, gt, conf, margin=0.02):
+    """Floaters and spikes poking out: share of confident LiDAR pixels where the render sits
+    more than `margin` metres in front of the surface LiDAR measured."""
+    h, w = gt.shape
+    d = F.adaptive_avg_pool2d(depth[None, None], (h, w))[0, 0]
+    a = F.adaptive_avg_pool2d(alpha[None, None], (h, w))[0, 0]
+    m = (conf >= 2) & (gt > 0.05) & torch.isfinite(gt) & (a > 0.5)
+    if not m.any():
+        return None
+    return float((d[m] < gt[m] - margin).float().mean())
+
+
+def scene_counts(m, params):
+    """' needles 3.1% holes 4.0% in front 1.2%' for a log line: spikes (share of visible splats
+    10x longer than wide), gaps (box pixels left see-through), floaters (render in front of LiDAR)."""
+    sh = shape_stats(params)
+    out = f" needles {sh['needle_pct']:.1f}%" if "needle_pct" in sh else ""
+    for k, lab in (("streaks", "streaks"), ("holes", "holes"), ("in_front", "in front")):
+        if m.get(k) is not None:
+            out += f" {lab} {100 * m[k]:.1f}%"
+    return out
+
+
 def depth_image(depth, alpha):
     """Inverse depth as grey (near = bright), black where nothing was rendered."""
     inv = torch.where(alpha > 0.5, 1 / depth.clamp_min(0.05), torch.zeros_like(depth))
@@ -380,13 +571,20 @@ def evaluate(params, views, sh_degree, mode, antialiased, out_dir=None):
     res = []
     with torch.no_grad():
         for i in range(len(views)):
-            rgb, depth, alpha, *_ = render(params, views, i, sh_degree, mode, antialiased)
+            rgb, depth, alpha, meta, _ = render(params, views, i, sh_degree, mode, antialiased)
             gt = views.image(i)
             rgb = rgb.clamp(0, 1)
             m = views.masks[i] == 255 if views.masks and views.masks[i] is not None else None
             r = {"name": views.names[i], "psnr": gsdata.psnr(rgb, gt, m), "ssim": float(gsdata.ssim(rgb, gt, m))}
+            try:
+                r["streaks"] = streak_share(meta)
+            except Exception:
+                pass
+            if m is not None and m.any():   # gaps: box pixels the splats leave see-through
+                r["holes"] = float((alpha[m] < 0.9).float().mean())
             if views.depth[i] is not None:
                 r["depth_err"] = depth_error(depth, alpha, views.depth[i], views.conf[i])
+                r["in_front"] = in_front(depth, alpha, views.depth[i], views.conf[i])
             res.append(r)
             if out_dir:
                 stem = Path(views.names[i]).stem
@@ -396,9 +594,10 @@ def evaluate(params, views, sh_degree, mode, antialiased, out_dir=None):
         return {}
     out = {"psnr": sum(r["psnr"] for r in res) / len(res), "ssim": sum(r["ssim"] for r in res) / len(res),
            "views": res}
-    de = [r["depth_err"] for r in res if r.get("depth_err") is not None]
-    if de:
-        out["depth_err"] = sum(de) / len(de)
+    for k in ("depth_err", "holes", "in_front", "streaks"):
+        v = [r[k] for r in res if r.get(k) is not None]
+        if v:
+            out[k] = sum(v) / len(v)
     return out
 
 
@@ -469,8 +668,16 @@ def train(a, splats=None, log=print):
     lrs = {"means": a.means_lr * scene_scale, "scales": 5e-3, "quats": 1e-3, "opacities": 5e-2,
            "sh0": 2.5e-3, "shN": 2.5e-3 / 20}
     opts = {k: torch.optim.Adam([{"params": params[k], "lr": lr, "name": k}], eps=1e-15) for k, lr in lrs.items()}
-    pose = PoseCorrection(len(tv), dev) if a.pose_opt else None
-    pose_opt = torch.optim.Adam(pose.parameters(), lr=a.pose_lr, weight_decay=a.pose_reg) if pose else None
+    sweeps = None
+    if a.sweep_correction:
+        sweeps = find_sweeps(tv.names, torch.linalg.inv(tv.viewmats), a.sweep_jump, a.sweep_turn, a.sweep_max)
+        log(f"sweep correction: {max(sweeps) + 1} sweeps over {len(tv)} photos")
+    pose = (PoseCorrection(len(tv), dev, sweeps, tv.viewmats)
+            if a.pose_opt or a.sweep_correction else None)
+    pose_opt = (torch.optim.Adam(pose.per_photo(), lr=a.pose_lr, weight_decay=a.pose_reg)
+                if a.pose_opt else None)
+    sweep_opt = (torch.optim.Adam(pose.per_sweep(), lr=a.sweep_lr, weight_decay=a.pose_reg)
+                 if a.sweep_correction else None)
     decay = a.lr_decay_steps or a.steps
     means_lr0 = lrs["means"]
 
@@ -513,7 +720,7 @@ def train(a, splats=None, log=print):
             i = int(torch.multinomial(weights, 1))
         else:
             i = int(torch.randint(len(tv), (1,)))
-        deg = sh_degree if fine_tune else min(sh_degree, (step - 1) // 1000)
+        deg = sh_degree if fine_tune else min(sh_degree, (step - 1) // max(a.sh_ramp, 1))
         vmi = pose.viewmat(tv.viewmats[i], i) if pose is not None else None
         rgb_r, depth, alpha, meta, ex = render(params, tv, i, deg, a.mode, a.antialiased,
                                                absgrad=a.strategy in ("absgrad", "hybrid"), packed=packed, viewmat=vmi)
@@ -540,7 +747,8 @@ def train(a, splats=None, log=print):
         if a.depth_weight > 0 and tv.depth[i] is not None:
             loss = loss + a.depth_weight * depth_loss(
                 depth, alpha, tv.depth[i], tv.conf[i], a.depth_conf, a.depth_deadband,
-                align=a.depth_align_after > 0 and step >= a.depth_align_after * a.steps)
+                align=a.depth_align_after > 0 and step >= a.depth_align_after * a.steps,
+                front_only=a.depth_front_only)
         if a.flat_weight > 0 and a.mode == "3dgs":
             loss = loss + a.flat_weight * torch.exp(params["scales"]).min(dim=-1).values.mean()
         if a.mode == "2dgs":
@@ -551,8 +759,15 @@ def train(a, splats=None, log=print):
                 loss = loss + 0.01 * ex["distort"].mean()
         if a.needle_weight > 0:
             loss = loss + a.needle_weight * needle_loss(params, a.needle_max)
+        if a.streak_weight > 0:
+            loss = loss + a.streak_weight * streak_loss(meta, params["means"], a.streak_max,
+                                                        space if a.streak_off_surface else None)
         if mcmc:
-            loss = loss + 0.01 * torch.sigmoid(params["opacities"]).mean() + 0.01 * torch.exp(params["scales"]).mean()
+            loss = (loss + a.opacity_reg * torch.sigmoid(params["opacities"]).mean()
+                    + a.scale_reg * torch.exp(params["scales"]).mean())
+        if a.opacity_binary > 0 and step >= a.opacity_binary_start * a.steps:
+            o = torch.sigmoid(params["opacities"]).clamp(1e-4, 1 - 1e-4)
+            loss = loss - a.opacity_binary * (o * o.log() + (1 - o) * (1 - o).log()).mean()
         if space is not None and a.far_flat_weight > 0:
             loss = loss + a.far_flat_weight * far_flat_loss(params, space)
         loss.backward()
@@ -562,8 +777,15 @@ def train(a, splats=None, log=print):
         if pose_opt is not None:
             pose_opt.step()
             pose_opt.zero_grad(set_to_none=True)
+        if sweep_opt is not None:
+            if step >= a.sweep_start:
+                sweep_opt.step()
+            sweep_opt.zero_grad(set_to_none=True)
         for g in opts["means"].param_groups:
             g["lr"] = means_lr(step)
+        if mcmc and a.noise_stop > 0 and step == int(a.noise_stop * a.steps):
+            strategy.noise_lr = 0.0
+            log(f"step {step}: splat jitter stopped")
         if mcmc:
             strategy.step_post_backward(params, opts, state, step, meta, lr=means_lr(step))
         elif strategy:
@@ -575,9 +797,14 @@ def train(a, splats=None, log=print):
         if box is not None and step % 100 == 0 and step <= a.steps - 200:
             boxed += keep_in_box(params, box)
         if space is not None and a.carve and step % 100 == 0 and step <= a.steps - 200:
-            d, sh = carve(params, space)
+            d, sh = carve(params, space, fade=a.carve_fade, band=a.carve_band)
             carved[0] += d
             carved[1] += sh
+        if a.streak_pass_every and step % a.streak_pass_every == 0 and step <= a.steps - 500:
+            nf = streak_pass(params, tv, deg, a.mode, a.antialiased, a.streak_pass_share, a.streak_pass_fade,
+                             space=space if a.streak_off_surface else None,
+                             viewmat=pose.viewmat if pose is not None else None)
+            log(f"step {step}: streak pass faded {nf:,} splats")
         if step % 100 == 0 or step == a.steps:
             el = time.time() - t0
             log(f"step {step}/{a.steps} splats {len(params['means']):,} loss {float(loss):.4f} "
@@ -599,10 +826,11 @@ def train(a, splats=None, log=print):
                         img, *_ = render(params, extra, i, sh_degree, a.mode, a.antialiased)
                         gsdata.save_png(out / "track" / f"{Path(nm).stem}_{step:06d}.png", img.clamp(0, 1))
             curve.append({"step": step, "psnr": m["psnr"], "ssim": m["ssim"], "depth_err": m.get("depth_err"),
-                          "splats": len(params["means"]), "seconds": round(time.time() - t0, 1),
+                          "holes": m.get("holes"), "in_front": m.get("in_front"), "streaks": m.get("streaks"),
+                          "shapes": shape_stats(params), "splats": len(params["means"]), "seconds": round(time.time() - t0, 1),
                           "views": [{k: v[k] for k in ("name", "psnr", "ssim")} for v in m["views"]]})
             (out / "curve.json").write_text(json.dumps(curve, indent=1))
-            log(f"step {step}: held-out PSNR {m['psnr']:.2f} SSIM {m['ssim']:.4f}")
+            log(f"step {step}: held-out PSNR {m['psnr']:.2f} SSIM {m['ssim']:.4f}" + scene_counts(m, params))
         if a.export_every and step % a.export_every == 0 and step != a.steps:
             gsdata.save_ply(out / f"export_{step}.ply", dict(params))
 
@@ -626,10 +854,25 @@ def train(a, splats=None, log=print):
         pose_report = [{"name": n, "shift_mm": round(s_, 2), "turn_deg": round(r_, 3)}
                        for n, s_, r_ in zip(tv.names, sh_mm, rot_deg)]
         ss = sorted(sh_mm)
-        log(f"pose corrections: median shift {ss[len(ss) // 2]:.1f} mm, max {ss[-1]:.1f} mm; "
-            f"median turn {sorted(rot_deg)[len(rot_deg) // 2]:.2f} deg, max {max(rot_deg):.2f} deg")
+        if a.pose_opt:
+            log(f"pose corrections: median shift {ss[len(ss) // 2]:.1f} mm, max {ss[-1]:.1f} mm; "
+                f"median turn {sorted(rot_deg)[len(rot_deg) // 2]:.2f} deg, max {max(rot_deg):.2f} deg")
+    sweep_report = None
+    if pose is not None and pose.sweeps is not None:   # how far each sweep moved as a whole
+        with torch.no_grad():
+            g_mm = (pose.sweep_shift.norm(dim=-1) * 1000).cpu().tolist()
+            g_deg = (pose.sweep_rot.norm(dim=-1) * 180 / math.pi).cpu().tolist()
+        sweep_report = []
+        for g in range(len(g_mm)):
+            members = sorted(n for n, s_ in zip(tv.names, pose.sweeps.tolist()) if s_ == g)
+            sweep_report.append({"photos": len(members), "first": members[0], "last": members[-1],
+                                 "anchor": g == pose.anchor, "shift_mm": round(g_mm[g], 2),
+                                 "turn_deg": round(g_deg[g], 3)})
+        log("sweep corrections: " + ", ".join(f"{r['shift_mm']:.0f} mm/{r['turn_deg']:.2f} deg"
+                                              for r in sweep_report if not r["anchor"]))
     metrics = {"steps": a.steps, "splats": len(params["means"]), "train_seconds": round(time.time() - t0, 1),
-               "pose_corrections": pose_report,
+               "pose_corrections": pose_report if a.pose_opt else None,
+               "sweep_corrections": sweep_report,
                "peak_gpu_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
                "carved": {"removed": carved[0], "shortened": carved[1]}, "left_box": boxed,
                "shapes": shape_stats(params),
@@ -637,7 +880,8 @@ def train(a, splats=None, log=print):
     if len(ev):
         metrics["test"] = evaluate(params, ev, sh_degree, a.mode, a.antialiased, out / "test_renders")
         log(f"held-out PSNR {metrics['test']['psnr']:.2f} SSIM {metrics['test']['ssim']:.4f}"
-            + (f" depth error {100 * metrics['test']['depth_err']:.1f}%" if "depth_err" in metrics["test"] else ""))
+            + (f" depth error {100 * metrics['test']['depth_err']:.1f}%" if "depth_err" in metrics["test"] else "")
+            + scene_counts(metrics["test"], params))
     (out / "metrics.json").write_text(json.dumps(metrics, indent=1))
     return params, metrics
 
