@@ -7,6 +7,7 @@ inbox items. No Brush, iCloud or Messages needed:
 """
 import importlib.util
 import json
+import types
 import os
 import socket
 import tempfile
@@ -245,6 +246,90 @@ class DashboardAPITest(unittest.TestCase):
         self.inbox.read_quality(item)
         self.assertEqual(item.quality["pose_jump_pct"], 60)
         z.unlink()
+
+    def test_time_correction_match_cache(self):
+        gq, root = self.gq, Path(self.tmp.name)
+        # where a worker keeps a capture's matches: beside its gsplat folder, under the capture's key
+        w = types.SimpleNamespace(gsplat={"scripts": "D:/gq/gsplat/gs"})
+        self.assertEqual(gq.RemoteWorker.match_db_path(w, root / "pose_cache" / "capM-abc123"),
+                         f"D:/gq/match_cache/capM-abc123/{gq.MATCH_DB_VERSION}.db")
+        self.assertIsNone(gq.RemoteWorker.match_db_path(types.SimpleNamespace(gsplat=None), root))
+        # the marker in the pose cache shows up in the dashboard's cache list
+        gq.POSE_CACHE = root / "pose_cache"
+        d = gq.POSE_CACHE / "capM-abc123"
+        d.mkdir(parents=True)
+        (d / "stats.json").write_text(json.dumps({"photos": 800}))
+        mine = lambda: next(c for c in gq.list_caches() if c["dir"] == "capM-abc123")
+        self.assertIsNone(mine()["match_db"])
+        (d / f"{gq.MATCH_DB_VERSION}-matches.json").write_text(json.dumps({"worker": "pc", "size": 1234}))
+        self.assertEqual(mine()["match_db"]["size"], 1234)
+        # estimates: matching is the slow part; with the matches kept only the solve is left
+        st = {"sweep_correction": "time", "trainer": "gsplat"}
+        fresh = gq.sweep_seconds(st, 800, "capM", [])
+        kept = gq.sweep_seconds(st, 800, "capM", gq.list_caches())   # (the cache's name is "capM")
+        self.assertGreater(fresh, 3600)
+        self.assertLess(kept, 900)
+        # a run that reused matches says nothing about how long matching takes
+        slow = {"name": "x", "photos": 800, "match_db": None,
+                "sweeps": {"time": {"seconds": 4600, "match_cached": False}}}
+        fast = {"name": "y", "photos": 800, "match_db": None,
+                "sweeps": {"time": {"seconds": 400, "match_cached": True}}}
+        self.assertEqual(gq.sweep_seconds(st, 800, "z", [slow]), gq.sweep_seconds(st, 800, "z", [slow, fast]))
+
+    def test_time_correction_reuses_kept_matches(self):
+        """The first run matches and keeps the matches on the worker; with the result cache
+        gone, the next run goes straight to the correction on those kept matches."""
+        gq, root = self.gq, Path(self.tmp.name)
+        cache = root / "pose_cache" / "capR-1"
+        cache.mkdir(parents=True)
+        w = gq.RemoteWorker.__new__(gq.RemoteWorker)
+        w.name, w.label = "pc", "PC"
+        w.spec = {"aliked": {"models": "M", "cuda_path": "c"}, "colmap": "colmap.exe"}
+        w.gsplat = {"python": "py", "scripts": "D:/gq/gsplat/gs"}
+        calls, remote = [], {"size": None}
+
+        def run(exe, args, cwd, d, name, beat, poll=None, job=None, pending_settings=None, env_path=None):
+            calls.append((Path(str(args[0])).name, [str(a) for a in args]))
+            return 0
+
+        def ps(script, timeout=120, check=True):
+            if "Test-Path" in script:
+                return str(remote["size"] or "")
+            if "Copy-Item -Force 'D:/gq/jobs/capR/sweeps/upright" in script:
+                remote["size"] = 4321
+                return "4321\n"
+            return ""
+
+        def download(remote_path, local):
+            Path(local).write_text(json.dumps({"photos": {"a.jpg": {"shift_mm": [1, 2, 2]}}})
+                                   if str(local).endswith("sweeps.json") else "1 1 0 0 0 0 0 0 1 a.jpg\n\n")
+        w.run, w.ps, w.download = run, ps, download
+        w.upload_file, w.failure = (lambda a, b: None), (lambda *a: "")
+        job = {"name": "capR", "pose_cache": str(cache)}
+        beat = lambda **k: None
+        kept = f"D:/gq/match_cache/capR-1/{gq.MATCH_DB_VERSION}.db"
+
+        first = w.sweep_correction(self.cfg, job, "D:/gq/jobs/capR", "time", beat)
+        self.assertEqual([c[0] for c in calls], ["upright_match.py", "time_correct.py"])
+        self.assertEqual(calls[1][1][1], kept)   # the correction reads the kept copy
+        self.assertFalse(first["match_cached"])
+        marker = json.loads((cache / f"{gq.MATCH_DB_VERSION}-matches.json").read_text())
+        self.assertEqual((marker["worker"], marker["size"], marker["path"]), ("pc", 4321, kept))
+
+        for f in cache.glob(f"{gq.SWEEP_VERSION}-*"):   # forget the result, keep the matches
+            f.unlink()
+        calls.clear()
+        again = w.sweep_correction(self.cfg, job, "D:/gq/jobs/capR", "time", beat)
+        self.assertEqual([c[0] for c in calls], ["time_correct.py"])
+        self.assertEqual(calls[0][1][1], kept)
+        self.assertTrue(again["match_cached"])
+
+        remote["size"] = 99   # the worker's copy is not the one we recorded: match again
+        for f in cache.glob(f"{gq.SWEEP_VERSION}-*"):
+            f.unlink()
+        calls.clear()
+        w.sweep_correction(self.cfg, job, "D:/gq/jobs/capR", "time", beat)
+        self.assertEqual([c[0] for c in calls], ["upright_match.py", "time_correct.py"])
 
     def test_pose_cache_roundtrip(self):
         gq, root = self.gq, Path(self.tmp.name)

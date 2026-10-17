@@ -923,7 +923,7 @@ function renderCaches(list) {
   const el = $("caches");
   if (!list.length) { setHTML(el, `<div class="empty">Nothing cached yet.</div>`); return; }
   const sweepText = (sw) => Object.entries(sw).map(([m, v]) =>
-    `${esc(m)} search (${v.sweeps} sweeps, up to ${(+v.max_shift_mm || 0).toFixed(1)} mm${v.seconds ? `, ${dur(v.seconds)}` : ""}, ${esc(v.saved)})`).join("; ");
+    `${esc(m)} ${m.startsWith("time") ? "correction" : "search"} (${v.sweeps} ${m.startsWith("time") ? "photos" : "sweeps"}, up to ${(+v.max_shift_mm || 0).toFixed(1)} mm${v.seconds ? `, ${dur(v.seconds)}${v.match_cached ? " with kept matches" : ""}` : ""}, ${esc(v.saved)})`).join("; ");
   setHTML(el, list.map(c => `
     <div class="crow">
       <div class="name">${esc(c.name)} <span class="meta">${esc(c.key)} · ${size(c.size)} · ${esc((c.saved || "").replace("T", " ").slice(0, 16))}</span></div>
@@ -931,6 +931,7 @@ function renderCaches(list) {
         c.poses ? `<b>Refined poses</b>${c.photos ? ` (${c.photos} photos${c.reprojection_px[1] ? `, ${(+c.reprojection_px[0]).toFixed(2)} → ${(+c.reprojection_px[1]).toFixed(2)} px` : ""})` : ""}` : "",
         c.lens ? "<b>lens</b> calibrated" : "",
         c.feature_points ? "<b>feature points</b>" : "",
+        c.match_db ? `<b>feature matches</b> kept on ${esc(c.match_db.worker)} (${size(c.match_db.size)})` : "",
         c.space_maps.length ? `<b>LiDAR space map</b>` : "",
         Object.keys(c.sweeps).length ? `<b>Sweep correction:</b> ${sweepText(c.sweeps)}` : "<b>Sweep correction:</b> none",
       ].filter(Boolean).join(" · ")}</div>

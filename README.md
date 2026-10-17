@@ -265,6 +265,15 @@ PyTorch 2.14+ with MPS (Homebrew's `pytorch` works) and, in config.json:
 (metalsplat cloned into `tools/metalsplat`; `pip install --no-deps --target tools/gsplat-py
 gsplat==1.5.3 jaxtyping wadler_lindig`.) With `"auto": false` the Mac takes gsplat captures only
 when *Run on* is set to the Mac.
+**Time correction** (the "Time correction" sweep-correction choice) turns each photo upright by gravity
+before matching (ALIKED + LightGlue fail across a 90° turn of the phone), then fits a small, smooth
+per-photo correction to the cameras. Matching every photo pair is the slow part (about 3 minutes for
+100 photos, about 75 for 800, growing with the square of the count), so the worker keeps a capture's
+matches in `<worker root>/match_cache/<capture key>/`, with a marker in the pose cache that the
+dashboard's Cache section shows. A later run on the same capture (a failure after matching, a changed
+correction) reuses them and takes minutes. Each capture's copy is about a gigabyte for a large capture;
+delete the folder to reclaim the space.
+
 The scripts also run by hand on any CUDA machine:
 
 ```bash

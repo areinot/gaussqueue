@@ -185,6 +185,10 @@ TRAIN_RECIPE = ("full_schedule", "needles", "streaks", "antialiased", "soft_carv
 # poses and reused.
 SWEEP_METHODS = ("off", "match", "render", "time")
 SWEEP_VERSION = "sweeps2"   # bump when the sweep split or the searches change their result
+# Time correction's feature matches (the slow part: ~73 min for 800 photos) are kept on the worker,
+# in <worker root>/match_cache/<capture key>/, with a small marker in the Mac's pose cache. Bump
+# when the matching settings change (photo size, ALIKED/LightGlue thresholds, uprighting).
+MATCH_DB_VERSION = "upright1"
 GSPLAT_KEYS = ("trainer", "densify", "depth_supervision", "flatten", "sweep_correction") + TRAIN_RECIPE
 RESTART_KEYS = TRAIN_KEYS + ("refine_poses",) + GSPLAT_KEYS   # changing these restarts training
 OUTPUT_KEYS = ("flip_up", "start_view", "prune_pct", "spz_v3", "spz_v4", "notify")   # only affect the output files
@@ -1479,6 +1483,14 @@ def pose_cache_dir(cfg, colmap_dir, name):
     return POSE_CACHE / f"{name}-{h.hexdigest()[:16]}"
 
 
+def read_json(path):
+    """A small json file's contents, or None if it is missing or unreadable."""
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+
+
 def list_caches():
     """What the pose cache holds, for the dashboard: one entry per capture key, newest first."""
     out = []
@@ -1501,11 +1513,14 @@ def list_caches():
                     r = json.loads(f.read_text())
                 except Exception:
                     r = {}
+                summ = r.get("summary") or {}
                 sweeps[m[1] + (" (unrefined poses)" if m[2] else "")] = {
                     "saved": dt.datetime.fromtimestamp(f.stat().st_mtime).strftime("%m-%d %H:%M"),
-                    "sweeps": len(r.get("sweeps", {})),
-                    "max_shift_mm": max([v.get("shift_size_mm") or 0 for v in r.get("sweeps", {}).values()] or [0]),
-                    "seconds": r.get("seconds")}
+                    "sweeps": len(r.get("sweeps", {})) or len(r.get("photos", {})),
+                    "max_shift_mm": max([v.get("shift_size_mm") or 0 for v in r.get("sweeps", {}).values()]
+                                        or [summ.get("max_shift_mm") or 0]),
+                    "seconds": summ.get("seconds") or r.get("seconds"),
+                    "match_cached": bool(summ.get("match_cached"))}
         out.append({"name": name or d.name, "key": key, "dir": d.name,
                     "size": sum(f.stat().st_size for f in files if f.is_file()),
                     "saved": stats.get("saved") or dt.datetime.fromtimestamp(d.stat().st_mtime).isoformat(timespec="seconds"),
@@ -1514,6 +1529,7 @@ def list_caches():
                     "reprojection_px": [stats.get("reprojection_px_before"), stats.get("reprojection_px_after")],
                     "lens": bool(stats.get("lens")),
                     "feature_points": (d / FEATURE_POINTS).exists(),
+                    "match_db": read_json(d / f"{MATCH_DB_VERSION}-matches.json"),
                     "space_maps": sorted(f.name for f in files if f.name.startswith(SPACE_VERSION)),
                     "sweeps": sweeps})
     return sorted(out, key=lambda c: c["saved"] or "", reverse=True)
@@ -2219,6 +2235,13 @@ class RemoteWorker:
     def job_dir(self, name):
         return f"{self.root}/{name}"
 
+    def match_db_path(self, cache_dir):
+        """Where this worker keeps a capture's time-correction feature matches (see MATCH_DB_VERSION)."""
+        g = self.gsplat.get("scripts", "") if self.gsplat else ""
+        if not g or not cache_dir:
+            return None
+        return f"{g.rstrip('/').rsplit('/', 2)[0]}/match_cache/{Path(cache_dir).name}/{MATCH_DB_VERSION}.db"
+
     def download(self, remote_path, local):
         tmp = Path(str(local) + ".partial")
         r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", f"{self.ssh}:/{remote_path}", str(tmp)],
@@ -2574,6 +2597,7 @@ class RemoteWorker:
             return dict(json.loads(cached[1].read_text()).get("summary") or {}, method=method, cached=True)
         cwd, py = self.gsplat["scripts"], self.gsplat["python"]
         t0 = time.time()
+        match_cached = False
         if method == "match":
             al = self.spec.get("aliked") or {}
             if not al.get("models"):
@@ -2605,17 +2629,41 @@ class RemoteWorker:
             al = self.spec.get("aliked") or {}
             if not al.get("models"):
                 raise RuntimeError(f"time correction needs an \"aliked\" entry for {self.label} in config.json")
-            job["phase"] = f"sweep correction on {self.label}: matching uprighted photos"
-            beat(force=True)
-            args = [f"{cwd}/upright_match.py", "--colmap", self.spec["colmap"].replace("\\", "/"),
-                    "--images", f"{d}/data/images", "--model", sp, "--work", f"{d}/sweeps/upright",
-                    "--models", al["models"].rstrip("/"), "--max-image-size", 960]
-            code = self.run(py, args, cwd, d, "sweep_features", beat, env_path=al.get("cuda_path"))
-            if code:
-                raise RuntimeError(f"feature matching exit {code} {self.failure(d, 'sweep_features')}")
+            db, match_cached = f"{d}/sweeps/upright/database.db", False
+            marker = cache_dir / f"{MATCH_DB_VERSION}-matches.json" if cache_dir else None
+            kept = self.match_db_path(cache_dir) if cache_dir else None
+            if marker and marker.exists() and kept:   # the worker still has this capture's matches?
+                try:
+                    want = int(json.loads(marker.read_text()).get("size") or 0)
+                    have = self.ps(f"if (Test-Path '{kept}') {{ (Get-Item '{kept}').Length }}", check=False).strip()
+                    if want and have.isdigit() and int(have) == want:
+                        db, match_cached = kept, True
+                        log(f"using cached feature matches for {job['name']} on {self.label}")
+                except (ValueError, OSError):
+                    pass
+            if not match_cached:
+                job["phase"] = f"sweep correction on {self.label}: matching uprighted photos"
+                beat(force=True)
+                args = [f"{cwd}/upright_match.py", "--colmap", self.spec["colmap"].replace("\\", "/"),
+                        "--images", f"{d}/data/images", "--model", sp, "--work", f"{d}/sweeps/upright",
+                        "--models", al["models"].rstrip("/"), "--max-image-size", 960]
+                code = self.run(py, args, cwd, d, "sweep_features", beat, env_path=al.get("cuda_path"))
+                if code:
+                    raise RuntimeError(f"feature matching exit {code} {self.failure(d, 'sweep_features')}")
+                if kept and marker:   # keep them: a failure after this point, or another run, reuses them
+                    try:
+                        size = self.ps(f"New-Item -ItemType Directory -Force (Split-Path '{kept}') | Out-Null; "
+                                       f"Copy-Item -Force '{db}' '{kept}.partial'; Move-Item -Force '{kept}.partial' '{kept}'; "
+                                       f"(Get-Item '{kept}').Length", timeout=900).strip()
+                        marker.parent.mkdir(parents=True, exist_ok=True)
+                        marker.write_text(json.dumps({"worker": self.name, "path": kept, "size": int(size),
+                                                      "saved": dt.datetime.now().isoformat(timespec="seconds")}))
+                        db = kept
+                    except Exception as e:
+                        log(f"could not keep the feature matches: {e}")
             job["phase"] = f"sweep correction on {self.label}: time correction"
             beat(force=True)
-            args = [f"{cwd}/time_correct.py", f"{d}/sweeps/upright/database.db", "--raw", "--poses", sp,
+            args = [f"{cwd}/time_correct.py", db, "--raw", "--poses", sp,
                     "--out", f"{d}/sweeps/sweeps.json", "--write-model", f"{d}/sweeps/model",
                     "--pair-cap", 200]
             code = self.run(py, args, cwd, d, "sweep_search", beat)
@@ -2642,7 +2690,7 @@ class RemoteWorker:
         rep_ = json.loads((tmp / "sweeps.json").read_text())
         if method == "time":   # per photo, not per sweep
             ph = rep_.get("photos", {})
-            summary = {"photos": len(ph), "seconds": round(time.time() - t0),
+            summary = {"photos": len(ph), "seconds": round(time.time() - t0), "match_cached": match_cached,
                        "max_shift_mm": round(max([math.hypot(*v["shift_mm"]) for v in ph.values()] or [0]), 2)}
         else:
             moved = [v for v in rep_.get("sweeps", {}).values() if not v.get("anchor")]
@@ -3369,8 +3417,11 @@ def sweep_seconds(st, frames, name, caches, sweeps=None):
         return SWEEP_SECONDS_FIXED[method] + rate * max(sweeps - 1, 0)
     if method == "time":   # matching every pair dominates: grows with the square of the photo count
         n = frames or 100
+        if any(c.get("match_db") for c in mine):   # matches kept from an earlier run: only the solve is left
+            return SWEEP_SECONDS_FIXED["time"] + SWEEP_SECONDS_PER_PHOTO["time"] * n
         rates = [(v["seconds"] - SWEEP_SECONDS_FIXED["time"]) / (c["photos"] ** 2 / 2) for c in caches
-                 if (c.get("photos") or 0) > 50 for m, v in c["sweeps"].items() if m.split(" ")[0] == "time" and v.get("seconds")]
+                 if (c.get("photos") or 0) > 50 for m, v in c["sweeps"].items()
+                 if m.split(" ")[0] == "time" and v.get("seconds") and not v.get("match_cached")]
         pair = sorted(rates)[len(rates) // 2] if rates else SWEEP_SECONDS_PER_PAIR
         return SWEEP_SECONDS_FIXED["time"] + SWEEP_SECONDS_PER_PHOTO["time"] * n + max(pair, 0.002) * n * n / 2
     rates = [v["seconds"] / c["photos"] for c in caches if c.get("photos")
