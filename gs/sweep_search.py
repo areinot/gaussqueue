@@ -68,7 +68,7 @@ def main(argv=None):
     p.add_argument("--turn-step", type=float, default=0.5)
     p.add_argument("--refine-steps", type=int, default=200)
     a = p.parse_args(argv)
-    dev = "cuda"
+    dev = T.DEVICE
     t0 = time.time()
 
     want = {l.strip() for l in open(a.names) if l.strip()}

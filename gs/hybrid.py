@@ -36,6 +36,11 @@ class HybridStrategy(MCMCStrategy):
         if state["grad"] is None or len(state["grad"]) != n:
             state["grad"] = torch.zeros(n, device=dev)
             state["count"] = torch.zeros(n, device=dev)
+        if info.get("absgrad_full") is not None:   # Apple GPU backend: metalsplat's per-splat |grad|
+            ids = info["gaussian_ids"]
+            state["grad"].index_add_(0, ids, info["absgrad_full"][ids])
+            state["count"].index_add_(0, ids, torch.ones_like(ids, dtype=state["grad"].dtype))
+            return
         m2d = info["means2d"]
         g = getattr(m2d, "absgrad", None)
         if g is None:

@@ -44,22 +44,36 @@ def grid(r, step):
 class Matches:
     """Cross-sweep matches as arrays: for side 0/1, photo index and camera-frame ray."""
 
-    def __init__(self, db, photos, sid, max_matches):
-        con = sqlite3.connect(db)
+    def __init__(self, db, photos, sid, max_matches, raw=False):
+        """db: one COLMAP database, or a list (their matches are pooled per photo pair, each
+        distinct keypoint pair once; the runs must share keypoints, e.g. repeated runs of the same
+        settings). raw: LightGlue's matches before COLMAP's geometric verification. That
+        verification is RANSAC, so whole photo pairs pass in one run and fail in the next; the
+        raw matches are the same every run, and the searches here reject outliers themselves."""
+        dbs = [db] if isinstance(db, (str, Path)) else list(db)
         idx = {Path(n).stem: k for k, n in enumerate(photos["name"])}
-        iname = {i: Path(n).stem for i, n in con.execute("select image_id, name from images")}
-        kp = {i: np.frombuffer(d, np.float32).reshape(r, c)[:, :2]
-              for i, r, c, d in con.execute("select image_id, rows, cols, data from keypoints")}
+        table = "matches" if raw else "two_view_geometries"
+        pooled = {}
+        kps = {}
+        for one in dbs:
+            con = sqlite3.connect(one)
+            iname = {i: Path(n).stem for i, n in con.execute("select image_id, name from images")}
+            for i, r, c, d in con.execute("select image_id, rows, cols, data from keypoints"):
+                kps.setdefault(iname[i], np.frombuffer(d, np.float32).reshape(r, c)[:, :2])
+            for pid, r, _, data in con.execute(f"select pair_id, rows, cols, data from {table} where rows > 0"):
+                i2 = pid % PAIR
+                i1 = (pid - i2) // PAIR
+                key = (iname[i1], iname[i2])
+                a, b = idx.get(key[0]), idx.get(key[1])
+                if a is None or b is None or sid[a] == sid[b]:
+                    continue
+                m = np.frombuffer(data, np.uint32).reshape(r, 2)
+                pooled[key] = np.unique(np.concatenate([pooled[key], m]), axis=0) if key in pooled else m
         pa, pb, xa, xb = [], [], [], []
-        for pid, r, _, data in con.execute("select pair_id, rows, cols, data from two_view_geometries where rows > 0"):
-            i2 = pid % PAIR
-            i1 = (pid - i2) // PAIR
-            a, b = idx.get(iname[i1]), idx.get(iname[i2])
-            if a is None or b is None or sid[a] == sid[b]:
-                continue
-            m = np.frombuffer(data, np.uint32).reshape(r, 2)
-            pa.append(np.full(r, a)); pb.append(np.full(r, b))
-            xa.append(kp[i1][m[:, 0]]); xb.append(kp[i2][m[:, 1]])
+        for (n1, n2), m in pooled.items():
+            a, b = idx[n1], idx[n2]
+            pa.append(np.full(len(m), a)); pb.append(np.full(len(m), b))
+            xa.append(kps[n1][m[:, 0]]); xb.append(kps[n2][m[:, 1]])
         self.p = [np.concatenate(pa), np.concatenate(pb)]
         x = [np.concatenate(xa), np.concatenate(xb)]
         K = photos["K"]

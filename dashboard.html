@@ -48,6 +48,13 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .idle { padding: 28px 20px; color: var(--muted); text-align: center; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; align-items: start; }
 .card { overflow: hidden; display: flex; flex-direction: column; }
+.card.add { border-style: dashed; align-items: center; justify-content: center; min-height: 220px; gap: 10px;
+  text-align: center; padding: 14px; }
+.card.add .plus { font-size: 56px; line-height: 1; color: var(--muted); background: none; border: 0; cursor: pointer;
+  width: 100%; flex: 1; }
+.card.add .plus:hover { color: var(--text); }
+.card.add .bar { width: 80%; height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; }
+.card.add .bar span { display: block; height: 100%; background: var(--accent, #4a8); }
 .thumb { aspect-ratio: 4 / 3; background: var(--track); display: flex; align-items: center;
   justify-content: center; color: var(--muted); font-size: 12px; text-align: center; padding: 0; }
 .thumb { position: relative; overflow: hidden; }
@@ -75,6 +82,11 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .history .row { display: grid; grid-template-columns: 96px minmax(0, 1fr) auto; gap: 14px; align-items: center;
   padding: 10px 12px; border-top: 1px solid var(--line); }
 .history .row:first-child { border-top: 0; }
+.drawer { margin-bottom: 10px; }
+.drawer > summary { cursor: pointer; font-weight: 600; padding: 6px 0; }
+.drawer > div { margin-top: 8px; }
+.caches .crow { padding: 10px 12px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 3px; }
+.caches .crow:first-child { border-top: 0; }
 .history .row .thumb { aspect-ratio: 4 / 3; border-radius: 6px; overflow: hidden; }
 .history .detail { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .empty { color: var(--muted); padding: 16px; text-align: center; }
@@ -224,9 +236,17 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 
   <h2 id="queue-h">Inbox</h2>
   <div id="queue"></div>
+  <input type="file" id="pick-zip" accept=".zip,application/zip" hidden>
+  <input type="file" id="pick-folder" webkitdirectory multiple hidden>
 
-  <h2>Recent</h2>
-  <div id="history" class="panel history"></div>
+  <h2>History</h2>
+  <details class="drawer" id="drawer-exp"><summary>Experiments <span class="meta" id="exp-count"></span></summary>
+    <div id="exp-history"></div></details>
+  <details class="drawer" id="drawer-scenes"><summary>Scenes <span class="meta" id="scene-count"></span></summary>
+    <div id="history" class="panel history"></div></details>
+
+  <h2>Cache</h2>
+  <div id="caches" class="panel caches"></div>
 </main>
 <div id="lightbox"><img alt=""></div>
 
@@ -242,7 +262,7 @@ const kindText = (k, f) => [k && k !== "unknown" ? k : null, f ? `${f} frames` :
 
 const PRESET_LABEL = {preview: "Preview", fast: "Fast", standard: "Standard", high: "High", custom: "Custom"};
 const kfmt = (n) => n >= 1e6 ? `${+(n/1e6).toFixed(1)}M` : n >= 1000 ? `${+(n/1000).toFixed(1)}k` : String(n);
-const qualityText = (st) => st ? `<b>${PRESET_LABEL[st.preset] || esc(st.preset)}</b> · ${kfmt(st.total_steps)} steps · ${st.max_resolution}px · SH${st.sh_degree} · ≤${kfmt(st.max_splats)} splats${st.subsample_frames > 1 ? ` · every ${st.subsample_frames} frames` : ""}${st.refine_poses ? " · refined poses" : ""}${st.trainer === "gsplat" ? ` · gsplat ${esc(st.densify || "")}${st.depth_supervision ? " +depth" : ""}${st.flatten ? " +flat" : ""}` : ""}${st.prune_pct ? ` · prune ${st.prune_pct}%` : ""}${st.flip_up ? " · flipped" : ""}${st.start_view ? " · starts at first photo" : ""}${(() => { const v = [3, 4].filter(n => st[`spz_v${n}`]); return v.join() === "3" ? "" : ` · spz ${v.length ? v.map(n => "v" + n).join("+") : "off"}`; })()}` : "";
+const qualityText = (st) => st ? `<b>${PRESET_LABEL[st.preset] || esc(st.preset)}</b> · ${kfmt(st.total_steps)} steps · ${st.max_resolution}px · SH${st.sh_degree} · ≤${kfmt(st.max_splats)} splats${st.subsample_frames > 1 ? ` · every ${st.subsample_frames} frames` : ""}${st.refine_poses ? " · refined poses" : ""}${st.trainer === "gsplat" ? ` · gsplat ${esc(st.densify || "")}${st.depth_supervision ? " +depth" : ""}${st.flatten ? " +flat" : ""}${["full_schedule", "needles", "streaks", "antialiased", "soft_carve"].filter(k => st[k]).map(k => " +" + k.replace("_", " ")).join("")}` : ""}${st.prune_pct ? ` · prune ${st.prune_pct}%` : ""}${st.flip_up ? " · flipped" : ""}${st.start_view ? " · starts at first photo" : ""}${(() => { const v = [3, 4].filter(n => st[`spz_v${n}`]); return v.join() === "3" ? "" : ` · spz ${v.length ? v.map(n => "v" + n).join("+") : "off"}`; })()}` : "";
 const FIELD_OPTS = {
   max_resolution: [720, 960, 1080, 1280, 1440, 1920, 2560, 3840],
   sh_degree: [[0, "0 · flat colour (1 band)"], [1, "1 (2 bands)"], [2, "2 (3 bands)"], [3, "3 · full sheen (4 bands)"],
@@ -293,7 +313,11 @@ function renderJobs(jobs) {
   if (editing(el)) return;
   for (const k of Object.keys(selectedBy)) if (!jobs.some(j => j.name === k)) delete selectedBy[k];
   const exps = last && last.experiments;
-  const exp = (Array.isArray(exps) ? exps : exps ? [exps] : []).map(experimentsPanel).join("");
+  const all = Array.isArray(exps) ? exps : exps ? [exps] : [];
+  const exp = all.filter(e => e.live).map(experimentsPanel).join("");
+  const done = all.filter(e => !e.live);
+  $("exp-count").textContent = done.length ? `(${done.length})` : "";
+  setHTML($("exp-history"), done.length ? done.map(experimentsPanel).join("") : `<div class="panel empty">No finished experiments.</div>`);
   if (!jobs.length) {
     setHTML(el, exp || `<div class="panel"><div class="idle">Idle. Drop a capture (zip or folder with a COLMAP model) into <b>${esc(last && last.inbox_dir || "the inbox")}</b>.</div></div>`);
     return;
@@ -463,8 +487,16 @@ function choiceHTML(key, value, opts) {
     `<option value="${esc(v)}"${v === value ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
 }
 
+// Which sweep corrections are cached for a capture (matched by name; a re-shot capture with
+// the same name but different poses has another cache key and won't reuse them).
+function sweepCached(it) {
+  const mine = (last.caches || []).filter(c => it && c.name === it.name);
+  const methods = [...new Set(mine.flatMap(c => Object.keys(c.sweeps)))];
+  return methods.length ? `cached: ${methods.map(esc).join(", ")}` : "nothing cached";
+}
+
 // gsplat + pruning controls; only shown when some machine has gsplat (CUDA).
-function gsplatHTML(st) {
+function gsplatHTML(st, it) {
   if (!(last.workers || []).some(w => w.gsplat)) return "";
   const gs = st.trainer === "gsplat";
   const check = (key, label, title) => `<label class="flip" title="${title}">
@@ -473,9 +505,17 @@ function gsplatHTML(st) {
         <div class="flipfield runon" data-help-key="trainer" title="Brush runs on any machine. gsplat (CUDA) adds LiDAR depth supervision, flat splats and MCMC; it only runs on machines that have it.">Trainer
           ${choiceHTML("trainer", st.trainer || "brush", [["brush", "Brush"], ["gsplat", "gsplat (CUDA)"]])}</div>
         ${gs ? `<div class="flipfield runon" data-help-key="densify" title="How splats are added during training. Default: classic 3DGS growth. Abs-grad: grows more in fine detail. MCMC: fixed budget, always ends at the splat cap.">Densify
-          ${choiceHTML("densify", st.densify || "mcmc", [["mcmc", "MCMC (fixed budget)"], ["default", "Default"], ["absgrad", "Abs-grad"]])}</div>
+          ${choiceHTML("densify", st.densify || "hybrid", [["hybrid", "Hybrid (MCMC + abs-grad)"], ["mcmc", "MCMC (fixed budget)"], ["default", "Default"], ["absgrad", "Abs-grad"]])}</div>
         <div class="flipfield" data-help-key="depth_supervision">${check("depth_supervision", "LiDAR depth", "Match the LiDAR depth maps where the iPhone is confident (near surfaces). Sky and far scenery are left to the photos.")}</div>
-        <div class="flipfield" data-help-key="flatten">${check("flatten", "Flatten splats", "Push splats flat onto surfaces: crisper walls and ground, fewer floaters.")}</div>` : ""}
+        <div class="flipfield" data-help-key="flatten">${check("flatten", "Flatten splats", "Push splats flat onto surfaces: crisper walls and ground, fewer floaters.")}</div>
+        <div class="flipfield runon" data-help-key="sweep_correction" title="Before training, move each sweep of photos onto the rest (ARKit drift shifts whole runs of photos). Cached results are reused.">Sweep correction
+          ${choiceHTML("sweep_correction", st.sweep_correction || "off", [["off", "Off"], ["time", "Time correction (fast)"], ["match", "Match search (minutes)"], ["render", "Render search (slow)"]])}
+          <span class="meta">${sweepCached(it)}</span></div>
+        <div class="flipfield" data-help-key="full_schedule">${check("full_schedule", "Full-run schedule", "Slow splat movement down over the whole run; stop adding splats at 40% and jittering them at 60%, so the scene settles.")}</div>
+        <div class="flipfield" data-help-key="needles">${check("needles", "No needles", "Penalise splats more than 10 times longer than wide.")}</div>
+        <div class="flipfield" data-help-key="streaks">${check("streaks", "No streaks", "Penalise splats that look like streaks on screen: needles, and flat splats seen edge-on.")}</div>
+        <div class="flipfield" data-help-key="antialiased">${check("antialiased", "Antialiased", "Render splats antialiased while training: fewer thin streaks.")}</div>
+        <div class="flipfield" data-help-key="soft_carve">${check("soft_carve", "Soft carve", "Fade splats in space the LiDAR saw as empty; the photos keep what they need (LiDAR sees through glass).")}</div>` : ""}
         <div class="flipfield runon" data-help-key="prune_pct" title="After training, remove this share of splats (the ones that matter least to the photos) and fine-tune the rest. Runs on a CUDA machine; the unpruned result is kept in the work folder.">Prune
           ${choiceHTML("prune_pct", String(st.prune_pct || 0), [["0", "Off"], ["50", "50%"], ["70", "70%"], ["80", "80%"], ["90", "90%"]])}</div>`;
 }
@@ -489,7 +529,7 @@ function etaLine(it) {
     .map(w => { const e = est[w.name] || {};
       if (!e.total) return `? (${esc(shortLabel(w))})`;
       return e.train && e.total - e.train >= 60
-        ? `${dur(e.total)} (${esc(shortLabel(w))}: ${dur(e.train)} training)`
+        ? `${dur(e.total)} (${esc(shortLabel(w))}: ${dur(e.train)} training${e.sweeps ? `, ${dur(e.sweeps)} sweep correction` : ""})`
         : `${dur(e.total)} (${esc(shortLabel(w))})`; });
   if (!parts.length && it.est_seconds) parts.push(dur(it.est_seconds));
   return parts.length ? `<div class="quality"><b>Est. time</b> ${parts.join(" · ")}</div>` : "";
@@ -516,8 +556,8 @@ const HELP = {
   preset: {name: "Quality preset", what: "A starting point for the training settings below. Changing any field makes it Custom.",
     opts: {preview: "Quick look: is the scene coherent, the right way up, covered? 3k steps at 720 px; minutes. Not for judging detail.",
            fast: "7k steps at 1080 px, up to 1.5M splats. A usable result quickly.",
-           standard: "Your everyday default, set in config.json.",
-           high: "30k steps at 1920 px, up to 10M splats. The most detail; about an hour on the PC, several on the Mac.",
+           standard: "Your everyday default, set in config.json: the tested recipe at 20k steps, 1920 px, up to 1.5M splats.",
+           high: "The tested recipe at 30k steps, 1920 px, up to 1.5M splats. Longer than 30k only overfits in tests.",
            custom: "You've changed at least one field from the preset."}},
   total_steps: {name: "Training steps", what: "How long training runs. More steps refine detail, with diminishing returns past about 30k.",
     val: (v) => `${(+v).toLocaleString()} steps. Time grows roughly in proportion.`},
@@ -540,9 +580,25 @@ const HELP = {
     opts: {brush: "Brush: runs on the Mac or the PC. No depth supervision.",
            gsplat: "gsplat (CUDA, PC only): adds LiDAR depth, flatten, MCMC and floater carving. Held-out depth error about 2% vs 45% for Brush in tests."}},
   densify: {name: "Densify", what: "How splats are added and moved during training.",
-    opts: {mcmc: "MCMC: a fixed budget that always ends at the splat cap, moving weak splats to where they're needed. Best in tests.",
+    opts: {hybrid: "Hybrid: MCMC's fixed budget, placing new splats where abs-grad sees fine texture. Best in tests.",
+           mcmc: "MCMC: a fixed budget that always ends at the splat cap, moving weak splats to where they're needed.",
            default: "Default: classic 3DGS growth. Can hit the cap early and stop growing.",
            absgrad: "Abs-grad: grows more in fine detail. No better than Default in tests."}},
+  sweep_correction: {name: "Sweep correction", what: "ARKit's drift moves whole runs of photos (sweeps) together, so the same object lands in different places and trains as a ghost. Before training, each sweep is moved onto the rest. Results are cached with the capture's poses and reused next time. gsplat on the PC only.",
+    opts: {off: "Off: train on the poses as they are.",
+           match: "Match search: ALIKED + LightGlue features (about 2 min on the PC), then a consensus search over the raw matches (a few minutes). Reliable where objects look distinct; can miss sweeps that only see repeated or glassy objects.",
+           render: "Render search: for each sweep, train without it and search for the move that best matches the renders. 35-100 min per 100 photos.",
+           time: "Time correction: ALIKED + LightGlue on photos turned upright by gravity (the matcher fails across a 90° turn of the phone), then a small correction per photo, smooth along the capture. About a minute after matching; matching grows with the square of the photo count (~3 min for 100 photos, ~80 min for 800). Matched or beat the render search in tests."}},
+  full_schedule: {name: "Full-run schedule", what: "How fast splats may move, spread over the whole run: movement slows to 1% by the end, new splats stop at 40% and MCMC's jitter at 60%, so the scene settles instead of churning.",
+    opts: {1: "On: held-out +0.24 dB and fewer streaks in tests.", 0: "Off: movement slows by the halfway point, jitter until the end."}},
+  needles: {name: "No needles", what: "Penalises splats whose longest axis is more than 10 times the middle one.",
+    opts: {1: "On: needles 7% to 0% in tests, no cost.", 0: "Off: splats may grow into needles."}},
+  streaks: {name: "No streaks", what: "Penalises splats that are more than 10 times longer than wide on screen, from the camera being trained: needles, and flat disks seen edge-on, which the needle check can't see.",
+    opts: {1: "On: streaks 16% to 4% in tests, no loss in quality; about 7% slower.", 0: "Off: edge-on disks can show as streaks from new angles."}},
+  antialiased: {name: "Antialiased", what: "Trains with antialiased splat rendering, so tiny or thin splats can't hide as sub-pixel lines.",
+    opts: {1: "On: fewer streaks in tests.", 0: "Off: classic rendering."}},
+  soft_carve: {name: "Soft carve", what: "Every 100 steps, fades splats sitting in space the LiDAR saw as empty. Real ones (glass, which LiDAR sees through) regrow from the photos; floaters fade away. Hard carving cut up glassware in tests.",
+    opts: {1: "On: insurance against floaters; about -0.15 dB, no visible change on a glass shelf.", 0: "Off: the best score in tests."}},
   depth_supervision: {name: "LiDAR depth", what: "Pulls rendered depth toward the iPhone's LiDAR wherever it was confident (near surfaces, up to about 5 m). Sky and far scenery are left to the photos.",
     opts: {1: "On: correct geometry (held-out depth error about 2% instead of 40%), fewer floaters.", 0: "Off: geometry only has to look right from the photos."}},
   flatten: {name: "Flatten splats", what: "Pushes each splat's thinnest axis toward zero so splats lie flat on surfaces.",
@@ -689,7 +745,7 @@ function settingsHTML(it, isCurrent) {
           <select data-runon>${[["auto", "Auto (first available)"], ...last.workers.map(w => [w.name, w.label])].map(([v, l]) =>
             `<option value="${esc(v)}"${(it.run_on || "auto") === v ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></div>` : ""}
         <div class="flipfield" data-help-key="refine_poses">${refineBox(st.refine_poses)}</div>
-        ${gsplatHTML(st)}
+        ${gsplatHTML(st, it)}
         <div class="flipfield" data-help-key="flip_up">${flipBox(st.flip_up)}</div>
         <div class="flipfield" data-help-key="start_view">${startViewBox(st.start_view)}</div>
         <div class="flipfield" data-help-key="spz">${spzBoxes(st)}</div>
@@ -710,10 +766,9 @@ function renderQueue(q) {
   $("queue-h").textContent = `Inbox (${q.length})`;
   // Don't rebuild while someone is typing in a settings field.
   if (editing($("queue"))) return;
-  if (!q.length) { setHTML($("queue"), `<div class="panel empty">Nothing waiting.</div>`); return; }
   const editable = !!(last && last.presets);
   let pos = 0;
-  setHTML($("queue"), `<div class="grid">${q.map((it) => {
+  setHTML($("queue"), `<div class="grid">${editable ? addCardHTML() : ""}${q.map((it) => {
     const queued = it.state === "queued" && !it.hold;
     if (queued) pos++;
     const badge = it.hold ? `<span class="badge b-held">on hold</span>`
@@ -799,7 +854,91 @@ async function sendItem(name, body) {
   await refresh();
 }
 
+// "Add to queue" card: a zip or a capture folder from this computer, uploaded to the Mac and
+// put in the inbox on hold (so it waits for its settings even when the queue is empty).
+const add = {open: false, busy: false, done: 0, total: 0, label: "", error: ""};
+function addCardHTML() {
+  const inner = add.busy
+    ? `<div class="name">Adding ${esc(add.label)}</div>
+       <div class="bar"><span style="width:${add.total ? Math.round(100 * add.done / add.total) : 0}%"></span></div>
+       <div class="meta">${size(add.done)} of ${size(add.total)}</div>`
+    : add.open
+    ? `<div class="name">Add a capture</div>
+       <button data-add="zip">Zip file…</button><button data-add="folder">Folder…</button>
+       <button data-add="close">Cancel</button>`
+    : `<button class="plus" data-add="open" title="Add a capture (zip or folder) to the queue, on hold" aria-label="Add a capture to the queue">+</button>
+       <div class="meta">Add to queue</div>`;
+  return `<div class="panel card add">${inner}${add.error ? `<div class="serr">${esc(add.error)}</div>` : ""}</div>`;
+}
+const redrawQueue = () => { if (last) renderQueue(last.queue || []); };
+
+function postFile(url, file) {   // XHR for upload progress; resolves on 2xx, rejects with the server's error
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open("POST", url);
+    x.setRequestHeader("X-GaussQueue", "upload");
+    x.upload.onprogress = (e) => { add.part = e.loaded; add.shown = add.base + e.loaded; tickAdd(); };
+    x.onload = () => { if (x.status < 300) resolve(); else {
+      let m = `error ${x.status}`; try { m = JSON.parse(x.responseText).error || m; } catch (_) {} reject(new Error(m)); } };
+    x.onerror = () => reject(new Error("upload failed"));
+    x.send(file);
+  });
+}
+let addDrawn = 0;
+function tickAdd() { add.done = add.shown || add.done; if (Date.now() - addDrawn > 250) { addDrawn = Date.now(); redrawQueue(); } }
+
+async function addCapture(files, isZip) {
+  if (!files.length) return;
+  const strip = (n) => n.replace(/(\.zip)+$/i, "");
+  const name = isZip ? strip(files[0].name) : files[0].webkitRelativePath.split("/")[0];
+  // a folder's files, without hidden ones (.DS_Store) or anything inside hidden folders
+  const list = isZip ? [[files[0], ""]] : files.map(f => [f, f.webkitRelativePath.split("/").slice(1).join("/")])
+    .filter(([, rel]) => rel && !rel.split("/").some(x => x.startsWith(".")));
+  Object.assign(add, {open: false, busy: true, label: name, error: "", done: 0, base: 0, shown: 0,
+                      total: list.reduce((a, [f]) => a + f.size, 0)});
+  redrawQueue();
+  const q = (extra) => `/api/upload?name=${encodeURIComponent(name)}&${extra}`;
+  try {
+    for (let i = 0; i < list.length; i++) {
+      const [f, rel] = list[i];
+      await postFile(q(`path=${encodeURIComponent(rel)}${i === 0 ? "&start=1" : ""}`), f);
+      add.base += f.size;
+    }
+    await postFile(q(`finish=${isZip ? "zip" : "folder"}`), new Blob([]));
+    add.busy = false;
+  } catch (e) { add.busy = false; add.error = `${name}: ${e.message}`; }
+  await refresh();
+}
+for (const id of ["drawer-exp", "drawer-scenes"]) {   // remember open/closed per browser
+  const d = $(id);
+  try { d.open = localStorage.getItem(id) === "1"; } catch (_) {}
+  d.addEventListener("toggle", () => { try { localStorage.setItem(id, d.open ? "1" : "0"); } catch (_) {} });
+}
+$("pick-zip").addEventListener("change", (e) => { addCapture([...e.target.files], true); e.target.value = ""; });
+$("pick-folder").addEventListener("change", (e) => { addCapture([...e.target.files], false); e.target.value = ""; });
+
+// What the pose cache holds: refined poses, lens, feature points, LiDAR space maps and sweep
+// corrections, per capture. Captures reuse these instead of recomputing.
+function renderCaches(list) {
+  const el = $("caches");
+  if (!list.length) { setHTML(el, `<div class="empty">Nothing cached yet.</div>`); return; }
+  const sweepText = (sw) => Object.entries(sw).map(([m, v]) =>
+    `${esc(m)} search (${v.sweeps} sweeps, up to ${(+v.max_shift_mm || 0).toFixed(1)} mm${v.seconds ? `, ${dur(v.seconds)}` : ""}, ${esc(v.saved)})`).join("; ");
+  setHTML(el, list.map(c => `
+    <div class="crow">
+      <div class="name">${esc(c.name)} <span class="meta">${esc(c.key)} · ${size(c.size)} · ${esc((c.saved || "").replace("T", " ").slice(0, 16))}</span></div>
+      <div class="quality">${[
+        c.poses ? `<b>Refined poses</b>${c.photos ? ` (${c.photos} photos${c.reprojection_px[1] ? `, ${(+c.reprojection_px[0]).toFixed(2)} → ${(+c.reprojection_px[1]).toFixed(2)} px` : ""})` : ""}` : "",
+        c.lens ? "<b>lens</b> calibrated" : "",
+        c.feature_points ? "<b>feature points</b>" : "",
+        c.space_maps.length ? `<b>LiDAR space map</b>` : "",
+        Object.keys(c.sweeps).length ? `<b>Sweep correction:</b> ${sweepText(c.sweeps)}` : "<b>Sweep correction:</b> none",
+      ].filter(Boolean).join(" · ")}</div>
+    </div>`).join(""));
+}
+
 function renderHistory(h) {
+  $("scene-count").textContent = h.length ? `(${h.length})` : "";
   if (!h.length) { setHTML($("history"), `<div class="empty">No finished jobs yet.</div>`); return; }
   setHTML($("history"), h.map(r => `
     <div class="row">
@@ -849,7 +988,7 @@ async function refresh() {
     await Promise.all(s.jobs.map(j => preload(heroName(j))));
     last = s;
     $("stamp").textContent = new Date().toLocaleTimeString([], {hour: "numeric", minute: "2-digit", second: "2-digit"});
-    renderMachines(s.workers); renderJobs(s.jobs); renderQueue(s.queue || []); renderHistory(s.history || []);
+    renderMachines(s.workers); renderJobs(s.jobs); renderQueue(s.queue || []); renderHistory(s.history || []); renderCaches(s.caches || []);
     tick();
   } catch (e) {
     $("dot").classList.add("stale");
@@ -884,6 +1023,12 @@ document.addEventListener("mouseover", followHelp);
 document.addEventListener("focusin", followHelp);
 
 document.addEventListener("click", (e) => {
+  const ad = e.target.closest("[data-add]");
+  if (ad) { const a = ad.dataset.add;
+    if (a === "open") { add.open = true; add.error = ""; }
+    else if (a === "close") add.open = false;
+    else $(a === "zip" ? "pick-zip" : "pick-folder").click();
+    redrawQueue(); return; }
   const hb = e.target.closest("[data-help]");
   if (hb) { const n = hb.dataset.help; helpOpen.has(n) ? helpOpen.delete(n) : helpOpen.add(n);
     if (last) { renderQueue(last.queue || []); renderJobs(last.jobs || []); } return; }

@@ -101,13 +101,18 @@ DEFAULTS = {
     # more) and render it back into each photo for denoised, wider depth coverage. In tests it
     # made held-out depth worse in views facing foliage; training already fuses the per-photo
     # depth implicitly.
-    # carve: remove splats in space the LiDAR saw through (and shorten ones poking into it);
-    # removes floaters that show when you move off the capture path. far_flat_weight: make
-    # splats beyond the scanned region camera-facing disks. Both use a map of the LiDAR's
-    # space built on the worker and cached with the pose refinement.
-    "gsplat": {"densify": "mcmc", "depth_weight": 0.3, "flat_weight": 10, "max_splats": 6_000_000,
-               "sky_points": 50000, "mode": "3dgs", "depth_fusion": False,
-               "carve": True, "far_flat_weight": 1.0},
+    # carve: hard-remove splats in space the LiDAR saw through (and shorten ones poking into
+    # it). Off by default: LiDAR sees through glass, so hard carving cut up glassware in tests
+    # (-0.9 dB); the per-capture "soft carve" check fades them instead and lets the photos
+    # keep what they need. far_flat_weight: make splats beyond the scanned region
+    # camera-facing disks. Both use a map of the LiDAR's space built on the worker and cached
+    # with the pose refinement. The per-capture recipe checks (full_schedule, needles, streaks,
+    # antialiased, soft_carve) default to the values below; see TRAIN_RECIPE.
+    "gsplat": {"densify": "hybrid", "depth_weight": 0.3, "flat_weight": 10, "max_splats": 6_000_000,
+               "sky_points": 50000, "mode": "3dgs", "depth_fusion": False, "ssim_weight": 0.4,
+               "carve": False, "far_flat_weight": 1.0,
+               "full_schedule": True, "needles": True, "streaks": True, "antialiased": True,
+               "soft_carve": False, "sweep_correction": "off"},
     "depth_supervision": True,   # gsplat: match LiDAR depth where ARKit is confident
     "flatten": True,             # gsplat: push splats flat onto surfaces
     # Post-training pruning (on a CUDA worker): remove this percentage of splats, ranked by
@@ -121,8 +126,8 @@ DEFAULTS = {
     "settle_seconds": 30,         # inbox item must be unchanged this long before training
     "dashboard_port": 8765,
     "standard": {                 # the default quality preset
-        "total_steps": 15000, "max_resolution": 1440, "sh_degree": 3,
-        "max_splats": 10_000_000, "subsample_frames": 1,
+        "total_steps": 20000, "max_resolution": 1920, "sh_degree": 3,
+        "max_splats": 1_500_000, "subsample_frames": 1,
     },
     "checkpoint_every": 2500,
     "eval_every": 500,
@@ -149,6 +154,11 @@ DEFAULTS = {
     #             "scripts": "D:/gaussqueue/gsplat/gs"}}   <- optional, enables gsplat + pruning
     # "Auto" captures go to an idle remote worker first, then the Mac.
     "local_training": True,
+    # gsplat recipe on this Mac's GPU (gs/mps_backend.py: metalsplat's Metal kernels behind
+    # gsplat's interface). {"python": PyTorch 2.14+ with MPS, "pythonpath": [metalsplat/src,
+    # a folder with the gsplat Python package], "auto": false}. With "auto" false the Mac runs
+    # gsplat captures only when one is set to Run on: Mac (the PC is ~3x faster); {} = off.
+    "mac_gsplat": {},
     "workers": [],
 }
 
@@ -156,7 +166,26 @@ DEFAULTS = {
 # Per-item processing settings, editable from the dashboard. "standard" comes
 # from config.json, so editing config still changes the default.
 TRAIN_KEYS = ("total_steps", "max_resolution", "sh_degree", "max_splats", "subsample_frames")
-GSPLAT_KEYS = ("trainer", "densify", "depth_supervision", "flatten")
+# gsplat recipe checks, from the 2026-10 convergence tests (cups ladder, ablation, whole shelf):
+#   full_schedule: positions' learning rate decays over the whole run, growth stops at 40%,
+#                  MCMC's jitter at 60% (without it, held-out -0.24 dB and more streaks)
+#   needles:       penalise splats over 10:1 in 3D (needles 7% -> 0%, free)
+#   streaks:       penalise splats over 10:1 on screen, i.e. needles and flat disks seen
+#                  edge-on (streaks 16% -> 4%, ~7% slower)
+#   antialiased:   antialiased rendering (fewer streaks)
+#   soft_carve:    fade splats in LiDAR-empty space each 100 steps; the photos regrow real ones
+TRAIN_RECIPE = ("full_schedule", "needles", "streaks", "antialiased", "soft_carve")
+# Sweep correction (gsplat on a remote worker): before training, move each sweep of photos
+# (ARKit drift shifts whole runs of photos together) onto the rest. "match": consensus over
+# COLMAP's raw ALIKED+LightGlue matches, a few minutes (needs the worker's "aliked" entry);
+# "render": leave-one-sweep-out training + render search, 35-100 min per 100 photos;
+# "time": ALIKED+LightGlue on gravity-uprighted photos (upright_match.py), then a smooth
+# per-photo correction along the capture (time_correct.py), about a minute after matching;
+# in tests as good as the render search or better. Each result is cached with the capture's
+# poses and reused.
+SWEEP_METHODS = ("off", "match", "render", "time")
+SWEEP_VERSION = "sweeps2"   # bump when the sweep split or the searches change their result
+GSPLAT_KEYS = ("trainer", "densify", "depth_supervision", "flatten", "sweep_correction") + TRAIN_RECIPE
 RESTART_KEYS = TRAIN_KEYS + ("refine_poses",) + GSPLAT_KEYS   # changing these restarts training
 OUTPUT_KEYS = ("flip_up", "start_view", "prune_pct", "spz_v3", "spz_v4", "notify")   # only affect the output files
 SETTING_KEYS = RESTART_KEYS + OUTPUT_KEYS
@@ -164,8 +193,10 @@ SETTING_LIMITS = {"total_steps": (500, 100_000), "max_resolution": (256, 4096),
                   "sh_degree": (0, 4), "max_splats": (50_000, 20_000_000),
                   "subsample_frames": (1, 20), "flip_up": (0, 1), "refine_poses": (0, 1), "notify": (0, 1),
                   "depth_supervision": (0, 1), "flatten": (0, 1), "prune_pct": (0, 95),
-                  "start_view": (0, 1), "spz_v3": (0, 1), "spz_v4": (0, 1)}
-SETTING_CHOICES = {"trainer": ("brush", "gsplat"), "densify": ("mcmc", "default", "absgrad")}
+                  "start_view": (0, 1), "spz_v3": (0, 1), "spz_v4": (0, 1),
+                  **{k: (0, 1) for k in TRAIN_RECIPE}}
+SETTING_CHOICES = {"trainer": ("brush", "gsplat"), "densify": ("hybrid", "mcmc", "default", "absgrad"),
+                   "sweep_correction": SWEEP_METHODS}
 PRESETS = {
     # Quick look: is the scene coherent, oriented right, covered? Not for judging detail.
     "preview": {"total_steps": 3000, "max_resolution": 720, "sh_degree": 1,
@@ -174,7 +205,7 @@ PRESETS = {
              "max_splats": 1_500_000, "subsample_frames": 1},
     "standard": None,  # from config["standard"]
     "high": {"total_steps": 30000, "max_resolution": 1920, "sh_degree": 3,
-             "max_splats": 10_000_000, "subsample_frames": 1},
+             "max_splats": 1_500_000, "subsample_frames": 1},
 }
 def standard_settings(cfg):
     st = dict(DEFAULTS["standard"])
@@ -195,7 +226,11 @@ def effective_settings(cfg, ov):
     out["refine_poses"] = int(bool(cfg.get("refine_poses")))
     out["trainer"] = cfg.get("trainer") if cfg.get("trainer") in SETTING_CHOICES["trainer"] else "brush"
     densify = sub_config(cfg, "gsplat")["densify"]
-    out["densify"] = densify if densify in SETTING_CHOICES["densify"] else "mcmc"
+    out["densify"] = densify if densify in SETTING_CHOICES["densify"] else "hybrid"
+    g = sub_config(cfg, "gsplat")
+    for k in TRAIN_RECIPE:
+        out[k] = int(bool(g.get(k)))
+    out["sweep_correction"] = g.get("sweep_correction") if g.get("sweep_correction") in SWEEP_METHODS else "off"
     out["depth_supervision"] = int(bool(cfg.get("depth_supervision", True)))
     out["flatten"] = int(bool(cfg.get("flatten", True)))
     out["prune_pct"] = int(cfg.get("prune_pct") or 0)
@@ -203,6 +238,20 @@ def effective_settings(cfg, ov):
     out["base"] = preset
     out["preset"] = preset if not any(k in ov for k in TRAIN_KEYS) else "custom"
     return out
+
+
+def gsplat_recipe_args(st, g, total):
+    """train.py arguments for a capture's recipe checks (see TRAIN_RECIPE)."""
+    args = ["--ssim-weight", g.get("ssim_weight", 0.4)]
+    if st.get("full_schedule"):
+        args += ["--lr-decay-steps", total, "--refine-stop", int(total * 0.4), "--noise-stop", 0.6]
+    if st.get("needles"):
+        args += ["--needle-weight", 0.1, "--needle-max", 10]
+    if st.get("streaks"):
+        args += ["--streak-weight", 0.1, "--streak-max", 10]
+    if st.get("antialiased"):
+        args += ["--antialiased"]
+    return args
 
 
 def sub_config(cfg, key):
@@ -217,7 +266,10 @@ def settings_summary(st):
             + (f", every {st['subsample_frames']} frames" if st["subsample_frames"] > 1 else "")
             + (", refined poses" if st.get("refine_poses") else "")
             + (f", gsplat {st.get('densify')}" + (" +depth" if st.get("depth_supervision") else "")
-               + (" +flat" if st.get("flatten") else "") if gs else "")
+               + (" +flat" if st.get("flatten") else "")
+               + "".join(f" +{k.replace('_', ' ')}" for k in TRAIN_RECIPE if st.get(k))
+               + (f" +sweeps by {st['sweep_correction']} search" if st.get("sweep_correction", "off") != "off" else "")
+               if gs else "")
             + (f", prune {st['prune_pct']}%" if st.get("prune_pct") else "")
             + (", flipped" if st.get("flip_up") else "")
             + (", starts at first photo" if st.get("start_view") else "")
@@ -563,6 +615,7 @@ class InboxItem:
         self.thumb_tries = 0
         self.quality = None   # SplatKing capture ratings, if present
         self.photo_px = None  # longest side of the capture's photos (from cameras.txt)
+        self.sweeps = None    # how many sweeps sweep correction will split it into (from images.txt)
         self.quality_tries = 0
 
     def signature(self):
@@ -589,7 +642,7 @@ class InboxItem:
                 "state": self.state, "kind": self.kind, "frames": self.frames,
                 "size": self.size, "first_seen": self.first_seen,
                 "thumb": self.thumb, "thumb_note": self.thumb_note, "quality": self.quality,
-                "photo_px": self.photo_px}
+                "photo_px": self.photo_px, "sweeps": self.sweeps}
 
 
 class Inbox:
@@ -659,7 +712,7 @@ class Inbox:
             d["est_seconds"] = estimate_seconds(d["settings"], d["frames"], rate)
             d["run_on"] = ov.get("run_on", "auto")
             if estimates:
-                d["est"] = estimates(d["settings"], d["frames"], ov)
+                d["est"] = estimates(d["settings"], d["frames"], ov, i.name, i.sweeps)
                 known = [v["total"] for v in d["est"].values() if v and v.get("total")]
                 if known:
                     d["est_seconds"] = min(known)
@@ -723,7 +776,63 @@ class Inbox:
             return max(int(p[2]), int(p[3]))
         return None
 
+    @staticmethod
+    def count_sweeps(text, turn=25.0, min_size=3):
+        """How many sweeps gs/train.find_sweeps makes of a capture, from images.txt text."""
+        poses = []
+        for line in text.splitlines():
+            p = line.split()
+            if line.startswith("#") or len(p) < 10 or not p[0].isdigit():
+                continue
+            q, t = list(map(float, p[1:5])), list(map(float, p[5:8]))
+            R = _quat_to_R(*q)
+            poses.append((p[9], [-(R[0][i] * t[0] + R[1][i] * t[1] + R[2][i] * t[2]) for i in range(3)], R[2]))
+        poses.sort()
+        if not poses:
+            return 0
+        step = [math.dist(a[1], b[1]) for a, b in zip(poses, poses[1:])]
+        jump = max(0.05, 3 * sorted(step)[len(step) // 2]) if step else 0.05
+        ang = [math.degrees(math.acos(max(-1.0, min(1.0, sum(x * y for x, y in zip(a[2], b[2]))))))
+               for a, b in zip(poses, poses[1:])]
+        runs, cur = [], [0]
+        for k in range(len(step)):
+            if step[k] > jump or ang[k] > turn:
+                runs.append(cur)
+                cur = []
+            cur.append(k + 1)
+        runs.append(cur)
+
+        while len(runs) > 1:
+            i = next((i for i, r in enumerate(runs) if len(r) < min_size), None)
+            if i is None:
+                break
+            left = (math.dist(poses[runs[i - 1][-1]][1], poses[runs[i][0]][1]) / jump + math.degrees(math.acos(
+                max(-1.0, min(1.0, sum(x * y for x, y in zip(poses[runs[i - 1][-1]][2], poses[runs[i][0]][2]))))))
+                / turn) if i > 0 else math.inf
+            right = (math.dist(poses[runs[i][-1]][1], poses[runs[i + 1][0]][1]) / jump + math.degrees(math.acos(
+                max(-1.0, min(1.0, sum(x * y for x, y in zip(poses[runs[i][-1]][2], poses[runs[i + 1][0]][2]))))))
+                / turn) if i + 1 < len(runs) else math.inf
+            if left <= right:
+                runs[i - 1] += runs[i]
+            else:
+                runs[i + 1] = runs[i] + runs[i + 1]
+            del runs[i]
+        return len(runs)
+
     def read_photo_size(self, item):
+        if item.sweeps is None:
+            try:
+                if item.is_dir:
+                    f = next(item.path.rglob("sparse/0/images.txt"), None)
+                    if f is not None and not is_dataless(f):
+                        item.sweeps = self.count_sweeps(f.read_text())
+                elif not is_dataless(item.path):
+                    with zipfile.ZipFile(item.path) as z:
+                        names = [n for n in z.namelist() if n.endswith("sparse/0/images.txt")]
+                        if names:
+                            item.sweeps = self.count_sweeps(z.read(names[0]).decode(errors="replace"))
+            except Exception:
+                item.sweeps = 0
         if item.photo_px:
             return
         if item.is_dir:
@@ -919,7 +1028,9 @@ class Status:
         workers = list(self.workers.values()) or [LocalWorker()]
         any_gsplat = any(w.gsplat for w in workers)
 
-        def estimates(st, frames, ov):
+        caches = list_caches()
+
+        def estimates(st, frames, ov, name=None, sweeps=None):
             """{machine: seconds or None} for the machines that could run this capture:
             all eligible ones on Auto, else just the chosen one."""
             out = {}
@@ -930,8 +1041,9 @@ class Status:
                 r = current_rate(self.jobs.get(w.name), self.state, w.name, trainer)
                 train = estimate_seconds(st, frames, r)
                 pre, post = overhead_seconds(self.state, w.name, frames, st.get("prune_pct"))
-                out[w.name] = {"total": train + pre + post if train and pre is not None else train,
-                               "train": train}
+                sweeps_t = sweep_seconds(st, frames, name, caches, sweeps) if trainer == "gsplat" else 0
+                out[w.name] = {"total": train + pre + post + sweeps_t if train and pre is not None else train,
+                               "train": train, "sweeps": sweeps_t}
             return out
         queue = self.inbox.snapshot(cfg, self.overrides, rate, busy, estimates)
         hist, seen = [], set()
@@ -962,6 +1074,7 @@ class Status:
             "settings": standard_settings(cfg),
             "inbox_dir": cfg["inbox_dir"],
             "presets": {k: (v or standard_settings(cfg)) for k, v in PRESETS.items()},
+            "caches": list_caches(),
             "limits": SETTING_LIMITS,
             "choices": SETTING_CHOICES,
             "experiments": read_experiments(self.paths),
@@ -1046,6 +1159,36 @@ def requeue(status, overrides, name):
     log(f"requeued (on hold): {name}" + (", with its last settings" if prev else ""))
 
 
+UPLOADS = APP_HOME / "uploads"   # dashboard uploads are assembled here, then moved into the inbox
+UPLOAD_NAME = re.compile(r"[^./\\\x00-\x1f][^/\\\x00-\x1f]{0,200}")   # no separators, no leading dot
+
+
+def upload_target(name, rel):
+    """Where one uploaded file goes in the staging folder: <uploads>/<name>/<rel> for a folder's
+    files, <uploads>/<name>.zip for a zip (rel empty). Raises ValueError on unsafe names."""
+    if not UPLOAD_NAME.fullmatch(name or "") or name.lower().endswith(".zip"):
+        raise ValueError("bad item name")
+    if not rel:
+        return UPLOADS / f"{name}.zip"
+    parts = rel.replace("\\", "/").split("/")
+    if any(not x or x in (".", "..") or not UPLOAD_NAME.fullmatch(x) for x in parts):
+        raise ValueError(f"bad file path: {rel}")
+    return UPLOADS / name / Path(*parts)
+
+
+def finish_upload(paths, overrides, name, is_zip):
+    """Move a completed upload into the inbox, on hold (set first, so it never starts on its own)."""
+    src = UPLOADS / (f"{name}.zip" if is_zip else name)
+    if not src.exists():
+        raise ValueError("nothing was uploaded")
+    dst = paths.inbox / src.name
+    if dst.exists() or (paths.inbox / (name if is_zip else f"{name}.zip")).exists():
+        raise ValueError(f"the inbox already has {src.name}")
+    overrides.apply(name, {"action": "hold", "value": True})
+    shutil.move(str(src), dst)
+    log(f"added from the dashboard (on hold): {src.name}")
+
+
 def start_dashboard(cfg, paths, status, overrides):
     previews = paths.previews
     port = int(cfg["dashboard_port"])
@@ -1101,7 +1244,48 @@ def start_dashboard(cfg, paths, status, overrides):
             except (BrokenPipeError, ConnectionResetError):
                 pass   # the browser cancelled
 
+        def upload(self):
+            """POST /api/upload?name=<item>&path=<file in the folder, or empty for a zip>: one
+            file's bytes, streamed to the staging folder. POST /api/upload?name=..&finish=zip|folder
+            moves the finished item into the inbox, on hold. Same-origin only; the custom header
+            makes cross-site pages need CORS approval, which this server never gives."""
+            if (self.headers.get("Origin") not in allowed_origins
+                    or self.headers.get("X-GaussQueue") != "upload"):
+                return self.send(403, b"forbidden", "text/plain")
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            name = (q.get("name") or [""])[0]
+            try:
+                if q.get("finish"):
+                    finish_upload(paths, overrides, name, q["finish"][0] == "zip")
+                    status.write(load_config())
+                    return self.send(200, b'{"ok":true}', "application/json")
+                if (q.get("start") or [""])[0] == "1":   # a fresh upload: clear any earlier attempt
+                    for old in (UPLOADS / name, UPLOADS / f"{name}.zip"):
+                        upload_target(name, "")   # validates the name
+                        if old.is_dir():
+                            shutil.rmtree(old)
+                        elif old.exists():
+                            old.unlink()
+                dst = upload_target(name, (q.get("path") or [""])[0])
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                left = int(self.headers.get("Content-Length", 0))
+                with open(dst.with_name(dst.name + ".part"), "wb") as f:
+                    while left > 0:
+                        chunk = self.rfile.read(min(left, 1 << 20))
+                        if not chunk:
+                            raise ValueError("upload cut short")
+                        f.write(chunk)
+                        left -= len(chunk)
+                dst.with_name(dst.name + ".part").replace(dst)
+                self.send(200, b'{"ok":true}', "application/json")
+            except ValueError as e:
+                self.send(400, json.dumps({"error": str(e)}).encode(), "application/json")
+            except Exception as e:
+                self.send(500, json.dumps({"error": str(e)}).encode(), "application/json")
+
         def do_POST(self):
+            if self.path.startswith("/api/upload?"):
+                return self.upload()
             # Only the dashboard itself may change settings: require our own Origin
             # and a JSON body (cross-site pages can't send either without CORS approval).
             if (self.headers.get("Origin") not in allowed_origins
@@ -1293,6 +1477,46 @@ def pose_cache_dir(cfg, colmap_dir, name):
         r = subprocess.run([colmap, "-h"], capture_output=True, text=True)
         h.update((r.stdout.splitlines() or [""])[0].encode())
     return POSE_CACHE / f"{name}-{h.hexdigest()[:16]}"
+
+
+def list_caches():
+    """What the pose cache holds, for the dashboard: one entry per capture key, newest first."""
+    out = []
+    if not POSE_CACHE.is_dir():
+        return out
+    for d in POSE_CACHE.iterdir():
+        if not d.is_dir() or d.name.endswith(".partial"):
+            continue
+        try:
+            stats = json.loads((d / "stats.json").read_text()) if (d / "stats.json").exists() else {}
+        except Exception:
+            stats = {}
+        files = list(d.iterdir())
+        name, _, key = d.name.rpartition("-")
+        sweeps = {}
+        for f in files:
+            m = re.match(rf"{SWEEP_VERSION}-(\w+?)(-unrefined)?\.json$", f.name)
+            if m:
+                try:
+                    r = json.loads(f.read_text())
+                except Exception:
+                    r = {}
+                sweeps[m[1] + (" (unrefined poses)" if m[2] else "")] = {
+                    "saved": dt.datetime.fromtimestamp(f.stat().st_mtime).strftime("%m-%d %H:%M"),
+                    "sweeps": len(r.get("sweeps", {})),
+                    "max_shift_mm": max([v.get("shift_size_mm") or 0 for v in r.get("sweeps", {}).values()] or [0]),
+                    "seconds": r.get("seconds")}
+        out.append({"name": name or d.name, "key": key, "dir": d.name,
+                    "size": sum(f.stat().st_size for f in files if f.is_file()),
+                    "saved": stats.get("saved") or dt.datetime.fromtimestamp(d.stat().st_mtime).isoformat(timespec="seconds"),
+                    "photos": stats.get("photos"),
+                    "poses": (d / "images.txt").exists(),
+                    "reprojection_px": [stats.get("reprojection_px_before"), stats.get("reprojection_px_after")],
+                    "lens": bool(stats.get("lens")),
+                    "feature_points": (d / FEATURE_POINTS).exists(),
+                    "space_maps": sorted(f.name for f in files if f.name.startswith(SPACE_VERSION)),
+                    "sweeps": sweeps})
+    return sorted(out, key=lambda c: c["saved"] or "", reverse=True)
 
 
 FEATURE_POINTS = "points3D_features.txt"   # written by gs/refine.py
@@ -1546,15 +1770,45 @@ def same_settings(a, b):
     return all(a.get(k) == b.get(k) for k in RESTART_KEYS)
 
 
-def train(cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
-    """Run Brush until done. Honours job["request"] = "pause" | "resume" (set by
-    the dashboard): pause SIGSTOPs Brush in place; resume either SIGCONTs it, or,
-    if the settings were changed while paused, kills it and returns RESTART."""
-    if not os.access(cfg["brush"], os.X_OK):
-        raise RuntimeError(f"Brush not found at {cfg['brush']} (run scripts/install.sh)")
+def local_gsplat_cmd(cfg, gs, st, total, colmap_dir, out_dir, job):
+    """train.py on this Mac's GPU (gs/mps_backend.py) with the capture's recipe settings."""
+    g = sub_config(cfg, "gsplat")
+    cmd = [gs["python"], "-u", str(GS_DIR / "train.py"), str(colmap_dir), "--out", str(out_dir),
+           "--steps", total, "--max-res", st["max_resolution"], "--sh-degree", st["sh_degree"],
+           "--max-splats", min(int(st["max_splats"]), int(g["max_splats"])), "--subsample", st["subsample_frames"],
+           "--strategy", st.get("densify") or "mcmc", "--sky-points", g["sky_points"],
+           "--export-every", cfg["checkpoint_every"], "--eval-every", cfg["eval_every"],
+           "--holdout-every", cfg["eval_split_every"]]
+    sensor = find_sensor_data(colmap_dir) or find_sensor_data(Path(colmap_dir).parent)
+    if sensor:
+        cmd += ["--depth-dir", sensor, "--eval-depth-dir", sensor]
+        if st.get("depth_supervision"):
+            cmd += ["--depth-weight", g["depth_weight"]]
+    if st.get("flatten"):
+        cmd += ["--flat-weight", g["flat_weight"]]
+    cmd += gsplat_recipe_args(st, g, total)
+    skipped = [k for k, on in (("sweep correction", st.get("sweep_correction", "off") != "off"),
+                               ("soft carve", st.get("soft_carve")), ("2DGS", g.get("mode") == "2dgs")) if on]
+    if skipped:
+        job.setdefault("warnings", []).append(f"not on the Mac yet: {', '.join(skipped)}")
+    return [str(c) for c in cmd]
+
+
+def train(cfg, paths, job, colmap_dir, out_dir, beat, pending_settings, worker=None):
+    """Run Brush (or, for gsplat captures with mac_gsplat set up, train.py on the Mac's GPU)
+    until done. Honours job["request"] = "pause" | "resume" (set by the dashboard): pause
+    SIGSTOPs the trainer in place; resume either SIGCONTs it, or, if the settings were
+    changed while paused, kills it and returns RESTART."""
     st = job["settings"]
     total = int(st["total_steps"])
-    cmd = [cfg["brush"], str(colmap_dir),
+    gs = worker.gsplat if (worker is not None and not worker.remote and st.get("trainer") == "gsplat") else None
+    env = None
+    if gs:
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(gs["pythonpath"] + [str(GS_DIR)]),
+                   KMP_DUPLICATE_LIB_OK="TRUE", PYTHONUNBUFFERED="1")
+    elif not os.access(cfg["brush"], os.X_OK):
+        raise RuntimeError(f"Brush not found at {cfg['brush']} (run scripts/install.sh)")
+    cmd = local_gsplat_cmd(cfg, gs, st, total, colmap_dir, out_dir, job) if gs else [cfg["brush"], str(colmap_dir),
            "--total-steps", str(total),
            "--max-resolution", str(st["max_resolution"]),
            "--sh-degree", str(min(int(st["sh_degree"]), BRUSH_MAX_SH)),
@@ -1572,7 +1826,7 @@ def train(cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
     with open(out_dir.parent / "train.log", "w") as tlog:
         # cwd matters: Brush writes a GPU autotune cache relative to it (launchd's cwd is /)
         proc = subprocess.Popen(cmd, stdout=tlog, stderr=subprocess.STDOUT,
-                                cwd=out_dir.parent)
+                                cwd=out_dir.parent, env=env)
     keep_awake = lambda: subprocess.Popen(["caffeinate", "-i", "-m", "-w", str(proc.pid)])
     awake = keep_awake()
     job.update(phase="training", step=0, total=total, started=time.time(),
@@ -1653,11 +1907,20 @@ def train(cfg, paths, job, colmap_dir, out_dir, beat, pending_settings):
             if "panicked at" in line and i + 1 < len(tlines):
                 reason = ": " + tlines[i + 1].strip()[:100]
                 break
-        raise RuntimeError(f"brush exited with code {proc.returncode}{reason}")
+        if gs:
+            reason = ": " + next((l.strip()[:120] for l in reversed(tlines) if "rror" in l), "")
+        raise RuntimeError(f"{'train.py' if gs else 'brush'} exited with code {proc.returncode}{reason}")
     job["train_seconds"] = time.time() - job["train_started"]
     final = out_dir / f"export_{total}.ply"
     if not final.exists():
-        raise RuntimeError("brush finished but no final .ply was written")
+        raise RuntimeError("training finished but no final .ply was written")
+    if gs:
+        try:
+            job["metrics"] = json.loads((out_dir / "metrics.json").read_text()).get("test")
+            if job["metrics"]:
+                job["metrics"].pop("views", None)
+        except Exception:
+            pass
     return final
 
 
@@ -1857,14 +2120,19 @@ class LocalWorker:
     """This Mac."""
     name, label, remote, gsplat = "mac", "Mac", False, None
 
-    def __init__(self):
+    def __init__(self, cfg=None):
         self.stats = {}
+        spec = (cfg or {}).get("mac_gsplat") or {}
+        if spec.get("python") and os.access(os.path.expanduser(spec["python"]), os.X_OK):
+            self.gsplat = {"python": os.path.expanduser(spec["python"]),
+                           "pythonpath": [os.path.expanduser(x) for x in spec.get("pythonpath") or []],
+                           "auto": bool(spec.get("auto"))}
 
     def refresh(self):
         self.stats = {"mem_free_pct": memory_free_pct()}
 
     def info(self, job):
-        return {"name": self.name, "label": self.label, "remote": False, "online": True, "gsplat": False,
+        return {"name": self.name, "label": self.label, "remote": False, "online": True, "gsplat": bool(self.gsplat),
                 "job": job and {"name": job["name"], "phase": job.get("phase"),
                                 "step": job.get("step"), "total": job.get("total")},
                 **self.stats}
@@ -2087,14 +2355,15 @@ class RemoteWorker:
         if r.returncode:
             raise RuntimeError(f"copying the gsplat scripts to {self.label} failed: {r.stderr.strip()[:200]}")
 
-    def run(self, exe, args, cwd, d, name, beat, poll=None, job=None, pending_settings=None):
+    def run(self, exe, args, cwd, d, name, beat, poll=None, job=None, pending_settings=None, env_path=None):
         """Run a program on the worker and wait for it, logging to <d>/<name>.log/.err.
         poll() is called about every 10 s. Stopping (an exception here) kills it.
         With job: honours job["request"] = "pause" | "resume" by suspending the process in
         place (it keeps its GPU memory) and resuming it; a resume after settings that need a
         restart were changed raises Restart (pending_settings gives the new ones)."""
         arglist = ", ".join("'" + str(a).replace("'", "''") + "'" for a in args)
-        script = (f"$env:PYTHONUNBUFFERED='1'\n"
+        script = ((f"$env:PATH = (Get-Content '{env_path}' -Raw).Trim() + ';' + $env:PATH\n" if env_path else "")
+                  + f"$env:PYTHONUNBUFFERED='1'\n"
                   f"$p = Start-Process -FilePath '{exe}' -ArgumentList @({arglist}) "
                   f"-WorkingDirectory '{cwd}' -NoNewWindow -PassThru "
                   f"-RedirectStandardOutput '{d}/{name}.log' -RedirectStandardError '{d}/{name}.err'\n"
@@ -2170,6 +2439,13 @@ class RemoteWorker:
         if gs:
             self.sync_gsplat()
             g = sub_config(cfg, "gsplat")
+            method = st.get("sweep_correction", "off")
+            if method in ("match", "render", "time"):
+                try:
+                    job["sweeps"] = self.sweep_correction(cfg, job, d, method, beat)
+                except Exception as e:
+                    log(f"sweep correction ({method}) failed for {name}: {e}")
+                    job.setdefault("warnings", []).append(f"sweep correction skipped: {str(e)[:120]}")
             what, exe, cwd = "gsplat", self.gsplat["python"], self.gsplat["scripts"]
             args = [f"{cwd}/train.py", f"{d}/data", "--out", f"{d}/out", "--steps", total,
                     "--max-res", st["max_resolution"], "--sh-degree", st["sh_degree"],
@@ -2184,16 +2460,19 @@ class RemoteWorker:
                 if st.get("depth_supervision") and g.get("depth_fusion"):
                     depth = self.fuse_depth(cfg, job, d, raw, beat)
                 args += ["--depth-dir", depth, "--eval-depth-dir", raw]
-                if g.get("carve") or g.get("far_flat_weight"):
+                if g.get("carve") or st.get("soft_carve") or g.get("far_flat_weight"):
                     space = self.space_map(cfg, job, d, raw, beat)
                     if space:
-                        args += ["--space", space] + (["--carve"] if g.get("carve") else [])
+                        args += ["--space", space]
+                        if g.get("carve") or st.get("soft_carve"):
+                            args += ["--carve"] + ([] if g.get("carve") else ["--carve-fade", 0.7])
                         if g.get("far_flat_weight"):
                             args += ["--far-flat-weight", g["far_flat_weight"]]
                 if st.get("depth_supervision"):
                     args += ["--depth-weight", g["depth_weight"]]
             if st.get("flatten"):
                 args += ["--flat-weight", g["flat_weight"]]
+            args += gsplat_recipe_args(st, g, total)
         else:
             what, exe, cwd = "brush", self.brush, d
             args = [f"{d}/data", "--total-steps", total, "--max-resolution", st["max_resolution"],
@@ -2277,6 +2556,111 @@ class RemoteWorker:
                 log(f"no metrics from {self.label}: {e}")
         # The worker's copy stays until finish(): pruning may still use it.
         return final
+
+    def sweep_correction(self, cfg, job, d, method, beat):
+        """Move each sweep of <d>/data's cameras onto the rest (see SWEEP_METHODS), in place:
+        <d>/data/sparse/0/images.txt is replaced (the original kept as images_uncorrected.txt).
+        From the cache when this capture (same poses) was corrected this way before. Returns a
+        short report."""
+        sp = f"{d}/data/sparse/0"
+        cache_dir = Path(job["pose_cache"]) if job.get("pose_cache") else None
+        tag = f"{SWEEP_VERSION}-{method}{'-unrefined' if job.get('poses_unrefined') else ''}"
+        cached = (cache_dir / f"{tag}-images.txt", cache_dir / f"{tag}.json") if cache_dir else None
+        label = {"match": "match search", "render": "render search", "time": "time correction"}[method]
+        self.ps(f"Copy-Item -Force '{sp}/images.txt' '{sp}/images_uncorrected.txt'")
+        if cached and cached[0].exists() and cached[1].exists():
+            self.upload_file(cached[0], f"{sp}/images.txt")
+            log(f"using cached sweep correction ({label}) for {job['name']}")
+            return dict(json.loads(cached[1].read_text()).get("summary") or {}, method=method, cached=True)
+        cwd, py = self.gsplat["scripts"], self.gsplat["python"]
+        t0 = time.time()
+        if method == "match":
+            al = self.spec.get("aliked") or {}
+            if not al.get("models"):
+                raise RuntimeError(f"match search needs an \"aliked\" entry for {self.label} in config.json")
+            m = al["models"].rstrip("/")
+            job["phase"] = f"sweep correction on {self.label}: matching features"
+            beat(force=True)
+            args = [f"{cwd}/refine.py", "--colmap", self.spec["colmap"].replace("\\", "/"),
+                    "--images", f"{d}/data/images", "--model", sp, "--work", f"{d}/sweeps/colmap",
+                    "--out", f"{d}/sweeps/refined", "--gpu", "--max-image-size", al.get("max_image_size", 1600),
+                    "--extract-args", f"--FeatureExtraction.type ALIKED_N16ROT --AlikedExtraction.n16rot_model_path "
+                                      f"{m}/aliked-n16rot.onnx --AlikedExtraction.max_num_features 8192 "
+                                      f"--AlikedExtraction.min_score 0.2",
+                    "--match-args", f"--FeatureMatching.type ALIKED_LIGHTGLUE --AlikedMatching.lightglue_model_path "
+                                    f"{m}/aliked-lightglue.onnx --AlikedMatching.lightglue_min_score 0.5 "
+                                    f"--TwoViewGeometry.max_error 2"]
+            code = self.run(py, args, cwd, d, "sweep_features", beat, env_path=al.get("cuda_path"))
+            if code:
+                raise RuntimeError(f"feature matching exit {code} {self.failure(d, 'sweep_features')}")
+            job["phase"] = f"sweep correction on {self.label}: match search"
+            beat(force=True)
+            args = [f"{cwd}/match_sweeps.py", f"{d}/sweeps/colmap/database.db", sp, "--out", f"{d}/sweeps/sweeps.json",
+                    "--write-model", f"{d}/sweeps/model", "--max-matches", 15000]
+            code = self.run(py, args, cwd, d, "sweep_search", beat)
+            if code:
+                raise RuntimeError(f"match search exit {code} {self.failure(d, 'sweep_search')}")
+            corrected, report = f"{d}/sweeps/model/images.txt", f"{d}/sweeps/sweeps.json"
+        elif method == "time":
+            al = self.spec.get("aliked") or {}
+            if not al.get("models"):
+                raise RuntimeError(f"time correction needs an \"aliked\" entry for {self.label} in config.json")
+            job["phase"] = f"sweep correction on {self.label}: matching uprighted photos"
+            beat(force=True)
+            args = [f"{cwd}/upright_match.py", "--colmap", self.spec["colmap"].replace("\\", "/"),
+                    "--images", f"{d}/data/images", "--model", sp, "--work", f"{d}/sweeps/upright",
+                    "--models", al["models"].rstrip("/"), "--max-image-size", 960]
+            code = self.run(py, args, cwd, d, "sweep_features", beat, env_path=al.get("cuda_path"))
+            if code:
+                raise RuntimeError(f"feature matching exit {code} {self.failure(d, 'sweep_features')}")
+            job["phase"] = f"sweep correction on {self.label}: time correction"
+            beat(force=True)
+            args = [f"{cwd}/time_correct.py", f"{d}/sweeps/upright/database.db", "--raw", "--poses", sp,
+                    "--out", f"{d}/sweeps/sweeps.json", "--write-model", f"{d}/sweeps/model",
+                    "--pair-cap", 200]
+            code = self.run(py, args, cwd, d, "sweep_search", beat)
+            if code:
+                raise RuntimeError(f"time correction exit {code} {self.failure(d, 'sweep_search')}")
+            corrected, report = f"{d}/sweeps/model/images.txt", f"{d}/sweeps/sweeps.json"
+        else:
+            job["phase"] = f"sweep correction on {self.label}: render search (long)"
+            beat(force=True)
+            args = [f"{cwd}/sweep_correct.py", f"{d}/data", "--out", f"{d}/sweeps"]
+            def poll():
+                out_ = self.ps(f"Get-Content '{d}/sweep_render.log' -Tail 20 -ErrorAction SilentlyContinue", check=False)
+                lines = [l.strip()[4:] for l in out_.splitlines() if l.strip().startswith("=== sweep ")]
+                if lines:
+                    job["phase"] = f"sweep correction on {self.label}: {lines[-1][:80]}"
+            code = self.run(py, args, cwd, d, "sweep_render", beat, poll)
+            if code:
+                raise RuntimeError(f"render search exit {code} {self.failure(d, 'sweep_render')}")
+            corrected, report = f"{d}/sweeps/corrected/sparse/0/images.txt", f"{d}/sweeps/sweeps.json"
+        tmp = APP_HOME / "tmp" / f"{job['name']}-{tag}"
+        tmp.mkdir(parents=True, exist_ok=True)
+        self.download(corrected, tmp / "images.txt")
+        self.download(report, tmp / "sweeps.json")
+        rep_ = json.loads((tmp / "sweeps.json").read_text())
+        if method == "time":   # per photo, not per sweep
+            ph = rep_.get("photos", {})
+            summary = {"photos": len(ph), "seconds": round(time.time() - t0),
+                       "max_shift_mm": round(max([math.hypot(*v["shift_mm"]) for v in ph.values()] or [0]), 2)}
+        else:
+            moved = [v for v in rep_.get("sweeps", {}).values() if not v.get("anchor")]
+            summary = {"sweeps": len(rep_.get("sweeps", {})), "seconds": round(time.time() - t0),
+                       "max_shift_mm": max([v.get("shift_size_mm") or (v.get("search") or {}).get("result", {}).get("shift_size_mm") or 0
+                                            for v in moved] or [0])}
+        rep_["summary"] = summary
+        self.upload_file(tmp / "images.txt", f"{sp}/images.txt")
+        if cache_dir:
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(tmp / "images.txt", cached[0])
+                cached[1].write_text(json.dumps(rep_, indent=1))
+            except OSError as e:
+                log(f"could not cache the sweep correction: {e}")
+        shutil.rmtree(tmp, ignore_errors=True)
+        log(f"sweep correction ({label}) for {job['name']}: {summary}")
+        return dict(summary, method=method, cached=False)
 
     def space_map(self, cfg, job, d, raw, beat):
         """The LiDAR space map for carving: from the pose cache when this capture (same refined
@@ -2375,7 +2759,8 @@ def make_workers(cfg):
     """Configured machines, in scheduling preference order (remote GPUs first)."""
     ws = [RemoteWorker(spec) for spec in cfg.get("workers") or []]
     if cfg.get("local_training", True):
-        ws.append(LocalWorker())
+        ws.append(LocalWorker(cfg))
+    globals()["_ALL_WORKERS"] = ws
     return {w.name: w for w in ws}
 
 
@@ -2437,7 +2822,7 @@ def process(cfg, paths, state, status, item, beat, worker=None):
         warnings = []
         job["trainer"] = "gsplat" if job["settings"].get("trainer") == "gsplat" and worker.gsplat else "brush"
         if job["settings"].get("trainer") == "gsplat" and not worker.gsplat:
-            warnings.append(f"gsplat needs a CUDA worker; trained with Brush on {worker.label}")
+            warnings.append(f"gsplat needs a CUDA worker or mac_gsplat; trained with Brush on {worker.label}")
         if job["trainer"] == "brush" and int(job["settings"].get("sh_degree", 0)) > BRUSH_MAX_SH:
             warnings.append(f"Brush trains at most SH degree {BRUSH_MAX_SH} (4 bands); used {BRUSH_MAX_SH}")
         while True:
@@ -2458,10 +2843,16 @@ def process(cfg, paths, state, status, item, beat, worker=None):
                 if refined[0]:
                     source = refined[0]
                 job["refine"] = refined[1]
+            if not job.get("pose_cache"):   # no refinement: sweep results still cache per capture
+                try:
+                    job["pose_cache"] = str(pose_cache_dir(cfg, colmap, name))
+                    job["poses_unrefined"] = True
+                except Exception:
+                    pass
             if worker.remote:
                 final = worker.train(cfg, paths, job, source, out_dir, beat, pending, sensor)
             else:
-                final = train(cfg, paths, job, source, out_dir, beat, pending)
+                final = train(cfg, paths, job, source, out_dir, beat, pending, worker=worker)
             if final is not RESTART:
                 break
             for old in paths.previews.glob(f"{name}_step*.jpg"):
@@ -2954,6 +3345,40 @@ def overhead_seconds(state, worker, frames, prune):
     return sum(pres) / len(pres), sum(posts) / len(posts)
 
 
+SWEEP_SECONDS_PER_PHOTO = {"match": 3.0, "render": 36.0, "time": 0.3}   # fallbacks until cached runs say otherwise
+SWEEP_SECONDS_FIXED = {"match": 60.0, "render": 120.0, "time": 120.0}
+SWEEP_SECONDS_PER_PAIR = 0.014   # time: LightGlue on every photo pair (PC, 960 px)
+
+
+RENDER_SECONDS_PER_SWEEP = 500.0   # PC, full-shelf: one leave-one-out training + search per sweep
+
+
+def sweep_seconds(st, frames, name, caches, sweeps=None):
+    """Time a capture's sweep correction will add before training: 0 when off, Brush, or
+    already cached for this capture; otherwise per-photo rates from earlier cached runs."""
+    method = st.get("sweep_correction", "off")
+    if method not in SWEEP_SECONDS_PER_PHOTO or st.get("trainer") != "gsplat":
+        return 0
+    mine = [c for c in caches if c["name"] == name]
+    if any(m.split(" ")[0] == method for c in mine for m in c["sweeps"]):
+        return 0
+    if method == "render" and sweeps:   # one training per sweep (all but the anchor)
+        rates = [v["seconds"] / max(v["sweeps"] - 1, 1) for c in caches
+                 for m, v in c["sweeps"].items() if m.split(" ")[0] == "render" and v.get("seconds") and v.get("sweeps")]
+        rate = sorted(rates)[len(rates) // 2] if rates else RENDER_SECONDS_PER_SWEEP
+        return SWEEP_SECONDS_FIXED[method] + rate * max(sweeps - 1, 0)
+    if method == "time":   # matching every pair dominates: grows with the square of the photo count
+        n = frames or 100
+        rates = [(v["seconds"] - SWEEP_SECONDS_FIXED["time"]) / (c["photos"] ** 2 / 2) for c in caches
+                 if c.get("photos", 0) > 50 for m, v in c["sweeps"].items() if m.split(" ")[0] == "time" and v.get("seconds")]
+        pair = sorted(rates)[len(rates) // 2] if rates else SWEEP_SECONDS_PER_PAIR
+        return SWEEP_SECONDS_FIXED["time"] + SWEEP_SECONDS_PER_PHOTO["time"] * n + max(pair, 0.002) * n * n / 2
+    rates = [v["seconds"] / c["photos"] for c in caches if c.get("photos")
+             for m, v in c["sweeps"].items() if m.split(" ")[0] == method and v.get("seconds")]
+    rate = sorted(rates)[len(rates) // 2] if rates else SWEEP_SECONDS_PER_PHOTO[method]
+    return SWEEP_SECONDS_FIXED[method] + rate * (frames or 100)
+
+
 def estimate_seconds(st, frames, rate):
     if not rate:
         return None
@@ -3009,8 +3434,11 @@ def can_take(cfg, worker, ov, any_gsplat):
     run_on = ov.get("run_on", "auto")
     if run_on not in ("auto", worker.name):
         return False
+    gs = effective_settings(cfg, ov).get("trainer") == "gsplat"
     if run_on == "auto" and any_gsplat and not worker.gsplat:
-        return effective_settings(cfg, ov).get("trainer") != "gsplat"
+        return not gs
+    if run_on == "auto" and gs and not worker.remote and worker.gsplat and not worker.gsplat.get("auto"):
+        return not any(w.remote and w.gsplat for w in globals().get("_ALL_WORKERS", []))
     return True
 
 

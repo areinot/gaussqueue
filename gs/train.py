@@ -29,7 +29,15 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from gsplat import rasterization, rasterization_2dgs
+if torch.cuda.is_available():
+    from gsplat import rasterization, rasterization_2dgs
+    DEVICE = "cuda"
+else:   # Apple GPU: metalsplat's Metal kernels behind gsplat's interface (gs/mps_backend.py)
+    import mps_backend
+    if not mps_backend.available():
+        raise SystemExit("train.py needs CUDA (gsplat) or an Apple GPU with metalsplat installed")
+    mps_backend.patch_gsplat_strategy()
+    rasterization, rasterization_2dgs, DEVICE = mps_backend.rasterization, None, "mps"
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 
 import gsdata
@@ -126,11 +134,12 @@ def parse(argv=None):
                         "wholesale against the rest (ARKit drift), which per-photo --pose-opt can't")
     p.add_argument("--sweep-lr", type=float, default=3e-5, help="sweep correction learning rate")
     p.add_argument("--sweep-start", type=int, default=500, help="start sweep correction at this step")
-    p.add_argument("--sweep-jump", type=float, default=0.05,
-                   help="a new sweep starts where the camera jumps further than this (m) between shots")
+    p.add_argument("--sweep-jump", type=float, default=0.0,
+                   help="a new sweep starts where the camera jumps further than this (m) between shots "
+                        "(0 = 3x the capture's median step, at least 5 cm)")
     p.add_argument("--sweep-turn", type=float, default=25.0,
                    help="... or turns more than this (degrees) between shots")
-    p.add_argument("--sweep-max", type=int, default=15, help="split sweeps longer than this many photos")
+    p.add_argument("--sweep-max", type=int, default=0, help="split sweeps longer than this many photos (0 = never)")
     p.add_argument("--track-cameras", help="a COLMAP folder of extra cameras (e.g. novel angles) rendered "
                                            "at every --test-every step into <out>/track")
     p.add_argument("--holdout-every", type=int, default=0)
@@ -393,21 +402,52 @@ def axis_angle_to_R(v):
     return torch.eye(3, device=v.device, dtype=v.dtype)[None] + s * K + (1 - c) * (K @ K)
 
 
-def find_sweeps(names, c2w, jump=0.05, turn=25.0, longest=15):
+def find_sweeps(names, c2w, jump=0.0, turn=25.0, longest=0, min_size=3):
     """Sweep id per photo: photos in capture order (their names), split where the camera jumps
-    or turns sharply between shots (a pause, or a new side of the scene), and long runs cut into
-    pieces of at most `longest` (drift builds up along a sweep too)."""
+    or turns sharply between shots (a pause, or a new side of the scene). ARKit's drift moves a
+    continuous run of shots together, so a sweep is one such run.
+
+    jump: metres; 0 = automatic, 3x this capture's median step between shots (at least 5 cm),
+    so a walking capture (a shot every few cm) isn't cut at every step. longest: split runs
+    longer than this many photos (0 = never). Runs shorter than min_size photos join the
+    neighbouring run they continue most smoothly (a lone photo can't be measured as a sweep)."""
     order = sorted(range(len(names)), key=lambda k: names[k])
-    sid, cur, run = [0] * len(names), 0, 0
-    for a_, b_ in zip(order, order[1:] + [None]):
-        sid[a_] = cur
-        run += 1
-        if b_ is None:
+    if not order:
+        return []
+    pos, axis = c2w[:, :3, 3], c2w[:, :3, 2]
+    step = [float((pos[a] - pos[b]).norm()) for a, b in zip(order, order[1:])]
+    ang = [math.degrees(math.acos(float((axis[a] * axis[b]).sum().clamp(-1, 1)))) for a, b in zip(order, order[1:])]
+    if jump <= 0:
+        jump = max(0.05, 3 * sorted(step)[len(step) // 2]) if step else 0.05
+    runs, cur = [], [order[0]]
+    for k, b in enumerate(order[1:]):
+        if step[k] > jump or ang[k] > turn or (longest and len(cur) >= longest):
+            runs.append(cur)
+            cur = []
+        cur.append(b)
+    runs.append(cur)
+    # fold short runs into a neighbour: the side with the smaller jump (scaled by turn)
+    cost = lambda a, b: float((pos[a] - pos[b]).norm()) / jump + math.degrees(
+        math.acos(float((axis[a] * axis[b]).sum().clamp(-1, 1)))) / turn
+    changed = True
+    while changed and len(runs) > 1:
+        changed = False
+        for i, r in enumerate(runs):
+            if len(r) >= min_size:
+                continue
+            left = cost(runs[i - 1][-1], r[0]) if i > 0 else float("inf")
+            right = cost(r[-1], runs[i + 1][0]) if i + 1 < len(runs) else float("inf")
+            if left <= right:
+                runs[i - 1] += r
+            else:
+                runs[i + 1] = r + runs[i + 1]
+            del runs[i]
+            changed = True
             break
-        d = float((c2w[a_, :3, 3] - c2w[b_, :3, 3]).norm())
-        cosang = float((c2w[a_, :3, 2] * c2w[b_, :3, 2]).sum().clamp(-1, 1))
-        if d > jump or math.degrees(math.acos(cosang)) > turn or run >= longest:
-            cur, run = cur + 1, 0
+    sid = [0] * len(names)
+    for i, r in enumerate(runs):
+        for k in r:
+            sid[k] = i
     return sid
 
 
@@ -504,13 +544,25 @@ def align_depth(d, gt):
     return s, b
 
 
+def pool_to(x, size):
+    """adaptive_avg_pool2d, also where MPS can't (sizes that don't divide): on the Apple GPU,
+    resample to the next exact multiple first, then average blocks."""
+    h, w = size
+    H, W = x.shape[-2:]
+    if x.device.type != "mps" or (H % h == 0 and W % w == 0):
+        return F.adaptive_avg_pool2d(x, size)
+    kh, kw = -(-H // h), -(-W // w)
+    x = F.interpolate(x, size=(h * kh, w * kw), mode="bilinear", align_corners=False)
+    return F.avg_pool2d(x, (kh, kw))
+
+
 def depth_loss(depth, alpha, gt, conf, min_conf, deadband=0.0, align=False, front_only=False):
     """Relative L1 between rendered depth (pooled to the LiDAR map's size) and LiDAR depth,
     only where the LiDAR is confident; disagreement within the deadband (metres) is free.
     With align, the LiDAR depth is first fitted onto the rendered surface (align_depth)."""
     h, w = gt.shape
-    d = F.adaptive_avg_pool2d(depth[None, None], (h, w))[0, 0]
-    a = F.adaptive_avg_pool2d(alpha[None, None], (h, w))[0, 0]
+    d = pool_to(depth[None, None], (h, w))[0, 0]
+    a = pool_to(alpha[None, None], (h, w))[0, 0]
     m = (conf >= min_conf) & (gt > 0.05) & torch.isfinite(gt) & (a > 0.5)
     if not m.any():
         return depth.new_zeros(())
@@ -526,11 +578,11 @@ def depth_loss(depth, alpha, gt, conf, min_conf, deadband=0.0, align=False, fron
 def depth_error(depth, alpha, gt, conf):
     """Median relative error of rendered depth against confident LiDAR depth."""
     h, w = gt.shape
-    d = F.adaptive_avg_pool2d(depth[None, None], (h, w))[0, 0]
+    d = pool_to(depth[None, None], (h, w))[0, 0]
     m = (conf >= 2) & (gt > 0.05) & torch.isfinite(gt)
     if not m.any():
         return None
-    a = F.adaptive_avg_pool2d(alpha[None, None], (h, w))[0, 0]
+    a = pool_to(alpha[None, None], (h, w))[0, 0]
     err = torch.where(a[m] > 0.5, (d[m] - gt[m]).abs() / gt[m], torch.ones_like(gt[m]))
     return float(err.median())
 
@@ -539,8 +591,8 @@ def in_front(depth, alpha, gt, conf, margin=0.02):
     """Floaters and spikes poking out: share of confident LiDAR pixels where the render sits
     more than `margin` metres in front of the surface LiDAR measured."""
     h, w = gt.shape
-    d = F.adaptive_avg_pool2d(depth[None, None], (h, w))[0, 0]
-    a = F.adaptive_avg_pool2d(alpha[None, None], (h, w))[0, 0]
+    d = pool_to(depth[None, None], (h, w))[0, 0]
+    a = pool_to(alpha[None, None], (h, w))[0, 0]
     m = (conf >= 2) & (gt > 0.05) & torch.isfinite(gt) & (a > 0.5)
     if not m.any():
         return None
@@ -605,7 +657,7 @@ def train(a, splats=None, log=print):
     """Train (or fine-tune, when `splats` or --init-ply is given). Returns (params, metrics)."""
     gsdata.keep_awake()
     torch.manual_seed(a.seed)
-    dev = "cuda"
+    dev = DEVICE
     root = Path(a.data)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -873,7 +925,8 @@ def train(a, splats=None, log=print):
     metrics = {"steps": a.steps, "splats": len(params["means"]), "train_seconds": round(time.time() - t0, 1),
                "pose_corrections": pose_report if a.pose_opt else None,
                "sweep_corrections": sweep_report,
-               "peak_gpu_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
+               "peak_gpu_gb": round((torch.cuda.max_memory_allocated() if DEVICE == "cuda"
+                                     else torch.mps.driver_allocated_memory()) / 1e9, 2),
                "carved": {"removed": carved[0], "shortened": carved[1]}, "left_box": boxed,
                "shapes": shape_stats(params),
                "views_train": len(tv), "views_test": len(ev), "settings": vars(a)}

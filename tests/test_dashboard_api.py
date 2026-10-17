@@ -47,7 +47,7 @@ class DashboardAPITest(unittest.TestCase):
         paths = gq.Paths(cls.cfg)
         state = {"history": [{"name": "old", "result": "done", "duration": "30m",
                               "finished": "01-01 00:00", "train_seconds": 1800,
-                              "settings": {"total_steps": 15000, "max_resolution": 1440}}]}
+                              "settings": {"total_steps": 20000, "max_resolution": 1920}}]}
         cls.inbox = gq.Inbox(paths)
         cls.overrides = gq.Overrides()
         cls.status = gq.Status(paths, state, cls.inbox, cls.overrides)
@@ -427,6 +427,38 @@ class DashboardAPITest(unittest.TestCase):
         # Not installed -> falls back (no native call recorded).
         self.assertIsNone(gq.native_spz(dict(cfg, spz_native=str(root / "missing"))))
 
+    def upload(self, query, data=b"", header="upload", origin=None):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/upload?{query}", data=data, method="POST",
+            headers={"Origin": origin or f"http://127.0.0.1:{self.port}", "X-GaussQueue": header,
+                     "Content-Type": "application/octet-stream"})
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    def test_add_from_dashboard(self):
+        inbox = Path(self.tmp.name) / "inbox"
+        # a folder, file by file, then finished: lands in the inbox on hold
+        self.assertEqual(self.upload("name=newcap&path=sparse%2F0%2Fimages.txt&start=1", b"# poses\n"), 200)
+        self.assertEqual(self.upload("name=newcap&path=images%2Fa%20(1).jpg", b"jpg"), 200)
+        self.assertEqual(self.upload("name=newcap&finish=folder"), 200)
+        self.assertEqual((inbox / "newcap" / "images" / "a (1).jpg").read_bytes(), b"jpg")
+        self.assertTrue(self.overrides.get("newcap").get("hold"))
+        # a zip
+        self.assertEqual(self.upload("name=zipcap&path=&start=1", b"PK"), 200)
+        self.assertEqual(self.upload("name=zipcap&finish=zip"), 200)
+        self.assertTrue((inbox / "zipcap.zip").exists())
+        self.assertTrue(self.overrides.get("zipcap").get("hold"))
+        # the same name again is refused; unsafe paths and foreign pages too
+        self.assertEqual(self.upload("name=zipcap&path=&start=1", b"PK"), 200)
+        self.assertEqual(self.upload("name=zipcap&finish=zip"), 400)
+        self.assertEqual(self.upload("name=x&path=..%2Fescape", b"no"), 400)
+        self.assertEqual(self.upload("name=x&path=a", b"no", header=""), 403)
+        self.assertEqual(self.upload("name=x&path=a", b"no", origin="http://evil.example"), 403)
+        self.assertFalse((Path(self.tmp.name) / "escape").exists())
+
     def test_estimates_per_machine(self):
         gq = self.gq
         pc = gq.RemoteWorker({"name": "pc", "label": "PC (RTX 4080)", "ssh": "gpu-pc",
@@ -434,7 +466,7 @@ class DashboardAPITest(unittest.TestCase):
         hist = self.status.state["history"]
         hist.append({"name": "x", "result": "done", "train_seconds": 600, "worker": "pc", "trainer": "brush",
                      "duration": "10m", "finished": "01-02 00:00",
-                     "settings": {"total_steps": 15000, "max_resolution": 1440}})
+                     "settings": {"total_steps": 20000, "max_resolution": 1920}})
         self.status.workers = {"pc": pc, "mac": gq.LocalWorker()}
         try:
             self.status.write(self.cfg)

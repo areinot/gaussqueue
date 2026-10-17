@@ -245,7 +245,26 @@ open so the dashboard also opens at `http://localhost:8765` on that machine. The
 reconnects it whenever it drops; the machine's card shows whether it's up.
 
 Captures set to gsplat wait for a machine that has it. If no machine does, or the capture
-is pinned to the Mac with *Run on*, it trains with Brush and says so in the history.
+is pinned to a machine without it with *Run on*, it trains with Brush and says so in the history.
+
+**gsplat recipe on the Mac (Apple GPU, optional).** `gs/train.py` also runs on Apple Silicon:
+`gs/mps_backend.py` puts [metalsplat](https://github.com/tchauffi/metalsplat)'s Metal kernels
+(MIT) behind the part of gsplat's interface the trainer uses, `gs/mps_ssim.py` is a fused
+Metal SSIM, and gsplat's Python package supplies the MCMC/hybrid strategies (its two CUDA
+helpers are replaced with PyTorch). Everything in the recipe works except sweep correction,
+soft carving and 2DGS, which still need the CUDA worker; the PC is about 3x faster. Needs a
+PyTorch 2.14+ with MPS (Homebrew's `pytorch` works) and, in config.json:
+
+```json
+"mac_gsplat": {"python": "/opt/homebrew/opt/pytorch/libexec/bin/python3",
+               "pythonpath": ["~/Library/Application Support/GaussQueue/tools/metalsplat/src",
+                              "~/Library/Application Support/GaussQueue/tools/gsplat-py"],
+               "auto": false}
+```
+
+(metalsplat cloned into `tools/metalsplat`; `pip install --no-deps --target tools/gsplat-py
+gsplat==1.5.3 jaxtyping wadler_lindig`.) With `"auto": false` the Mac takes gsplat captures only
+when *Run on* is set to the Mac.
 The scripts also run by hand on any CUDA machine:
 
 ```bash
@@ -278,7 +297,8 @@ The exception is `dashboard_port`, which needs a restart.
 | `compress` | `["spz"]` | Compressed formats written next to the `.ply`. Use `[]` to turn this off. If compression fails, the capture still counts as done, and the problem is noted in the history. |
 | `refine_poses` | `false` (example config: `true`) | Refine camera poses with COLMAP before training. A few minutes of CPU per capture. |
 | `init_feature_points` | `true` | Also start training from COLMAP's triangulated feature points (needs `refine_poses`). See [gsplat trainer and pruning](#gsplat-trainer-and-pruning-cuda-workers-optional). |
-| `trainer` | `"brush"` | `"gsplat"` trains on CUDA workers that have it. Per-capture override on the dashboard. |
+| `trainer` | `"brush"` | `"gsplat"` trains on CUDA workers that have it (or the Mac, with `mac_gsplat`). Per-capture override on the dashboard. |
+| `mac_gsplat` | `{}` (off) | Run the gsplat recipe on this Mac's GPU. See [gsplat trainer and pruning](#gsplat-trainer-and-pruning-cuda-workers-optional). |
 | `gsplat` | `{"densify": "mcmc", "depth_weight": 0.3, "flat_weight": 10, "max_splats": 6000000, "sky_points": 50000, "mode": "3dgs", "depth_fusion": false}` | gsplat options. `max_splats` caps gsplat runs whatever the preset says (MCMC always fills its budget; GPU memory is the limit). `mode` can be `"2dgs"` (flat disks). |
 | `depth_supervision` / `flatten` | `true` / `true` | Defaults for the per-capture gsplat checkboxes. |
 | `prune_pct` | `0` (off) | Remove this % of splats after training. Per-capture override. |

@@ -135,9 +135,30 @@ def expand(p):
     return Path(os.path.expanduser(str(p)))
 
 
-def publish(cfg, runner_local, ssh, out, label):
+def start_view(runner_local, ssh, data):
+    """The queue's start view for a training data folder (its first photo's camera, in the
+    flipped output's coordinates): gq_spz --origin/--yaw arguments, or [] if unknown."""
+    if not data:
+        return []
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import gaussqueue
+    if runner_local:
+        model = Path(data)
+    else:
+        model = APP_HOME / "tmp" / "start_view"
+        (model / "sparse" / "0").mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", f"{ssh}:/{data}/sparse/0/images.txt",
+                            str(model / "sparse" / "0" / "images.txt")], capture_output=True, text=True, timeout=120)
+        if r.returncode:
+            return []
+    view = gaussqueue.start_view_pose(model, True)
+    return ["--origin", *map(str, view[1]), "--yaw", str(view[2])] if view else []
+
+
+def publish(cfg, runner_local, ssh, out, label, data=None):
     """Fetch <out>'s newest export_<step>.ply and write outbox/<label>/<label>.ply + .v3.spz
-    (flipped). Returns [{"file", "size"}] or [] if there's nothing to publish."""
+    (flipped, and moved so viewers open at the first photo's camera when the training data
+    folder is given). Returns [{"file", "size"}] or [] if there's nothing to publish."""
     outbox = expand(cfg.get("outbox_dir") or APP_HOME / "outbox")
     tool = expand(cfg.get("spz_native") or APP_HOME / "bin" / "gq_spz")
     if runner_local:
@@ -162,10 +183,14 @@ def publish(cfg, runner_local, ssh, out, label):
         src = tmp
     dest = outbox / label
     dest.mkdir(parents=True, exist_ok=True)
+    try:
+        view = start_view(runner_local, ssh, data)
+    except Exception:
+        view = []
     files = []
     for suffix, extra in ((".ply", []), (".v3.spz", ["--spz-version", "3"])):
         f = dest / f"{label}{suffix}"
-        r = subprocess.run([str(tool), str(src), str(f), "--flip"] + extra, capture_output=True, text=True)
+        r = subprocess.run([str(tool), str(src), str(f), "--flip"] + view + extra, capture_output=True, text=True)
         if r.returncode == 0 and f.exists():
             files.append({"file": f.name, "size": f.stat().st_size})
     if tmp:
@@ -329,7 +354,8 @@ def main(plan_path):
                 if runner.program != "command":
                     label = f"exp-{slug(plan.get('name', 'batch'))[:40]}-{slug(v['name'])}"
                     try:
-                        rec["downloads"] = publish(cfg, runner.local, runner.worker.get("ssh"), out, label)
+                        rec["downloads"] = publish(cfg, runner.local, runner.worker.get("ssh"), out, label,
+                                                   data=(plan.get("common") or v.get("args") or [None])[0])
                         rec["result"] = label if rec["downloads"] else None
                     except Exception as e:
                         print(f"    publishing {v['name']} failed: {e}", flush=True)
@@ -362,7 +388,8 @@ def publish_batch(path):
         if rec.get("state") != "done" or rec.get("downloads"):
             continue
         label = f"exp-{slug(data.get('name', 'batch'))[:40]}-{slug(rec['name'])}"
-        rec["downloads"] = publish(cfg, local, ssh, f"{out_root}/{rec['name']}", label)
+        rec["downloads"] = publish(cfg, local, ssh, f"{out_root}/{rec['name']}", label,
+                                   data=(plan.get("common") or [None])[0])
         rec["result"] = label if rec["downloads"] else None
         print(f"{rec['name']}: {', '.join(d['file'] for d in rec['downloads']) or 'nothing to publish'}", flush=True)
         tmp = path.with_suffix(".tmp")

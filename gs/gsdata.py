@@ -251,12 +251,24 @@ def ssim(a, b, mask=None, weight=None):
     """SSIM of two [H,W,3] images in 0..1 (differentiable); with a [H,W] bool mask, the
     mean over the masked pixels only; with a [H,W] weight, the weighted mean."""
     import torch.nn.functional as F
+    if a.device.type == "mps":   # Apple GPU: fused Metal SSIM (gs/mps_ssim.py)
+        import mps_ssim
+        g = _gauss_window(device=a.device)[0, 0].sum(0)
+        return mps_ssim.ssim(a, b, g / g.sum(), mask, weight)
     x, y = a.permute(2, 0, 1)[None], b.permute(2, 0, 1)[None]
     w = _gauss_window(device=a.device)
-    mu_x, mu_y = F.conv2d(x, w, groups=3), F.conv2d(y, w, groups=3)
-    sxx = F.conv2d(x * x, w, groups=3) - mu_x ** 2
-    syy = F.conv2d(y * y, w, groups=3) - mu_y ** 2
-    sxy = F.conv2d(x * y, w, groups=3) - mu_x * mu_y
+    if a.device.type == "mps":   # Apple GPU: the same blur as two 1D passes over all 15 channels at once
+        g = w[0, 0].sum(0, keepdim=True)   # the window is separable: its row sums are the 1D taps
+        g = g / g.sum()
+        import mps_ssim
+        blur = lambda t: mps_ssim.blur(t, g[0])
+        mu_x, mu_y, exx, eyy, exy = blur(torch.cat([x, y, x * x, y * y, x * y], 1)).split(3, 1)
+        sxx, syy, sxy = exx - mu_x ** 2, eyy - mu_y ** 2, exy - mu_x * mu_y
+    else:
+        mu_x, mu_y = F.conv2d(x, w, groups=3), F.conv2d(y, w, groups=3)
+        sxx = F.conv2d(x * x, w, groups=3) - mu_x ** 2
+        syy = F.conv2d(y * y, w, groups=3) - mu_y ** 2
+        sxy = F.conv2d(x * y, w, groups=3) - mu_x * mu_y
     c1, c2 = 0.01 ** 2, 0.03 ** 2
     m = ((2 * mu_x * mu_y + c1) * (2 * sxy + c2)) / ((mu_x ** 2 + mu_y ** 2 + c1) * (sxx + syy + c2))
     k = (w.shape[-1] - 1) // 2

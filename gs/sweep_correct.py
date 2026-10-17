@@ -60,6 +60,9 @@ def main(argv=None):
                    help="train.py options for each held-out model, one quoted string")
     p.add_argument("--search-args", default="--shift-range 0.024 --turn-range 2.0",
                    help="sweep_search.py options, one quoted string")
+    p.add_argument("--sweep-jump", type=float, default=0.0, help="see train.find_sweeps (0 = automatic)")
+    p.add_argument("--sweep-max", type=int, default=0, help="split sweeps longer than this (0 = never)")
+    p.add_argument("--sweep-min", type=int, default=3, help="fold sweeps shorter than this into a neighbour")
     a = p.parse_args(argv)
     data, out = Path(a.data), Path(a.out)
     work = out / "work"
@@ -70,7 +73,7 @@ def main(argv=None):
     images, _, _ = gsdata.read_model(model)
     names = [im["name"] for im in images]
     vm = torch.tensor(np.stack([im["viewmat"] for im in images]), dtype=torch.float32)
-    sid = T.find_sweeps(names, torch.linalg.inv(vm))
+    sid = T.find_sweeps(names, torch.linalg.inv(vm), a.sweep_jump, longest=a.sweep_max, min_size=a.sweep_min)
     groups = {}
     for n, s in zip(names, sid):
         groups.setdefault(s, []).append(n)
