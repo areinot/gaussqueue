@@ -59,7 +59,8 @@ class Matches:
             con = sqlite3.connect(one)
             iname = {i: Path(n).stem for i, n in con.execute("select image_id, name from images")}
             for i, r, c, d in con.execute("select image_id, rows, cols, data from keypoints"):
-                kps.setdefault(iname[i], np.frombuffer(d, np.float32).reshape(r, c)[:, :2])
+                kps.setdefault(iname[i], np.frombuffer(d, np.float32).reshape(r, c)[:, :2] if d is not None and r
+                               else np.zeros((0, 2), np.float32))   # a photo with no keypoints stores no data
             for pid, r, _, data in con.execute(f"select pair_id, rows, cols, data from {table} where rows > 0"):
                 i2 = pid % PAIR
                 i1 = (pid - i2) // PAIR
