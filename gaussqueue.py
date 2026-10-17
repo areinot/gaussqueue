@@ -3370,7 +3370,7 @@ def sweep_seconds(st, frames, name, caches, sweeps=None):
     if method == "time":   # matching every pair dominates: grows with the square of the photo count
         n = frames or 100
         rates = [(v["seconds"] - SWEEP_SECONDS_FIXED["time"]) / (c["photos"] ** 2 / 2) for c in caches
-                 if c.get("photos", 0) > 50 for m, v in c["sweeps"].items() if m.split(" ")[0] == "time" and v.get("seconds")]
+                 if (c.get("photos") or 0) > 50 for m, v in c["sweeps"].items() if m.split(" ")[0] == "time" and v.get("seconds")]
         pair = sorted(rates)[len(rates) // 2] if rates else SWEEP_SECONDS_PER_PAIR
         return SWEEP_SECONDS_FIXED["time"] + SWEEP_SECONDS_PER_PHOTO["time"] * n + max(pair, 0.002) * n * n / 2
     rates = [v["seconds"] / c["photos"] for c in caches if c.get("photos")
