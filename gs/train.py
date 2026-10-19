@@ -90,6 +90,9 @@ def parse(argv=None):
                         "and dropped from the result")
     p.add_argument("--bounds-pad", type=float, default=1.0,
                    help="auto bounds: metres added on every side, and at least a quarter of the box's size")
+    p.add_argument("--open-scene", type=float, default=0.6,
+                   help="auto bounds: below this share of photo pixels with a LiDAR return (sky, far views) the "
+                        "scene is open: --sky-points are kept and the bounds grow to hold them; above it they're dropped")
     p.add_argument("--relocate-until", type=float, default=0.97,
                    help="MCMC: keep moving invisible splats to where they are needed until this fraction of "
                         "training (adding new ones still stops at the refine stop)")
@@ -326,7 +329,7 @@ def auto_bounds(images, depth_dir, depth_scale=1.0, pad=1.0, conf=2, max_depth=6
     LiDAR points, turned about +y to the points' main horizontal axes; per axis it spans the
     0.5-99.5th percentile of the points (a few LiDAR strays don't stretch it) and all the cameras,
     then grows by max(pad, a quarter of its size) on every side. None without any points."""
-    pts, cams = [], []
+    pts, cams, cover = [], [], []
     for k, im in enumerate(images):
         c2w = np.linalg.inv(im["viewmat"])
         cams.append(c2w[:3, 3])
@@ -338,6 +341,7 @@ def auto_bounds(images, depth_dir, depth_scale=1.0, pad=1.0, conf=2, max_depth=6
         d, c = d.numpy() * depth_scale, c.numpy()
         h, w = d.shape
         cam = im["cam"]
+        cover.append(float(((c >= 1) & (d > 0.05) & (d < max_depth)).mean()))
         v, u = np.mgrid[0:h:2, 0:w:2]
         z = d[v, u]
         ok = (c[v, u] >= conf) & (z > 0.05) & (z < max_depth)
@@ -358,7 +362,8 @@ def auto_bounds(images, depth_dir, depth_scale=1.0, pad=1.0, conf=2, max_depth=6
     grow = np.maximum(pad, 0.25 * (hi - lo))
     lo, hi = lo - grow, hi + grow
     return {"center": ((lo + hi) / 2 @ axes.T).tolist(), "axes": axes.tolist(),
-            "half": ((hi - lo) / 2).tolist(), "lidar_points": int(len(P)), "cameras": int(len(cams))}
+            "half": ((hi - lo) / 2).tolist(), "lidar_points": int(len(P)), "cameras": int(len(cams)),
+            "lidar_coverage": round(float(np.mean(cover)), 3)}
 
 
 @torch.no_grad()
@@ -741,17 +746,27 @@ def train(a, splats=None, log=print):
     if a.depth_scale != 1.0:
         for views in (tv, ev):
             views.depth = [None if d is None else d * a.depth_scale for d in views.depth]
+    centers = tv.centers()
+    scene_scale = float((centers - centers.mean(0)).norm(dim=1).max()) * 1.1 or 1.0
     bounds = None
-    if a.bounds == "auto" and not a.sky_points and not a.box:
-        bounds = auto_bounds(images, a.depth_dir, a.depth_scale, a.bounds_pad)
+    if a.bounds == "auto" and not a.box:
+        bounds = auto_bounds(images, a.depth_dir or a.eval_depth_dir, a.depth_scale, a.bounds_pad)
+        if bounds and a.sky_points:
+            if bounds["lidar_coverage"] >= a.open_scene:   # enclosed: nothing distant for a sky to stand for
+                log(f"LiDAR returns over {bounds['lidar_coverage']:.0%} of the photos: enclosed scene, no sky splats")
+                a.sky_points = 0
+            else:   # open: keep the sky, and the bounds hold its shell (they still catch splats flung far off)
+                c = np.array(bounds["center"])
+                reach = 1.5 * scene_scale * 10 + float(np.linalg.norm(centers.mean(0).cpu().numpy() - c))
+                bounds["half"] = [max(h, reach) for h in bounds["half"]]
+                bounds["open_scene"] = True
+                log(f"LiDAR returns over only {bounds['lidar_coverage']:.0%} of the photos: open scene, sky kept")
         if bounds:
             (out / "bounds.json").write_text(json.dumps(bounds, indent=1))
             log("bounds: level box {:.1f} x {:.1f} x {:.1f} m around {} cameras and {:,} LiDAR points".format(
                 *(2 * h for h in bounds["half"]), bounds["cameras"], bounds["lidar_points"]))
     elif a.bounds not in ("auto", "off"):
         bounds = json.loads(Path(a.bounds).read_text())
-    centers = tv.centers()
-    scene_scale = float((centers - centers.mean(0)).norm(dim=1).max()) * 1.1 or 1.0
     log(f"{len(tv)} training views, {len(ev)} held out, scene scale {scene_scale:.2f}, "
         f"depth maps {'yes' if tv.has_depth else 'no'}")
 

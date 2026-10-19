@@ -112,11 +112,16 @@ DEFAULTS = {
     # camera-facing disks. Both use a map of the LiDAR's space built on the worker and cached
     # with the pose refinement. The per-capture recipe checks (full_schedule, needles, streaks,
     # antialiased, soft_carve) default to the values below; see TRAIN_RECIPE.
+    # relocate: after the time correction, re-place photos whose own LiDAR lands in space the
+    # others see through (single-frame ARKit glitches), keeping a new pose only if the photo's
+    # LiDAR then agrees better (gs/relocate.py; needs pycolmap on the worker). smooth_robust:
+    # the time correction's smoothness lets a photo break from its neighbours when its matches
+    # pull it far away (0 = plain smoothness).
     "gsplat": {"densify": "hybrid", "depth_weight": 0.3, "flat_weight": 10, "max_splats": 6_000_000,
                "sky_points": 50000, "mode": "3dgs", "depth_fusion": False, "ssim_weight": 0.4,
                "carve": False, "far_flat_weight": 1.0,
                "full_schedule": True, "needles": True, "streaks": True, "antialiased": True,
-               "soft_carve": False, "sweep_correction": "off"},
+               "soft_carve": False, "sweep_correction": "time", "relocate": True, "smooth_robust": 0},
     "depth_supervision": True,   # gsplat: match LiDAR depth where ARKit is confident
     "flatten": True,             # gsplat: push splats flat onto surfaces
     # Post-training pruning (on a CUDA worker): remove this percentage of splats, ranked by
@@ -188,7 +193,7 @@ TRAIN_RECIPE = ("full_schedule", "needles", "streaks", "antialiased", "soft_carv
 # in tests as good as the render search or better. Each result is cached with the capture's
 # poses and reused.
 SWEEP_METHODS = ("off", "match", "render", "time")
-SWEEP_VERSION = "sweeps2"   # bump when the sweep split or the searches change their result
+SWEEP_VERSION = "sweeps3"   # bump when the sweep split or the searches change their result
 # Time correction's feature matches (the slow part: ~73 min for 800 photos) are kept on the worker,
 # in <worker root>/match_cache/<capture key>/, with a small marker in the Mac's pose cache. Bump
 # when the matching settings change (photo size, ALIKED/LightGlue thresholds, uprighting).
@@ -2405,6 +2410,11 @@ def write_meta(dest, job, files, flipped):
         meta["lidar_depth_scale"] = job["lidar_scale"]
     if job.get("dropped_frames"):
         meta["dropped_frames"] = job["dropped_frames"]
+    if job.get("relocation"):   # glitch photos re-placed after the time correction, and why each suspect was or wasn't
+        rl = job["relocation"]
+        meta["relocated_photos"] = {"relocated": rl.get("relocated", []), "suspects": len(rl.get("suspects") or {}),
+                                    "skipped": rl.get("skipped")}
+        (dest / "relocate.json").write_text(json.dumps(rl, indent=1) + "\n")
     if job.get("frame_check") and Path(job["frame_check"]).exists():   # every frame's check and what was done to it
         fc = json.loads(Path(job["frame_check"]).read_text())
         meta["frame_check"] = {"dropped": len(fc.get("dropped", [])), "shrunk": len(fc.get("shrunk", [])),
@@ -2830,7 +2840,8 @@ class RemoteWorker:
             method = st.get("sweep_correction", "off")
             if method in ("match", "render", "time"):
                 try:
-                    job["sweeps"] = self.sweep_correction(cfg, job, d, method, beat)
+                    job["sweeps"] = self.sweep_correction(cfg, job, d, method, beat,
+                                                          f"{d}/data/{sensor.name}" if sensor else None)
                 except Exception as e:
                     log(f"sweep correction ({method}) failed for {name}: {e}")
                     job.setdefault("warnings", []).append(f"sweep correction skipped: {str(e)[:120]}")
@@ -2950,21 +2961,28 @@ class RemoteWorker:
         # The worker's copy stays until finish(): pruning may still use it.
         return final
 
-    def sweep_correction(self, cfg, job, d, method, beat):
+    def sweep_correction(self, cfg, job, d, method, beat, raw=None):
         """Move each sweep of <d>/data's cameras onto the rest (see SWEEP_METHODS), in place:
         <d>/data/sparse/0/images.txt is replaced (the original kept as images_uncorrected.txt).
         From the cache when this capture (same poses) was corrected this way before. Returns a
         short report."""
         sp = f"{d}/data/sparse/0"
         cache_dir = Path(job["pose_cache"]) if job.get("pose_cache") else None
-        tag = f"{SWEEP_VERSION}-{method}{'-unrefined' if job.get('poses_unrefined') else ''}"
+        g = sub_config(cfg, "gsplat")
+        relocate = method == "time" and bool(g.get("relocate")) and bool(raw)
+        robust = float(g.get("smooth_robust") or 0) if method == "time" else 0
+        tag = (f"{SWEEP_VERSION}-{method}{'-unrefined' if job.get('poses_unrefined') else ''}"
+               + (f"-r{robust:g}" if robust else "") + ("-reloc" if relocate else ""))
         cached = (cache_dir / f"{tag}-images.txt", cache_dir / f"{tag}.json") if cache_dir else None
         label = {"match": "match search", "render": "render search", "time": "time correction"}[method]
         self.ps(f"Copy-Item -Force '{sp}/images.txt' '{sp}/images_uncorrected.txt'")
         if cached and cached[0].exists() and cached[1].exists():
             self.upload_file(cached[0], f"{sp}/images.txt")
             log(f"using cached sweep correction ({label}) for {job['name']}")
-            return dict(json.loads(cached[1].read_text()).get("summary") or {}, method=method, cached=True)
+            rep_ = json.loads(cached[1].read_text())
+            if rep_.get("relocation"):
+                job["relocation"] = rep_["relocation"]
+            return dict(rep_.get("summary") or {}, method=method, cached=True)
         cwd, py = self.gsplat["scripts"], self.gsplat["python"]
         t0 = time.time()
         match_cached = False
@@ -3054,11 +3072,25 @@ class RemoteWorker:
             beat(force=True)
             args = [f"{cwd}/time_correct.py", db, "--raw", "--poses", sp,
                     "--out", f"{d}/sweeps/sweeps.json", "--write-model", f"{d}/sweeps/model",
-                    "--pair-cap", 200]
+                    "--pair-cap", 200] + (["--smooth-robust", robust] if robust else [])
             code = self.run(py, args, cwd, d, "sweep_search", beat)
             if code:
                 raise RuntimeError(f"time correction exit {code} {self.failure(d, 'sweep_search')}")
             corrected, report = f"{d}/sweeps/model/images.txt", f"{d}/sweeps/sweeps.json"
+            if relocate:   # glitch photos, found by their LiDAR, re-placed against the trusted rest
+                job["phase"] = f"sweep correction on {self.label}: re-placing glitch photos"
+                beat(force=True)
+                for f in ("cameras.txt", "points3D.txt"):   # the model folder needs the cameras next to images.txt
+                    self.ps(f"if (-not (Test-Path '{d}/sweeps/model/{f}') -and (Test-Path '{sp}/{f}')) "
+                            f"{{ Copy-Item '{sp}/{f}' '{d}/sweeps/model/{f}' }}", check=False)
+                args = [f"{cwd}/relocate.py", "--model", f"{d}/sweeps/model", "--database", db, "--depth-dir", raw,
+                        "--out-model", f"{d}/sweeps/reloc", "--out", f"{d}/sweeps/relocate.json"]
+                code = self.run(py, args, cwd, d, "sweep_reloc", beat)
+                if code:   # not fatal: train on the time-corrected poses
+                    log(f"re-placing glitch photos failed for {job['name']} {self.failure(d, 'sweep_reloc')}")
+                    job.setdefault("warnings", []).append("glitch photo relocation skipped")
+                else:
+                    corrected = f"{d}/sweeps/reloc/images.txt"
         else:
             job["phase"] = f"sweep correction on {self.label}: render search (long)"
             expected = sweep_seconds(dict(job.get("settings") or {}, trainer="gsplat", sweep_correction="render"),
@@ -3083,9 +3115,14 @@ class RemoteWorker:
         self.download(corrected, tmp / "images.txt")
         self.download(report, tmp / "sweeps.json")
         rep_ = json.loads((tmp / "sweeps.json").read_text())
+        if corrected.endswith("/reloc/images.txt"):
+            self.download(f"{d}/sweeps/relocate.json", tmp / "relocate.json")
+            rep_["relocation"] = job["relocation"] = json.loads((tmp / "relocate.json").read_text())
         if method == "time":   # per photo, not per sweep
             ph = rep_.get("photos", {})
             summary = {"photos": len(ph), "seconds": round(time.time() - t0), "match_cached": match_cached, "pairs": n_pairs,
+                       "relocated": len((rep_.get("relocation") or {}).get("relocated") or []),
+                       "broken_links": len(rep_.get("broken_links") or []),
                        "max_shift_mm": round(max([math.hypot(*v["shift_mm"]) for v in ph.values()] or [0]), 2)}
         else:
             moved = [v for v in rep_.get("sweeps", {}).values() if not v.get("anchor")]

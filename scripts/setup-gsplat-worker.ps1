@@ -50,6 +50,8 @@ if (-not (Test-Path $py)) { Run @("venv", "--python", "3.10", $venv) }
 Run @("pip", "install", "--python", $py, $Torch, "--index-url", $TorchIndex)
 Run @("pip", "install", "--python", $py, $Gsplat, "--find-links", $GsplatIndex)
 Run @("pip", "install", "--python", $py, "pillow", "packaging", "setuptools")
+# pose tools (gs/relocate.py): pinned to versions that keep torch's numpy
+Run @("pip", "install", "--python", $py, "pycolmap==4.2.1", "scipy==1.15.3", "opencv-python-headless==5.0.0.93")
 New-Item -ItemType Directory -Force (Join-Path $Root "gsplat\gs") | Out-Null
 
 $colmapDir = Join-Path $Root "tools\colmap"

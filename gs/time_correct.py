@@ -313,6 +313,9 @@ def main(argv=None):
     p.add_argument("--smooth-share", type=float, default=0.05, help="... plus this share of how far the phone moved")
     p.add_argument("--smooth-deg", type=float, default=0.02, help="allowed turn change between photos, deg ...")
     p.add_argument("--smooth-turn-share", type=float, default=0.02, help="... plus this share of how far it turned")
+    p.add_argument("--smooth-robust", type=float, default=0.0,
+                   help="robust (Cauchy) smoothness, at this many allowed changes: a photo whose matches pull it far "
+                        "from its neighbours (an ARKit glitch) breaks free instead of dragging them along (0 = quadratic)")
     p.add_argument("--gap-seconds", type=float, default=5.0, help="no smoothness across a pause this long")
     p.add_argument("--prior-mm", type=float, default=20.0, help="weak pull of every correction toward zero")
     p.add_argument("--prior-deg", type=float, default=1.0)
@@ -504,8 +507,11 @@ def main(argv=None):
                     total += float(part)
             P = X * free
             loss = torch.zeros((), dtype=dtype, device=dev)
-            d = (P[1:] - P[:-1]) / sig_t
-            loss = loss + (d ** 2).sum(-1)[link_t].sum() + ((P / prior) ** 2).sum()
+            r2 = (((P[1:] - P[:-1]) / sig_t) ** 2).sum(-1)
+            if a.smooth_robust > 0:
+                k2 = a.smooth_robust ** 2
+                r2 = k2 * torch.log1p(r2 / k2)
+            loss = loss + r2[link_t].sum() + ((P / prior) ** 2).sum()
             if a.principal:
                 loss = loss + ((prob.pp / a.prior_principal) ** 2).sum()
             for m, target, _, per in groups:
@@ -642,6 +648,11 @@ def main(argv=None):
               + (f" focal {Pn[i, 6]:+6.2f} pm" if a.focal else "")
               + (f" {np.linalg.norm(disp):6.1f} {str(disp.round(1))}" if disp is not None else "")
               + ("  anchor" if sid[i] == anchor else "  needs render search" if flag else ""))
+    if a.smooth_robust > 0:   # links the robust smoothness let go: the photo moved well apart from its neighbour
+        r = np.sqrt((((Pn[1:] - Pn[:-1]) / sig) ** 2).sum(-1))
+        broke = np.flatnonzero(linked & (r > 2 * a.smooth_robust))
+        report["broken_links"] = [[Path(names[i]).stem, Path(names[i + 1]).stem, round(float(r[i]), 1)] for i in broke]
+        print(f"{len(broke)} smoothness links let go (> {2 * a.smooth_robust:g} allowed changes)", flush=True)
     report["seconds"] = round(time.time() - t_start, 1)
     report["needs_render"] = [Path(n).stem for n, v in zip(names, report["photos"].values()) if v["needs_render"]]
     Path(a.out).write_text(json.dumps(report, indent=1))

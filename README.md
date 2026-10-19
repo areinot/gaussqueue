@@ -28,7 +28,8 @@ Each step, and what it's built on (*ours* = code in this repo):
    `frame_check.json`. *Ours* (`gs/frame_check.py`), numpy + Pillow.
 4. **Pose fixing** (optional, CUDA worker): COLMAP database, ALIKED + LightGlue (ONNX Runtime).
    *Ours*: gravity-upright matching (`upright_match.py`), overlap pair picking (`overlap_pairs.py`),
-   smooth per-photo time correction (`time_correct.py`); older options `match_sweeps.py`,
+   smooth per-photo time correction (`time_correct.py`), then glitch photos found by their LiDAR
+   re-placed against the rest (`relocate.py`, pycolmap) and logged in `relocate.json`; older options `match_sweeps.py`,
    `sweep_search.py`, and COLMAP SIFT + bundle adjustment (`refine.py`).
 5. **LiDAR depth scale**: one factor per capture from triangulated matches vs LiDAR. *Ours*
    (`lidar_scale.py`), numpy + SQLite.
