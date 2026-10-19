@@ -18,6 +18,33 @@ captures, which ship with camera poses as a COLMAP model, so there is no
 structure-from-motion step. Any capture that contains a COLMAP model
 (`sparse/0/cameras.{txt,bin}` next to an `images/` folder) should work.
 
+## Pipeline
+
+Each step, and what it's built on (*ours* = code in this repo):
+
+1. **Capture**: SplatKing (ARKit poses, LiDAR depth and confidence per photo).
+2. **Queue and unpack**: `gaussqueue.py` (Python standard library only; launchd).
+3. **Frame check**: drops blank and glitch frames, and drops or shrinks blurred ones, logged in
+   `frame_check.json`. *Ours* (`gs/frame_check.py`), numpy + Pillow.
+4. **Pose fixing** (optional, CUDA worker): COLMAP database, ALIKED + LightGlue (ONNX Runtime).
+   *Ours*: gravity-upright matching (`upright_match.py`), overlap pair picking (`overlap_pairs.py`),
+   smooth per-photo time correction (`time_correct.py`); older options `match_sweeps.py`,
+   `sweep_search.py`, and COLMAP SIFT + bundle adjustment (`refine.py`).
+5. **LiDAR depth scale**: one factor per capture from triangulated matches vs LiDAR. *Ours*
+   (`lidar_scale.py`), numpy + SQLite.
+6. **LiDAR fusion / space map** (optional): *ours* (`fuse.py`, `undistort_depth.py`), PyTorch.
+7. **Training**: [gsplat](https://github.com/nerfstudio-project/gsplat) (CUDA) or
+   [metalsplat](https://github.com/tchauffi/metalsplat) (Apple GPU) under PyTorch; Brush as the
+   fallback trainer. *Ours*: the training loop (`train.py`): LiDAR depth loss, per-photo
+   resolution, pose/sweep correction, shape losses, carving, auto bounds, invisible-splat removal,
+   a hybrid MCMC strategy (`hybrid.py`) and the Metal port (`mps_backend.py`, `mps_ssim.py`).
+8. **Pruning** (optional): LightGaussian-style scoring + fine-tune. *Ours* (`prune.py`).
+9. **Orient and compress**: [Niantic's spz](https://github.com/nianticlabs/spz) (zlib, zstd) via
+   *our* `gq_spz` (flip, start view, yaw, quick prune); SplatTransform as the fallback.
+10. **Outbox**: `.ply`, `.spz`, preview, `meta.json`, `frame_check.json`; optional external viewer
+    (e.g. a Vulkan viewer: vulkan-loader → MoltenVK → Metal on macOS).
+11. **Edit and share** (by hand): [SuperSplat](https://superspl.at/editor) → *Export → HTML viewer*.
+
 ## Features
 
 - **Inbox → work → outbox.** Captures can be zips or folders. Each item has to stay unchanged

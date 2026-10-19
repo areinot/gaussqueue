@@ -71,6 +71,7 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .exp-row { align-items: start; }
 .exp-bar { height: 6px; background: var(--track); border-radius: 3px; overflow: hidden; }
 .exp-bar > span { display: block; height: 100%; background: var(--accent); }
+.exp-bar.est > span { opacity: .55; }
 .exp-row.s-done .exp-bar > span { background: var(--ok); } .exp-row.s-failed { color: var(--bad); }
 .exp-row.s-queued, .exp-row.s-waiting { color: var(--muted); }
 .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 99px;
@@ -166,6 +167,8 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .b-paused { color: var(--warn); }
 .now .settings { border: 1px solid var(--line); border-radius: 10px; }
 .now.paused .bar > div { background: var(--warn); }
+.bar.est > div { opacity: .55; }
+.prog { font-size: 12.5px; color: var(--muted); margin: 6px 0 4px; font-variant-numeric: tabular-nums; }
 .history .when { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
 .dls { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .dl { font-size: 12px; padding: 3px 9px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel);
@@ -257,6 +260,20 @@ const img = (name, alt) => name ? `<img src="/img/${encodeURIComponent(name)}" a
 const dur = (s) => { s = Math.max(0, Math.round(s)); const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
   return h ? `${h}h ${String(m).padStart(2,"0")}m` : m ? `${m}m` : `${s}s`; };
 const clock = (t) => new Date(t*1000).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+
+// Progress of a step that isn't training (gaussqueue.py set_progress, tools/track.py):
+// done of total in some unit, or only an expected duration, filled by elapsed time (drawn
+// fainter: it is an estimate). Both are redrawn every second by tick().
+const progFrac = (p, now) => !p ? 0 : p.total && p.done != null ? Math.min(1, p.done / p.total)
+  : p.expected && p.started ? Math.min(0.97, (now - p.started) / p.expected) : 0;
+function progText(p, now) {
+  if (!p) return "";
+  const n = (x) => x.toLocaleString();
+  const count = p.total && p.done != null ? `${n(p.done)} / ${n(p.total)}${p.unit ? " " + p.unit : ""} (${Math.floor(100 * progFrac(p, now))}%)` : "";
+  const end = p.eta ? (p.eta > now ? `${p.expected ? "est. " : ""}ends ~${clock(p.eta)} (${dur(p.eta - now)})`
+                                   : p.expected ? `longer than estimated (${dur(now - p.started)} so far)` : "") : "";
+  return [p.label, count, end].filter(Boolean).join(" · ");
+}
 const size = (b) => b > 1e9 ? (b/1e9).toFixed(1)+" GB" : (b/1e6).toFixed(0)+" MB";
 const kindText = (k, f) => [k && k !== "unknown" ? k : null, f ? `${f} frames` : null].filter(Boolean).join(" · ");
 
@@ -331,21 +348,25 @@ function renderJobs(jobs) {
 function experimentsPanel(e) {
   if (!e || !(e.variants || []).length) return "";
   const w = (last.workers || []).find(x => x.name === e.worker);
-  const row = (v) => {
+  const row = (v, i) => {
     const res = [v.psnr != null ? `PSNR ${v.psnr.toFixed(2)}` : "", v.depth_err != null ? `depth ${(100 * v.depth_err).toFixed(1)}%` : "",
                  v.splats != null ? `${kfmt(v.splats)} splats` : "", v.seconds != null ? dur(v.seconds) : ""].filter(Boolean).join(" · ");
-    const st = v.state === "done" ? `✓ ${res}`
+    const counted = v.done != null || v.expected;   // a tracked step (tools/track.py) rather than a training
+    const st = v.state === "done" ? `✓ ${res || (v.seconds == null && v.finished && v.started ? dur(v.finished - v.started) : "")}`
+      : v.state === "running" && counted ? progText(v, Date.now() / 1000)
       : v.state === "running" ? `${v.step != null ? `step ${v.step.toLocaleString()} / ${(v.total || 0).toLocaleString()}` : "starting"}${v.eta ? ` · ends ${clock(v.eta)}` : ""}`
       : v.state === "failed" ? `failed${v.error ? ": " + esc(v.error) : ""}`
       : v.state === "waiting" ? `waiting: ${esc(v.waiting || "")}` : "queued";
-    const pct = v.state === "done" ? 100 : v.step && v.total ? Math.min(100, 100 * v.step / v.total) : 0;
-    return `<div class="exp-row s-${esc(v.state)}"><span class="exp-name" title="${esc((v.args || []).join(" "))}">${esc(v.name)}${v.desc ? `<span class="exp-desc">${esc(v.desc)}</span>` : ""}</span>
-      <span class="exp-bar"><span style="width:${pct.toFixed(1)}%"></span></span><span class="exp-state">${st}${dlButtons(v.result, v.downloads)}</span></div>`;
+    const pct = v.state === "done" ? 100 : counted ? 100 * progFrac(v, Date.now() / 1000)
+      : v.step && v.total ? Math.min(100, 100 * v.step / v.total) : 0;
+    return `<div class="exp-row s-${esc(v.state)}" data-exp="${esc(e.id || e.name || "")}" data-row="${i}"><span class="exp-name" title="${esc((v.args || []).join(" "))}">${esc(v.name)}${v.desc ? `<span class="exp-desc">${esc(v.desc)}</span>` : ""}</span>
+      <span class="exp-bar${counted && !v.total ? " est" : ""}"><span style="width:${pct.toFixed(1)}%"></span></span><span class="exp-state">${st}${dlButtons(v.result, v.downloads)}</span></div>`;
   };
-  const state = e.live ? (e.eta ? `done ~${clock(e.eta)}` : "running") : e.finished ? `finished ${clock(e.finished)}` : "stopped";
+  const state = e.failed ? `failed ${clock(e.finished || e.updated)}` : e.live ? (e.eta ? `done ~${clock(e.eta)}` : "running")
+    : e.finished ? `finished ${clock(e.finished)}` : "stopped";
   return `<div class="panel exp"><div class="info">
-    <div class="name">🧪 ${esc(e.name || "Experiments")}${w ? `<span class="onbadge">on ${esc(w.label)}</span>` : ""}</div>
-    <div class="phase">${esc(state)}${e.live ? " · new captures wait for this machine" : ""}</div>
+    <div class="name">${e.tracked ? "⏳" : "🧪"} ${esc(e.name || "Experiments")}${w ? `<span class="onbadge">on ${esc(w.label)}</span>` : ""}</div>
+    <div class="phase">${esc(state)}${e.live && e.hold !== false ? " · new captures wait for this machine" : ""}</div>
     ${e.note ? `<div class="meta">${esc(e.note)}</div>` : ""}
     <div class="exp-rows">${e.variants.map(row).join("")}</div></div></div>`;
 }
@@ -353,7 +374,8 @@ function experimentsPanel(e) {
 function jobPanel(c) {
   const previews = c.previews || [];
   const hero = heroName(c);
-  const pct = c.step != null && c.total ? Math.min(100, 100*c.step/c.total) : 0;
+  const prog = c.progress;
+  const pct = prog ? 100 * progFrac(prog, Date.now() / 1000) : c.step != null && c.total ? Math.min(100, 100*c.step/c.total) : 0;
   const stepLabel = (n) => { const m = n.match(/_step(\d+)\.jpg$/); return m ? `${(+m[1]/1000).toFixed(1)}k` : ""; };
   const pend = c.pending_settings, run = c.settings;
   const changed = c.paused && pend && run && ["total_steps", "max_resolution", "sh_degree", "max_splats", "subsample_frames", "refine_poses",
@@ -392,7 +414,8 @@ function jobPanel(c) {
       ${c.settings ? `<div class="quality">${qualityText(c.settings)}</div>` : ""}
       ${captureQuality(c.quality)}
       ${controls}
-      <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
+      ${prog ? `<div class="prog" data-t="prog"></div>` : ""}
+      <div class="bar${prog && !prog.total ? " est" : ""}" data-t="pbar"><div style="width:${pct.toFixed(1)}%"></div></div>
       <div class="stats">
         <div class="stat"><div class="k">Step</div><div class="v">${c.step != null ? `${c.step.toLocaleString()} / ${(c.total||0).toLocaleString()}` : "—"}</div></div>
         <div class="stat"><div class="k">Elapsed</div><div class="v" data-t="elapsed">—</div></div>
@@ -535,13 +558,30 @@ function etaLine(it) {
   return parts.length ? `<div class="quality"><b>Est. time</b> ${parts.join(" · ")}</div>` : "";
 }
 
-// Download buttons for a result's files (<name>.ply, .v3.spz, .v4.spz), saved by the browser.
+// Download buttons for a result's files (<name>.ply, .v3.spz, .v4.spz), saved by the browser; with a
+// viewer set up on the Mac, a "View" button per file opens it there.
 function dlButtons(name, downloads) {
   if (!name || !(downloads || []).length) return "";
+  const view = d => last && last.viewer && /\.(ply|spz)$/.test(d.file)
+    ? `<button class="dl view" data-view-name="${esc(name)}" data-view-file="${esc(d.file)}"
+         title="Open ${esc(d.file)} in the splat viewer on this Mac">View ${esc(d.file.slice(name.length))}</button>` : "";
   return `<div class="dls">${downloads.map(d =>
     `<a class="dl" href="/download/${encodeURIComponent(name)}/${encodeURIComponent(d.file)}" download="${esc(d.file)}"
-       title="Save ${esc(d.file)} (${size(d.size)})">${esc(d.file.slice(name.length))} <span>${size(d.size)}</span></a>`).join("")}</div>`;
+       title="Save ${esc(d.file)} (${size(d.size)})">${esc(d.file.slice(name.length))} <span>${size(d.size)}</span></a>${view(d)}`).join("")}</div>`;
 }
+
+document.addEventListener("click", async e => {
+  const b = e.target.closest("[data-view-file]");
+  if (!b) return;
+  b.disabled = true;
+  try {
+    const r = await fetch("/api/view", {method: "POST", headers: {"Content-Type": "application/json"},
+                                        body: JSON.stringify({name: b.dataset.viewName, file: b.dataset.viewFile})});
+    const j = await r.json().catch(() => ({}));
+    b.textContent = r.ok ? "Opening…" : (j.error || `error ${r.status}`);
+  } catch (err) { b.textContent = "service not reachable"; }
+  setTimeout(() => { b.disabled = false; b.textContent = `View ${b.dataset.viewFile.slice(b.dataset.viewName.length)}`; }, 3000);
+});
 
 function selectHTML(key, value, opts) {
   const list = opts.map(o => Array.isArray(o) ? o : [o, key === "max_splats" ? kfmt(o) : String(o)]);
@@ -974,6 +1014,16 @@ function tick() {
     set(sel("elapsed"), c.started ? dur(t - c.started) : "—");
     set(sel("eta"), c.paused ? "paused" : c.eta ? `${clock(c.eta)} (${dur(c.eta - now)})` : "—");
     set(sel("done"), c.paused ? "paused" : c.done_eta ? `~${clock(c.done_eta)} (${dur(Math.max(0, c.done_eta - now))})` : "—");
+    if (c.progress) {
+      set(sel("prog"), progText(c.progress, now));
+      document.querySelectorAll(sel("pbar") + " > div").forEach(e => e.style.width = `${(100 * progFrac(c.progress, now)).toFixed(1)}%`);
+    }
+  }
+  for (const e of [].concat(last.experiments || [])) for (const [i, v] of (e.variants || []).entries()) {
+    if (v.state !== "running" || !(v.done != null || v.expected)) continue;
+    const sel = `[data-exp="${CSS.escape(e.id || e.name || "")}"][data-row="${i}"]`;
+    set(sel + " .exp-state", progText(v, now));
+    document.querySelectorAll(sel + " .exp-bar > span").forEach(b => b.style.width = `${(100 * progFrac(v, now)).toFixed(1)}%`);
   }
   document.querySelectorAll("[data-since]").forEach(e => {
     const t = dur(now - +e.dataset.since);

@@ -162,14 +162,18 @@ class Views:
     plus LiDAR depth/confidence when a SplatKing sensor_data folder is given, and the
     per-photo masks of a box dataset (box.py: 255 train colour, 128 must be empty, 0 ignore)."""
 
-    def __init__(self, root, images, max_res, device="cuda", depth_dir=None, weight_dir=None):
+    def __init__(self, root, images, max_res, device="cuda", depth_dir=None, weight_dir=None, photo_scales=None):
+        """photo_scales: {photo name: factor <= 1}, an extra shrink for photos trained below the
+        others' resolution (e.g. a blurred photo kept at the size where its blur is a normal edge)."""
         root = Path(root)
+        photo_scales = photo_scales or {}
         self.names, self.rgb, self.K, self.viewmats, self.depth, self.conf = [], [], [], [], [], []
         self.masks, self.weights = [], []
         for im in images:
             img = Image.open(root / "images" / im["name"]).convert("RGB")
             cam = im["cam"]
             s = min(1.0, max_res / max(img.size)) if max_res else 1.0
+            s *= min(1.0, float(photo_scales.get(im["name"], 1.0)))
             if s < 1.0:
                 img = img.resize((round(img.width * s), round(img.height * s)), Image.LANCZOS)
             sx, sy = img.width / cam["w"], img.height / cam["h"]

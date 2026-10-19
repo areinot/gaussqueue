@@ -30,12 +30,14 @@ _K_CACHE = {}
 
 def _intrinsics(K):
     """fx, fy, cx, cy as floats, read back from the GPU once per camera (each read would make
-    the CPU wait for the GPU, every step)."""
+    the CPU wait for the GPU, every step). Keyed by the tensor's address; the entry holds the
+    tensor so the address can't be reused by a new camera, and its version catches edits."""
     key = (K.data_ptr(), K.storage_offset())
-    if key not in _K_CACHE:
+    hit = _K_CACHE.get(key)
+    if hit is None or hit[1] != K._version:
         k = K.detach().cpu()
-        _K_CACHE[key] = (float(k[0, 0]), float(k[1, 1]), float(k[0, 2]), float(k[1, 2]))
-    return _K_CACHE[key]
+        hit = _K_CACHE[key] = (K, K._version, (float(k[0, 0]), float(k[1, 1]), float(k[0, 2]), float(k[1, 2])))
+    return hit[2]
 
 
 def available():

@@ -60,6 +60,9 @@ def parse(argv=None):
     p.add_argument("--eval-depth-dir", help="depth maps for scoring held-out photos (default: --depth-dir)")
     p.add_argument("--depth-weight", type=float, default=0.0)
     p.add_argument("--depth-conf", type=int, default=2)
+    p.add_argument("--depth-scale", type=float, default=1.0,
+                   help="multiply LiDAR depth by this (training and evaluation): iPhone LiDAR can read a few %% long "
+                        "against the photos' scale")
     p.add_argument("--depth-align-after", type=float, default=0.0,
                    help="from this fraction of training on, align each photo's LiDAR depth to the "
                         "rendered surface (per-photo scale + offset) before comparing: LiDAR keeps "
@@ -81,6 +84,17 @@ def parse(argv=None):
                    help="make splats outside the scanned region thin along the line to its centre (billboards)")
     p.add_argument("--antialiased", action="store_true")
     p.add_argument("--box", help="box.json from box.py: keep splats inside the box")
+    p.add_argument("--bounds", default="auto",
+                   help="where splats may live: auto (a level box around the cameras and their LiDAR points, "
+                        "padded by --bounds-pad), off, or a box.json; splats outside are moved back in (MCMC) "
+                        "and dropped from the result")
+    p.add_argument("--bounds-pad", type=float, default=1.0,
+                   help="auto bounds: metres added on every side, and at least a quarter of the box's size")
+    p.add_argument("--relocate-until", type=float, default=0.97,
+                   help="MCMC: keep moving invisible splats to where they are needed until this fraction of "
+                        "training (adding new ones still stops at the refine stop)")
+    p.add_argument("--keep-invisible", action="store_true",
+                   help="keep splats too faint to show (opacity under 1/255) in the result")
     p.add_argument("--empty-weight", type=float, default=0.1,
                    help="masked datasets: weight of rendered opacity where the box must be empty")
     p.add_argument("--sh-ramp", type=int, default=1000,
@@ -147,6 +161,8 @@ def parse(argv=None):
                                            "so runs on different datasets are scored on the same views")
     p.add_argument("--subsample", type=int, default=1, help="train on every Nth photo")
     p.add_argument("--exclude-names", help="file listing photos not to train on (one name per line)")
+    p.add_argument("--photo-scales", help="json {photo: factor <= 1}: train those photos at a lower resolution "
+                                          "(frame checks: a blurred photo kept at the size where its blur is a normal edge)")
     p.add_argument("--pixel-weights", help="folder of per-photo weight maps (coverage.py): pixels that "
                                            "close-ups cover better count less")
     p.add_argument("--pixel-weights-absolute", action="store_true",
@@ -296,13 +312,53 @@ def far_flat_loss(params, space):
 
 class Box:
     def __init__(self, path, dev):
-        b = json.loads(Path(path).read_text())
+        b = path if isinstance(path, dict) else json.loads(Path(path).read_text())
         self.center = torch.tensor(b["center"], dtype=torch.float32, device=dev)
         self.axes = torch.tensor(b["axes"], dtype=torch.float32, device=dev)
         self.half = torch.tensor(b["half"], dtype=torch.float32, device=dev)
 
     def inside(self, P, pad=0.02):
         return (((P - self.center) @ self.axes).abs() <= self.half * (1 + pad)).all(-1)
+
+
+def auto_bounds(images, depth_dir, depth_scale=1.0, pad=1.0, conf=2, max_depth=6.0, every=3, dev="cpu"):
+    """A level box (world +y up, as ARKit) around the camera centres and their high-confidence
+    LiDAR points, turned about +y to the points' main horizontal axes; per axis it spans the
+    0.5-99.5th percentile of the points (a few LiDAR strays don't stretch it) and all the cameras,
+    then grows by max(pad, a quarter of its size) on every side. None without any points."""
+    pts, cams = [], []
+    for k, im in enumerate(images):
+        c2w = np.linalg.inv(im["viewmat"])
+        cams.append(c2w[:3, 3])
+        if not depth_dir or k % every:
+            continue
+        d, c = gsdata.read_depth(depth_dir, im["name"])
+        if d is None:
+            continue
+        d, c = d.numpy() * depth_scale, c.numpy()
+        h, w = d.shape
+        cam = im["cam"]
+        v, u = np.mgrid[0:h:2, 0:w:2]
+        z = d[v, u]
+        ok = (c[v, u] >= conf) & (z > 0.05) & (z < max_depth)
+        z, u, v = z[ok], (u[ok] + 0.5) * cam["w"] / w, (v[ok] + 0.5) * cam["h"] / h
+        X = np.stack([(u - cam["cx"]) / cam["fx"] * z, (v - cam["cy"]) / cam["fy"] * z, z], 1)
+        pts.append(X @ c2w[:3, :3].T + c2w[:3, 3])
+    cams = np.array(cams)
+    if not pts:
+        return None
+    P = np.concatenate(pts)
+    xz = P[:, [0, 2]] - np.median(P[:, [0, 2]], 0)
+    ev, vec = np.linalg.eigh(xz.T @ xz)
+    a1 = np.array([vec[0, 1], 0, vec[1, 1]])   # main horizontal axis
+    axes = np.stack([a1, [0, 1, 0], np.cross(a1, [0, 1, 0])], 1)   # columns: box axes in world
+    pl, cl = P @ axes, cams @ axes
+    lo = np.minimum(np.percentile(pl, 0.5, 0), cl.min(0))
+    hi = np.maximum(np.percentile(pl, 99.5, 0), cl.max(0))
+    grow = np.maximum(pad, 0.25 * (hi - lo))
+    lo, hi = lo - grow, hi + grow
+    return {"center": ((lo + hi) / 2 @ axes.T).tolist(), "axes": axes.tolist(),
+            "half": ((hi - lo) / 2).tolist(), "lidar_points": int(len(P)), "cameras": int(len(cams))}
 
 
 @torch.no_grad()
@@ -672,13 +728,28 @@ def train(a, splats=None, log=print):
     if a.exclude_names:
         skip = {l.strip() for l in Path(a.exclude_names).read_text().splitlines() if l.strip()}
         tr_ims = [im for im in tr_ims if im["name"] not in skip]
+    photo_scales = json.loads(Path(a.photo_scales).read_text()) if a.photo_scales and Path(a.photo_scales).exists() else {}
     tv = gsdata.Views(root, tr_ims, a.max_res, dev, a.depth_dir if a.depth_weight > 0 else None,
-                      a.pixel_weights)
+                      a.pixel_weights, photo_scales)
+    if photo_scales:
+        log(f"{sum(1 for im in tr_ims if im['name'] in photo_scales)} photos trained at a lower resolution (--photo-scales)")
     pw_scale = 1.0
     if a.pixel_weights and a.pixel_weights_absolute:
         sf = Path(a.pixel_weights) / "summary.json"
         pw_scale = float(json.loads(sf.read_text()).get("scale", 1.0)) if sf.exists() else 1.0
     ev = gsdata.Views(root, te_ims, a.max_res, dev, a.eval_depth_dir or a.depth_dir)
+    if a.depth_scale != 1.0:
+        for views in (tv, ev):
+            views.depth = [None if d is None else d * a.depth_scale for d in views.depth]
+    bounds = None
+    if a.bounds == "auto" and not a.sky_points and not a.box:
+        bounds = auto_bounds(images, a.depth_dir, a.depth_scale, a.bounds_pad)
+        if bounds:
+            (out / "bounds.json").write_text(json.dumps(bounds, indent=1))
+            log("bounds: level box {:.1f} x {:.1f} x {:.1f} m around {} cameras and {:,} LiDAR points".format(
+                *(2 * h for h in bounds["half"]), bounds["cameras"], bounds["lidar_points"]))
+    elif a.bounds not in ("auto", "off"):
+        bounds = json.loads(Path(a.bounds).read_text())
     centers = tv.centers()
     scene_scale = float((centers - centers.mean(0)).norm(dim=1).max()) * 1.1 or 1.0
     log(f"{len(tv)} training views, {len(ev)} held out, scene scale {scene_scale:.2f}, "
@@ -755,7 +826,7 @@ def train(a, splats=None, log=print):
 
     packed = a.mode == "3dgs"
     space = Space(a.space, dev) if a.space else None
-    box = Box(a.box, dev) if a.box else None
+    box = Box(a.box, dev) if a.box else Box(bounds, dev) if bounds else None
     boxed = 0
     carved = [0, 0]
     eval_view = ev if len(ev) else tv
@@ -840,6 +911,9 @@ def train(a, splats=None, log=print):
             log(f"step {step}: splat jitter stopped")
         if mcmc:
             strategy.step_post_backward(params, opts, state, step, meta, lr=means_lr(step))
+            if (strategy.refine_stop_iter <= step < a.relocate_until * a.steps
+                    and step % strategy.refine_every == 0):   # growth has stopped; keep reusing dead splats
+                strategy._relocate_gs(params, opts, state["binoms"].to(params["means"].device))
         elif strategy:
             strategy.step_post_backward(params, opts, state, step, meta, packed=packed)
             if len(params["means"]) > a.max_splats and strategy.refine_stop_iter > step:
@@ -893,10 +967,20 @@ def train(a, splats=None, log=print):
                     if vw is extra or Path(nm).stem in a.track_views or nm in a.track_views:
                         img, *_ = render(params, vw, i, sh_degree, a.mode, a.antialiased)
                         gsdata.save_png(out / "track" / f"{Path(nm).stem}_{a.steps:06d}.png", img.clamp(0, 1))
-    if box is not None:   # drop what ended up outside the box
-        with torch.no_grad():
-            inside = box.inside(params["means"])
-            params = make_params({k: v[inside] for k, v in params.items()}, dev)
+    dropped = {"outside": 0, "invisible": 0}
+    with torch.no_grad():   # drop what ended up outside the box, and splats too faint to show
+        keep = torch.ones(len(params["means"]), dtype=torch.bool, device=dev)
+        if box is not None:
+            keep = box.inside(params["means"])
+            dropped["outside"] = int((~keep).sum())
+        if not a.keep_invisible:
+            vis = torch.sigmoid(params["opacities"]) >= 1 / 255
+            dropped["invisible"] = int((keep & ~vis).sum())
+            keep &= vis
+        if not keep.all():
+            params = make_params({k: v[keep] for k, v in params.items()}, dev)
+            log(f"dropped {dropped['outside']:,} splats outside the bounds and {dropped['invisible']:,} invisible ones; "
+                f"{len(params['means']):,} left")
     gsdata.save_ply(out / f"export_{a.steps}.ply", dict(params))
     pose_report = None
     if pose is not None:   # how far each training photo's camera moved
@@ -927,7 +1011,8 @@ def train(a, splats=None, log=print):
                "sweep_corrections": sweep_report,
                "peak_gpu_gb": round((torch.cuda.max_memory_allocated() if DEVICE == "cuda"
                                      else torch.mps.driver_allocated_memory()) / 1e9, 2),
-               "carved": {"removed": carved[0], "shortened": carved[1]}, "left_box": boxed,
+               "carved": {"removed": carved[0], "shortened": carved[1]}, "left_box": boxed, "dropped": dropped,
+               "bounds": bounds,
                "shapes": shape_stats(params),
                "views_train": len(tv), "views_test": len(ev), "settings": vars(a)}
     if len(ev):

@@ -11,6 +11,7 @@ import types
 import os
 import socket
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -61,10 +62,10 @@ class DashboardAPITest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def post(self, body, origin=None, ctype="application/json"):
+    def post(self, body, origin=None, ctype="application/json", path="/api/item"):
         origin = origin or f"http://127.0.0.1:{self.port}"
         req = urllib.request.Request(
-            f"http://127.0.0.1:{self.port}/api/item", data=json.dumps(body).encode(),
+            f"http://127.0.0.1:{self.port}{path}", data=json.dumps(body).encode(),
             headers={"Content-Type": ctype, "Origin": origin}, method="POST")
         try:
             with urllib.request.urlopen(req) as r:
@@ -102,6 +103,61 @@ class DashboardAPITest(unittest.TestCase):
         self.assertEqual(self.post({"name": "capA", "action": "set", "key": "brush",
                                     "value": "/bin/sh"})[0], 400)
         self.assertEqual(self.post({"name": "nope", "action": "hold"})[0], 400)
+
+    def test_view_opens_only_offered_result_files(self):
+        gq = self.gq
+        root = Path(self.tmp.name)
+        out = root / "outbox" / "res1"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "res1.ply").write_bytes(b"ply")
+        (out / "notes.txt").write_text("x")
+        seen = root / "viewer_args.txt"
+        exe = root / "fake_viewer.sh"
+        exe.write_text(f'#!/bin/sh\necho "$@" > "{seen}"\n')
+        exe.chmod(0o755)
+        layers = root / "layers"
+        layers.mkdir(exist_ok=True)
+        (layers / "res1-lidar.ply").write_bytes(b"ply")
+        (layers / "res1-lines.txt").write_text("")
+        (layers / "other-lidar.ply").write_bytes(b"ply")
+        cfg = json.loads(gq.CONFIG_PATH.read_text())
+        gq.CONFIG_PATH.write_text(json.dumps({**cfg, "viewer": str(exe), "viewer_layers_dir": str(layers)}))
+        try:
+            self.assertEqual(self.post({"name": "res1", "file": "notes.txt"}, path="/api/view")[0], 400)
+            self.assertEqual(self.post({"name": "../res1", "file": "res1.ply"}, path="/api/view")[0], 400)
+            self.assertEqual(self.post({"name": "res1", "file": "res1.ply"}, path="/api/view",
+                                       origin="http://evil.example")[0], 403)
+            self.assertEqual(self.post({"name": "res1", "file": "res1.ply"}, path="/api/view")[0], 200)
+            for _ in range(50):
+                if seen.exists():
+                    break
+                time.sleep(0.05)
+            self.assertEqual(seen.read_text().split(), [str(out / "res1.ply"), "--up", "-y",
+                             "--points", f"res1-lidar={layers / 'res1-lidar.ply'}",
+                             "--lines", f"res1-lines={layers / 'res1-lines.txt'}"])
+            self.assertEqual(gq.viewer_layers({"viewer_layers_dir": str(layers)}, "exp-res1-batch-variant")[:2],
+                             ["--points", f"res1-lidar={layers / 'res1-lidar.ply'}"])
+        finally:
+            gq.CONFIG_PATH.write_text(json.dumps(cfg))
+
+    def test_blank_frames_are_dropped(self):
+        import struct
+        gq, root = self.gq, Path(self.tmp.name) / "blankcap"
+        (root / "images").mkdir(parents=True); (root / "sparse" / "0").mkdir(parents=True)
+        def bmp(path, px):   # 64x48 24-bit BMP from a pixel function
+            w, h = 64, 48; row = (w * 3 + 3) & ~3
+            data = b"".join(bytes(sum(([px(x, y)] * 3 for x in range(w)), [])) + b"\0" * (row - w * 3) for y in range(h))
+            path.write_bytes(b"BM" + struct.pack("<IHHI", 54 + len(data), 0, 0, 54)
+                             + struct.pack("<IiiHHIIiiII", 40, w, h, 1, 24, 0, len(data), 2835, 2835, 0, 0) + data)
+        bmp(root / "images" / "blank.bmp", lambda x, y: 200)
+        bmp(root / "images" / "busy.bmp", lambda x, y: 40 if (x // 4 + y // 4) % 2 else 220)
+        (root / "sparse" / "0" / "images.txt").write_text(
+            "# header\n1 1 0 0 0 0 0 0 1 blank.bmp\n\n2 1 0 0 0 0 0 0 1 busy.bmp\n\n")
+        dropped = gq.drop_blank_frames(root)
+        self.assertEqual([(d[0], d[1]) for d in dropped], [("blank.bmp", "blank")])
+        self.assertTrue((root / "dropped_frames" / "blank.bmp").exists())
+        self.assertNotIn("blank.bmp", (root / "sparse" / "0" / "images.txt").read_text())
+        self.assertIn("busy.bmp", (root / "sparse" / "0" / "images.txt").read_text())
 
     def test_cross_site_requests_are_refused(self):
         self.assertEqual(self.post({"name": "capA", "action": "hold"},
@@ -267,7 +323,8 @@ class DashboardAPITest(unittest.TestCase):
         st = {"sweep_correction": "time", "trainer": "gsplat"}
         fresh = gq.sweep_seconds(st, 800, "capM", [])
         kept = gq.sweep_seconds(st, 800, "capM", gq.list_caches())   # (the cache's name is "capM")
-        self.assertGreater(fresh, 3600)
+        self.assertGreater(fresh, kept)
+        self.assertLess(fresh, 1800)   # overlapping pairs only: grows with the photo count, not its square
         self.assertLess(kept, 900)
         # a run that reused matches says nothing about how long matching takes
         slow = {"name": "x", "photos": 800, "match_db": None,
@@ -310,8 +367,10 @@ class DashboardAPITest(unittest.TestCase):
         kept = f"D:/gq/match_cache/capR-1/{gq.MATCH_DB_VERSION}.db"
 
         first = w.sweep_correction(self.cfg, job, "D:/gq/jobs/capR", "time", beat)
-        self.assertEqual([c[0] for c in calls], ["upright_match.py", "time_correct.py"])
-        self.assertEqual(calls[1][1][1], kept)   # the correction reads the kept copy
+        self.assertEqual([c[0] for c in calls], ["overlap_pairs.py", "upright_match.py", "time_correct.py"])
+        up = calls[1][1]
+        self.assertEqual(up[up.index("--pairs") + 1], "D:/gq/jobs/capR/sweeps/pairs.txt")   # only those pairs
+        self.assertEqual(calls[2][1][1], kept)   # the correction reads the kept copy
         self.assertFalse(first["match_cached"])
         marker = json.loads((cache / f"{gq.MATCH_DB_VERSION}-matches.json").read_text())
         self.assertEqual((marker["worker"], marker["size"], marker["path"]), ("pc", 4321, kept))
@@ -329,7 +388,19 @@ class DashboardAPITest(unittest.TestCase):
             f.unlink()
         calls.clear()
         w.sweep_correction(self.cfg, job, "D:/gq/jobs/capR", "time", beat)
-        self.assertEqual([c[0] for c in calls], ["upright_match.py", "time_correct.py"])
+        self.assertEqual([c[0] for c in calls], ["overlap_pairs.py", "upright_match.py", "time_correct.py"])
+
+        # no scene points to work out the overlap from: every pair is matched
+        for f in cache.glob(f"{gq.SWEEP_VERSION}-*"):
+            f.unlink()
+        remote["size"] = 1
+        calls.clear()
+        fail_pairs = lambda exe, args, *r, **k: (calls.append((Path(str(args[0])).name, [str(x) for x in args])),
+                                                  1 if "overlap_pairs" in str(args[0]) else 0)[1]
+        w.run = fail_pairs
+        w.sweep_correction(self.cfg, job, "D:/gq/jobs/capR", "time", beat)
+        self.assertEqual([c[0] for c in calls], ["overlap_pairs.py", "upright_match.py", "time_correct.py"])
+        self.assertNotIn("--pairs", calls[1][1])
 
     def test_pose_cache_roundtrip(self):
         gq, root = self.gq, Path(self.tmp.name)
@@ -631,6 +702,43 @@ class DashboardAPITest(unittest.TestCase):
         self.assertEqual(set(snap["presets"]), {"preview", "fast", "standard", "high"})
         self.assertTrue(all(q["est_seconds"] for q in snap["queue"]))
         self.assertTrue(snap["inbox_dir"].endswith("inbox"))
+
+
+    def test_progress(self):
+        gq = self.gq
+        log = "I1 feature_extraction.cc:270] Processed file [40/101]\n"
+        self.assertEqual(gq.colmap_progress(log), (40, 101, "photos", "finding features"))
+        log += "I2 pairing.cc:214] Processing block [2/3, 1/3]\n"
+        self.assertEqual(gq.colmap_progress(log), (4, 9, "blocks", "matching photo pairs"))
+        self.assertIsNone(gq.colmap_progress("nothing yet"))
+        self.assertEqual(gq.colmap_progress("I3 pairing.cc:938] Processing block [6/9]\n"), (6, 9, "blocks", "matching photo pairs"))
+        job = {"name": "x", "phase": "sweep correction", "worker": "mac", "started": 0}
+        gq.set_progress(job, 4, 9, "blocks", "matching photo pairs")
+        started = job["progress"]["started"]
+        gq.set_progress(job, 5, 9, "blocks", "matching photo pairs")
+        self.assertEqual(job["progress"]["started"], started)   # same step: same clock
+        self.assertEqual(self.status.job_view(self.cfg, job)["progress"]["done"], 5)
+        job["phase"] = "training"   # stale once the phase moves on
+        self.assertIsNone(self.status.job_view(self.cfg, job)["progress"])
+        job["phase"] = "solving"
+        gq.set_progress(job, label="solving", expected=100)
+        self.assertAlmostEqual(job["progress"]["eta"], job["progress"]["started"] + 100)
+
+    def test_tracked_card(self):
+        spec = importlib.util.spec_from_file_location("track", REPO / "tools" / "track.py")
+        tr = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tr)
+        tr.start("t1", "Line test", "pc", steps=["a", "b"], hold=False)
+        tr.step("t1", "b", 3, 10, "pairs")
+        e = next(e for e in self.gq.read_experiments() if e.get("id") == "track-t1")
+        self.assertTrue(e["live"])
+        self.assertEqual([v["state"] for v in e["variants"]], ["done", "running"])
+        self.assertEqual(e["variants"][1]["done"], 3)
+        tr.finish("t1", failed="boom")
+        e = next(e for e in self.gq.read_experiments() if e.get("id") == "track-t1")
+        self.assertFalse(e["live"])
+        self.assertEqual(e["variants"][1]["state"], "failed")
+        self.assertTrue(e["failed"])
 
 
 if __name__ == "__main__":

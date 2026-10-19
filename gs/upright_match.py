@@ -3,6 +3,7 @@
   python upright_match.py --colmap <colmap> --images <dir> --model <sparse/0> --work <dir>
                           --models <dir with aliked-n16rot.onnx, aliked-lightglue.onnx>
                           [--max-image-size 960] [--min-score 0.2] [--lightglue-min-score 0.1]
+                          [--pairs pairs.txt]
 
 LightGlue matches poorly across a large in-plane rotation: photos taken with the phone held one
 way barely match photos taken with it turned 90 degrees, and the few matches it makes are
@@ -10,6 +11,9 @@ mostly wrong. Every photo is first turned by a multiple of 90 degrees so that th
 the poses, ARKit's +y) points up in the image; features are extracted and matched on these
 copies; then the keypoints are mapped back into each original photo's frame, so the database
 reads like any other (time_correct.py, match_sweeps.py, ...). Writes <work>/database.db.
+
+All photo pairs are matched unless --pairs lists the ones to match (overlap_pairs.py picks them
+from the poses: a few percent of all pairs on a big capture, with the same corrections).
 """
 import argparse
 import os
@@ -62,6 +66,7 @@ def main(argv=None):
     p.add_argument("--min-score", type=float, default=0.2)
     p.add_argument("--lightglue-min-score", type=float, default=0.1)
     p.add_argument("--max-error", type=float, default=4.0, help="px, COLMAP's two-view verification")
+    p.add_argument("--pairs", help="match only these pairs (lines 'a.jpg b.jpg'); default every pair")
     p.add_argument("--cuda-path", help="file whose contents are prepended to PATH (CUDA libraries for onnxruntime)")
     a = p.parse_args(argv)
     if a.cuda_path:
@@ -96,7 +101,9 @@ def main(argv=None):
          "--FeatureExtraction.type", "ALIKED_N16ROT", "--AlikedExtraction.n16rot_model_path", f"{m}/aliked-n16rot.onnx",
          "--AlikedExtraction.max_num_features", str(a.max_features), "--AlikedExtraction.min_score", str(a.min_score)])
     print("features extracted", flush=True)
-    run(["exhaustive_matcher", "--database_path", str(db), "--FeatureMatching.use_gpu", "1",
+    pair_args = (["matches_importer", "--match_list_path", str(Path(a.pairs).resolve()), "--match_type", "pairs"]
+                 if a.pairs else ["exhaustive_matcher"])
+    run(pair_args + ["--database_path", str(db), "--FeatureMatching.use_gpu", "1",
          "--FeatureMatching.type", "ALIKED_LIGHTGLUE", "--AlikedMatching.lightglue_model_path", f"{m}/aliked-lightglue.onnx",
          "--AlikedMatching.lightglue_min_score", str(a.lightglue_min_score), "--TwoViewGeometry.max_error", str(a.max_error)])
     print("matched", flush=True)

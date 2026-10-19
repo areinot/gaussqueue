@@ -34,7 +34,8 @@ Each finished variant's final export is brought to this Mac and published to the
 exp-<batch>-<variant>/ (.ply and .v3.spz, flipped right way up like queue results), so the
 dashboard's card offers download buttons for it.
 
-  python3 tools/experiments.py --publish <batch json>   publish the variants of a finished batch
+  python3 tools/experiments.py --publish <batch json> [--force]   publish the variants of a finished
+                                                         batch (--force: again, if already published)
 """
 import json
 import os
@@ -78,7 +79,7 @@ class Batch:
         self.path = BATCHES / f"{time.strftime('%Y%m%d-%H%M%S')}-{slug(plan.get('name', 'batch'))}.json"
         self.data = {"name": plan.get("name", "Experiments"), "worker": worker_name, "out": plan.get("out"),
                      "program": plan.get("program", "gsplat"),
-                     "note": plan.get("note"), "started": time.time(), "finished": None,
+                     "note": plan.get("note"), "common": plan.get("common", []), "started": time.time(), "finished": None,
                      "variants": [{"name": v["name"], "desc": v.get("desc"), "state": "queued", "args": v.get("args", [])}
                                   for v in plan["variants"]]}
         self.write()
@@ -155,10 +156,17 @@ def start_view(runner_local, ssh, data):
     return ["--origin", *map(str, view[1]), "--yaw", str(view[2])] if view else []
 
 
+def data_candidates(*arg_lists):
+    """Arguments that may be the training data folder (the positional one can come anywhere,
+    e.g. in a variant's args): every argument that isn't an option, in order."""
+    return [a for args in arg_lists for a in (args or []) if isinstance(a, str) and a and not a.startswith("-")]
+
+
 def publish(cfg, runner_local, ssh, out, label, data=None):
     """Fetch <out>'s newest export_<step>.ply and write outbox/<label>/<label>.ply + .v3.spz
-    (flipped, and moved so viewers open at the first photo's camera when the training data
-    folder is given). Returns [{"file", "size"}] or [] if there's nothing to publish."""
+    (flipped, and moved so viewers open at the first photo's camera, like queue results, when the
+    training data folder is found among data: a folder or a list of candidates, the first with a
+    COLMAP model wins). Returns [{"file", "size"}] or [] if there's nothing to publish."""
     outbox = expand(cfg.get("outbox_dir") or APP_HOME / "outbox")
     tool = expand(cfg.get("spz_native") or APP_HOME / "bin" / "gq_spz")
     if runner_local:
@@ -183,10 +191,16 @@ def publish(cfg, runner_local, ssh, out, label, data=None):
         src = tmp
     dest = outbox / label
     dest.mkdir(parents=True, exist_ok=True)
-    try:
-        view = start_view(runner_local, ssh, data)
-    except Exception:
-        view = []
+    view = []
+    for cand in ([data] if isinstance(data, str) else (data or [])):
+        try:
+            view = start_view(runner_local, ssh, cand)
+        except Exception:
+            view = []
+        if view:
+            break
+    if data and not view:
+        print(f"    {label}: no start view found (published flipped only, not in the queue's frame)", flush=True)
     files = []
     for suffix, extra in ((".ply", []), (".v3.spz", ["--spz-version", "3"])):
         f = dest / f"{label}{suffix}"
@@ -355,7 +369,7 @@ def main(plan_path):
                     label = f"exp-{slug(plan.get('name', 'batch'))[:40]}-{slug(v['name'])}"
                     try:
                         rec["downloads"] = publish(cfg, runner.local, runner.worker.get("ssh"), out, label,
-                                                   data=(plan.get("common") or v.get("args") or [None])[0])
+                                                   data=data_candidates(v.get("args"), plan.get("common")))
                         rec["result"] = label if rec["downloads"] else None
                     except Exception as e:
                         print(f"    publishing {v['name']} failed: {e}", flush=True)
@@ -373,8 +387,9 @@ def main(plan_path):
         print("=== all done", flush=True)
 
 
-def publish_batch(path):
-    """Publish the finished variants of an existing batch file (and record the downloads)."""
+def publish_batch(path, force=False):
+    """Publish the finished variants of an existing batch file (and record the downloads); with
+    force, again even when already published (e.g. to put them in the queue's frame)."""
     path = Path(path)
     data = json.loads(path.read_text())
     cfg = json.loads((APP_HOME / "config.json").read_text())
@@ -385,11 +400,11 @@ def publish_batch(path):
     if not out_root:
         sys.exit("this batch file doesn't record its output folder")
     for rec in data["variants"]:
-        if rec.get("state") != "done" or rec.get("downloads"):
+        if rec.get("state") != "done" or (rec.get("downloads") and not force):
             continue
         label = f"exp-{slug(data.get('name', 'batch'))[:40]}-{slug(rec['name'])}"
         rec["downloads"] = publish(cfg, local, ssh, f"{out_root}/{rec['name']}", label,
-                                   data=(plan.get("common") or [None])[0])
+                                   data=data_candidates(rec.get("args"), data.get("common") or plan.get("common")))
         rec["result"] = label if rec["downloads"] else None
         print(f"{rec['name']}: {', '.join(d['file'] for d in rec['downloads']) or 'nothing to publish'}", flush=True)
         tmp = path.with_suffix(".tmp")
@@ -398,8 +413,8 @@ def publish_batch(path):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "--publish":
-        publish_batch(sys.argv[2])
+    if len(sys.argv) in (3, 4) and sys.argv[1] == "--publish" and sys.argv[3:] in ([], ["--force"]):
+        publish_batch(sys.argv[2], force=sys.argv[3:] == ["--force"])
     elif len(sys.argv) == 2:
         main(sys.argv[1])
     else:

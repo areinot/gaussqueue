@@ -75,6 +75,10 @@ DEFAULTS = {
     # iMessage updates (received, progress, done) for each capture: the default for new
     # captures; each one can be switched on or off from its card, even while it runs.
     "notify": False,
+    # iPhone LiDAR reads a few percent long against ARKit's (metric) poses. When a capture has
+    # feature matches (time correction), train.py --depth-scale is fitted per capture
+    # (gs/lidar_scale.py); otherwise this factor is used (1.0 = trust the LiDAR as is).
+    "lidar_depth_scale": 1.0,
     "start_view_forward": "-z",
     # Refine the capture's camera poses with COLMAP (features, matching, bundle
     # adjustment) before training. Slower, usually sharper. Needs `colmap` on PATH.
@@ -1009,6 +1013,8 @@ class Status:
         w = self.workers.get(c.get("worker"))
         v["worker_label"] = w.label if w else c.get("worker")
         v["remote"] = bool(w and w.remote)
+        pr = c.get("progress")
+        v["progress"] = pr if pr and pr.get("phase") == c.get("phase") and c.get("phase") != "training" else None
         if self.snapshots:
             v["snapshots"] = self.snapshots.for_job(c["name"])
             for sn in v["snapshots"]:   # published snapshots are results of their own
@@ -1082,6 +1088,7 @@ class Status:
             "limits": SETTING_LIMITS,
             "choices": SETTING_CHOICES,
             "experiments": read_experiments(self.paths),
+            "viewer": bool(viewer_command(cfg)),
         }
         self.write_text(jobs, queue, hist)
 
@@ -1295,6 +1302,14 @@ def start_dashboard(cfg, paths, status, overrides):
             if (self.headers.get("Origin") not in allowed_origins
                     or self.headers.get("Content-Type") != "application/json"):
                 return self.send(403, b"forbidden", "text/plain")
+            if self.path == "/api/view":   # open a result file in the splat viewer on this Mac
+                try:
+                    n = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(min(n, 10_000)))
+                    open_in_viewer(load_config(), paths, str(body.get("name", "")), str(body.get("file", "")))
+                    return self.send(200, b'{"ok":true}', "application/json")
+                except ValueError as e:
+                    return self.send(400, json.dumps({"error": str(e)}).encode(), "application/json")
             if self.path != "/api/item":
                 return self.send(404, b"not found", "text/plain")
             try:
@@ -1400,6 +1415,219 @@ def unpack(local_zip, data_dir):
         z.extractall(data_dir)  # extractall strips absolute paths and '..'
 
 
+BLANK_EDGE_SHARE = 0.01   # a frame with fewer edge pixels than this (in a 128 px thumbnail) is blank...
+BLANK_SPREAD = 10.0       # ... or with less brightness spread (grey levels, std) than this
+ALIEN_SIMILARITY = 0.35   # unlike BOTH time neighbours below this (colour histogram and shifted thumbnail
+                          # correlation): a finger, a flash, something across the lens, or a one-photo sweep
+SUSPECT_SIMILARITY = 0.5  # best-neighbour correlation below this: kept, but listed as a suspect (fast swing)
+BLUR_MAX_PX = 6.5         # edges wider than this (gs/frame_check.py; sharp phone photos are ~2.5-4 px) = blurred
+SHARP_PX = 5.0            # a neighbour this sharp, showing the same view, makes a blurred photo redundant
+SHRINK_TO_PX = 2.5        # a blurred photo that isn't redundant is trained at the size where its edges are this wide
+
+
+def frame_thumb(path, size=128):
+    """A photo's small thumbnail as rows of (b, g, r), decoded by sips (no image libraries here)."""
+    import struct
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "t.bmp"
+        subprocess.run(["sips", "-s", "format", "bmp", "-Z", str(size), str(path), "--out", str(out)],
+                       capture_output=True, check=True, timeout=60)
+        b = out.read_bytes()
+    off = struct.unpack_from("<I", b, 10)[0]
+    w, h = struct.unpack_from("<ii", b, 18)
+    bpp = struct.unpack_from("<H", b, 28)[0] // 8
+    row, hh = (w * bpp + 3) & ~3, abs(h)
+    rows = [[tuple(b[off + y * row + x * bpp:off + y * row + x * bpp + 3]) for x in range(w)] for y in range(hh)]
+    return rows if h < 0 else rows[::-1]   # BMP rows run bottom-up unless the height is negative
+
+
+def frame_detail(path=None, thumb=None):
+    """(brightness spread, share of edge pixels) of a photo's thumbnail. A finger over the lens, a
+    cap, or a plain surface right in front of the camera shows as almost no spread and no edges."""
+    t = thumb or frame_thumb(path)
+    hh, w = len(t), len(t[0])
+    g = [[0.114 * p[0] + 0.587 * p[1] + 0.299 * p[2] for p in r] for r in t]
+    flat = [v for r in g for v in r]
+    mean = sum(flat) / len(flat)
+    spread = (sum((v - mean) ** 2 for v in flat) / len(flat)) ** 0.5
+    edges = sum(1 for y in range(1, hh - 1) for x in range(1, w - 1)
+                if abs(g[y][x + 1] - g[y][x - 1]) + abs(g[y + 1][x] - g[y - 1][x]) > 24)
+    return spread, edges / max((w - 2) * (hh - 2), 1)
+
+
+def frame_similarity(a, b):
+    """(colour histogram overlap, best shifted correlation) of two thumbnails: does b show
+    roughly what a shows? The shift (up to a quarter of the frame) allows for the camera moving
+    between photos; the histogram doesn't care where things are."""
+    def hist(t):
+        h = [0] * 512
+        for r in t:
+            for p in r:
+                h[(p[2] >> 5) * 64 + (p[1] >> 5) * 8 + (p[0] >> 5)] += 1
+        n = sum(h)
+        return [v / n for v in h]
+    def small(t, W=24, H=18):   # box-averaged grey thumbnail
+        hh, w = len(t), len(t[0])
+        out = []
+        for y in range(H):
+            ys = range(y * hh // H, max(y * hh // H + 1, (y + 1) * hh // H))
+            row = []
+            for x in range(W):
+                xs = range(x * w // W, max(x * w // W + 1, (x + 1) * w // W))
+                vals = [0.114 * t[yy][xx][0] + 0.587 * t[yy][xx][1] + 0.299 * t[yy][xx][2] for yy in ys for xx in xs]
+                row.append(sum(vals) / len(vals))
+            out.append(row)
+        return out
+    ha, hb = hist(a), hist(b)
+    hs = sum(min(x, y) for x, y in zip(ha, hb))
+    ga, gb = small(a), small(b)
+    H, W = len(ga), len(ga[0])
+    best = -1.0
+    for dy in range(-H // 4, H // 4 + 1):
+        for dx in range(-W // 4, W // 4 + 1):
+            A = [ga[y][x] for y in range(max(0, dy), H + min(0, dy)) for x in range(max(0, dx), W + min(0, dx))]
+            B = [gb[y][x] for y in range(max(0, -dy), H + min(0, -dy)) for x in range(max(0, -dx), W + min(0, -dx))]
+            ma, mb = sum(A) / len(A), sum(B) / len(B)
+            sab = sum((p - ma) * (q - mb) for p, q in zip(A, B))
+            saa = sum((p - ma) ** 2 for p in A); sbb = sum((q - mb) ** 2 for q in B)
+            if saa > 1e-6 and sbb > 1e-6:
+                best = max(best, sab / (saa * sbb) ** 0.5)
+    return hs, best
+
+
+def frame_widths(cfg, images, names):
+    """Edge width (blur) per photo from gs/frame_check.py, run with the Mac's training Python
+    (config mac_gsplat.python: it has numpy); None if that isn't set up."""
+    py = (cfg.get("mac_gsplat") or {}).get("python")
+    if not py or not Path(py).exists() or not names:
+        return None
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "widths.json"
+        r = subprocess.run([py, str(GS_DIR / "frame_check.py"), "--images", str(images), "--out", str(out)] + list(names),
+                           capture_output=True, text=True, timeout=3600)
+        if r.returncode or not out.exists():
+            log(f"blur check failed: {(r.stderr or r.stdout)[-300:]}")
+            return None
+        return {n: v.get("width_px") for n, v in json.loads(out.read_text()).items()}
+
+
+def drop_blank_frames(colmap_dir, widths=None):
+    """Frame checks before anything uses the capture, cheapest first:
+    1. blank (no image detail: finger, cap, a plain surface at the lens) -> dropped;
+    2. unlike both neighbours in time (flash, something across the lens, a one-photo sweep) -> dropped;
+       weakly like them (a fast swing) -> kept, listed as a suspect;
+    3. blurred (widths(names) -> edge width px, gs/frame_check.py): if a sharp neighbour shows the
+       same view -> dropped as redundant; otherwise kept at a smaller size where its blur is a normal
+       edge (images/photo_scales.json, for train.py --photo-scales).
+    Dropped photos move to <capture>/dropped_frames/ and leave images.txt. Every frame's numbers and
+    what was done to it go to <capture>/frame_check.json. Returns [(name, why, numbers)] dropped."""
+    imtxt = colmap_dir / "sparse" / "0" / "images.txt"
+    if not imtxt.exists():
+        return []
+    lines = imtxt.read_text().splitlines()
+    header, entries, k = [], [], 0
+    while k < len(lines):
+        f = lines[k].split()
+        if lines[k].startswith("#") or len(f) < 10:
+            header.append(lines[k])
+            k += 1
+            continue
+        entries.append((f[9], lines[k:k + 2]))
+        k += 2
+    thumbs, dropped, kept = {}, [], []
+    for name, pair in entries:                    # 1. no image detail at all
+        img = colmap_dir / "images" / name
+        try:
+            thumbs[name] = frame_thumb(img) if img.exists() else None
+            spread, edges = frame_detail(thumb=thumbs[name]) if thumbs[name] else (None, None)
+        except Exception:
+            spread = edges = None
+        if spread is not None and (edges < BLANK_EDGE_SHARE or spread < BLANK_SPREAD):
+            dropped.append((name, "blank", f"spread {spread:.1f}, edges {100 * edges:.2f}%"))
+        else:
+            kept.append((name, pair))
+    order = sorted(range(len(kept)), key=lambda i: Path(kept[i][0]).stem)   # capture order (timestamped names)
+    sims = {}
+    for a, b in zip(order, order[1:]):            # 2. unlike both neighbours in time
+        ta, tb = thumbs.get(kept[a][0]), thumbs.get(kept[b][0])
+        sims[(a, b)] = frame_similarity(ta, tb) if ta and tb else (1.0, 1.0)
+    suspects, alien = [], set()
+    for j, i in enumerate(order):
+        nb = [sims[(order[j - 1], i)]] if j > 0 else []
+        nb += [sims[(i, order[j + 1])]] if j + 1 < len(order) else []
+        if not nb:
+            continue
+        hb, cb = max(h for h, _ in nb), max(c for _, c in nb)
+        if hb < ALIEN_SIMILARITY and cb < ALIEN_SIMILARITY:
+            alien.add(i)
+            dropped.append((kept[i][0], "unlike its neighbours", f"best histogram {hb:.2f}, correlation {cb:.2f}"))
+        elif cb < SUSPECT_SIMILARITY:
+            suspects.append((kept[i][0], round(cb, 2)))
+    # 3. blurred: redundant (a sharp neighbour shows the same view) or shrunk to its real resolution
+    width = widths([kept[i][0] for i in order if i not in alien]) if widths else None
+    scales, blurred, live = {}, {}, [i for i in order if i not in alien]
+    if width:
+        for j, i in enumerate(live):
+            w = width.get(kept[i][0])
+            if w is None or w <= BLUR_MAX_PX:
+                continue
+            cover = None
+            for k in (live[j - 1] if j > 0 else None, live[j + 1] if j + 1 < len(live) else None):
+                if k is None:
+                    continue
+                wk = width.get(kept[k][0])
+                pair_sim = sims.get((min(i, k), max(i, k))) or sims.get((k, i)) or sims.get((i, k))
+                if pair_sim is None and thumbs.get(kept[i][0]) and thumbs.get(kept[k][0]):
+                    pair_sim = frame_similarity(thumbs[kept[i][0]], thumbs[kept[k][0]])
+                if wk is not None and wk <= SHARP_PX and pair_sim and pair_sim[1] >= SUSPECT_SIMILARITY:
+                    cover = kept[k][0]
+                    break
+            if cover:
+                alien.add(i)
+                dropped.append((kept[i][0], "blurred, redundant", f"edges {w:.1f} px; {cover} shows the same view sharply"))
+            else:
+                scales[kept[i][0]] = round(max(0.25, SHRINK_TO_PX / w), 3)
+                blurred[kept[i][0]] = w
+    keep = header + [l for i, (_, pair) in enumerate(kept) if i not in alien for l in pair]
+    if scales:
+        (colmap_dir / "images" / "photo_scales.json").write_text(json.dumps(scales, indent=0))
+    log_rows = []
+    why = {n: (w, d) for n, w, d in dropped}
+    sus = dict(suspects)
+    for name, _ in entries:
+        th = thumbs.get(name)
+        row = {"photo": name}
+        if th:
+            sp, ed = frame_detail(thumb=th)
+            row.update(spread=round(sp, 1), edge_share=round(ed, 4))
+        if width and width.get(name) is not None:
+            row["edge_width_px"] = width[name]
+        if name in why:
+            row.update(action="dropped", why=why[name][0], numbers=why[name][1])
+        elif name in scales:
+            row.update(action="shrunk", scale=scales[name], why=f"blurred (edges {blurred[name]:.1f} px), no sharp neighbour shows its view")
+        elif name in sus:
+            row.update(action="kept, suspect", why=f"weakly like its neighbours (best correlation {sus[name]})")
+        else:
+            row["action"] = "kept"
+        log_rows.append(row)
+    (colmap_dir / "frame_check.json").write_text(json.dumps({
+        "dropped": [{"photo": n, "why": w, "numbers": d} for n, w, d in dropped],
+        "shrunk": [{"photo": n, "scale": v, "edge_width_px": blurred[n]} for n, v in scales.items()],
+        "suspects": [{"photo": n, "best_neighbour_correlation": c} for n, c in suspects],
+        "blur_checked": bool(width), "frames": log_rows}, indent=1))
+    if dropped:
+        (colmap_dir / "dropped_frames").mkdir(exist_ok=True)
+        for name, _, _ in dropped:
+            src = colmap_dir / "images" / name
+            if src.exists():
+                src.rename(colmap_dir / "dropped_frames" / name)
+        imtxt.write_text("\n".join(keep) + "\n")
+    return dropped
+
+
 def find_colmap(data_dir):
     for sparse in sorted(data_dir.rglob("sparse/0")):
         root = sparse.parent.parent
@@ -1483,6 +1711,46 @@ def pose_cache_dir(cfg, colmap_dir, name):
     return POSE_CACHE / f"{name}-{h.hexdigest()[:16]}"
 
 
+def set_progress(job, done=None, total=None, unit="", label="", expected=None):
+    """A progress bar on the job's card for the step it is in now (training shows its own
+    steps): done of total in any unit, with an ETA from the rate so far; or, for a step that
+    can't be counted, the seconds it is expected to take, which the card fills by elapsed
+    time. It belongs to the current phase, so it disappears when the phase changes; a new
+    label restarts its clock."""
+    old, now = job.get("progress") or {}, time.time()
+    same = old.get("phase") == job.get("phase") and old.get("label") == label
+    p = {"phase": job.get("phase"), "label": label, "unit": unit, "done": done, "total": total,
+         "started": old["started"] if same else now, "expected": expected, "eta": None}
+    if expected:
+        p["eta"] = p["started"] + expected
+    elif done and total and now - p["started"] > 5:
+        p["eta"] = p["started"] + (now - p["started"]) * total / done
+    job["progress"] = p
+
+
+COLMAP_BLOCK = re.compile(r"Processing block \[(\d+)/(\d+), (\d+)/(\d+)\]")
+COLMAP_BLOCK1 = re.compile(r"Processing block \[(\d+)/(\d+)\]")   # matching a list of pairs
+COLMAP_FILE = re.compile(r"Processed file \[(\d+)/(\d+)\]")
+
+
+def colmap_progress(text):
+    """(done, total, unit, label) from the tail of a COLMAP log: feature extraction's
+    photos, then exhaustive matching's blocks. None if neither has started."""
+    b = COLMAP_BLOCK.findall(text)
+    if b:
+        i, n, j, m = map(int, b[-1])
+        return (i - 1) * m + j, n * m, "blocks", "matching photo pairs"
+    b = COLMAP_BLOCK1.findall(text)
+    if b:
+        i, n = map(int, b[-1])
+        return i, n, "blocks", "matching photo pairs"
+    f = COLMAP_FILE.findall(text)
+    if f:
+        i, n = map(int, f[-1])
+        return i, n, "photos", "finding features"
+    return None
+
+
 def read_json(path):
     """A small json file's contents, or None if it is missing or unreadable."""
     try:
@@ -1520,7 +1788,7 @@ def list_caches():
                     "max_shift_mm": max([v.get("shift_size_mm") or 0 for v in r.get("sweeps", {}).values()]
                                         or [summ.get("max_shift_mm") or 0]),
                     "seconds": summ.get("seconds") or r.get("seconds"),
-                    "match_cached": bool(summ.get("match_cached"))}
+                    "match_cached": bool(summ.get("match_cached")), "pairs": summ.get("pairs")}
         out.append({"name": name or d.name, "key": key, "dir": d.name,
                     "size": sum(f.stat().st_size for f in files if f.is_file()),
                     "saved": stats.get("saved") or dt.datetime.fromtimestamp(d.stat().st_mtime).isoformat(timespec="seconds"),
@@ -1800,6 +2068,12 @@ def local_gsplat_cmd(cfg, gs, st, total, colmap_dir, out_dir, job):
         cmd += ["--depth-dir", sensor, "--eval-depth-dir", sensor]
         if st.get("depth_supervision"):
             cmd += ["--depth-weight", g["depth_weight"]]
+        scale = float(cfg.get("lidar_depth_scale", 1.0))
+        if scale != 1.0:   # no feature matches here to fit one: the configured factor
+            cmd += ["--depth-scale", scale]
+            job["lidar_scale"] = {"scale": scale, "source": "config"}
+    if (Path(colmap_dir) / "images" / "photo_scales.json").exists():
+        cmd += ["--photo-scales", Path(colmap_dir) / "images" / "photo_scales.json"]
     if st.get("flatten"):
         cmd += ["--flat-weight", g["flat_weight"]]
     cmd += gsplat_recipe_args(st, g, total)
@@ -2127,6 +2401,15 @@ def write_meta(dest, job, files, flipped):
         meta["pruning"] = job["prune"]
     if job.get("quality"):
         meta["capture_quality"] = job["quality"]
+    if job.get("lidar_scale"):
+        meta["lidar_depth_scale"] = job["lidar_scale"]
+    if job.get("dropped_frames"):
+        meta["dropped_frames"] = job["dropped_frames"]
+    if job.get("frame_check") and Path(job["frame_check"]).exists():   # every frame's check and what was done to it
+        fc = json.loads(Path(job["frame_check"]).read_text())
+        meta["frame_check"] = {"dropped": len(fc.get("dropped", [])), "shrunk": len(fc.get("shrunk", [])),
+                               "suspects": len(fc.get("suspects", [])), "blur_checked": fc.get("blur_checked")}
+        shutil.copyfile(job["frame_check"], dest / "frame_check.json")
     (dest / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
 
 
@@ -2235,6 +2518,40 @@ class RemoteWorker:
     def job_dir(self, name):
         return f"{self.root}/{name}"
 
+    def lidar_depth_scale(self, cfg, job, d, raw, beat):
+        """train.py --depth-scale for this capture: fitted from its feature matches when the worker has
+        them (gs/lidar_scale.py, about a minute), else config "lidar_depth_scale". Recorded in job."""
+        fallback = float(cfg.get("lidar_depth_scale", 1.0))
+        job["lidar_scale"] = {"scale": fallback, "source": "config"}
+        cache_dir = Path(job["pose_cache"]) if job.get("pose_cache") else None
+        db = self.match_db_path(cache_dir) if cache_dir else None
+        if not db or self.ps(f"Test-Path '{db}'", check=False).strip() != "True":
+            return fallback
+        job["phase"] = f"fitting the LiDAR depth scale on {self.label}"
+        beat(force=True)
+        cwd = self.gsplat["scripts"]
+        code = self.run(self.gsplat["python"], [f"{cwd}/lidar_scale.py", "--model", f"{d}/data/sparse/0", "--database", db,
+                                                "--depth-dir", raw, "--out", f"{d}/lidar_scale.json"], cwd, d, "lidar_scale", beat)
+        if code:
+            log(f"LiDAR scale fit failed for {job['name']} {self.failure(d, 'lidar_scale')}; using {fallback}")
+            return fallback
+        try:
+            tmp = APP_HOME / "tmp" / f"{job['name']}-lidar_scale.json"
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            self.download(f"{d}/lidar_scale.json", tmp)
+            res = json.loads(tmp.read_text())
+        except Exception as e:
+            log(f"LiDAR scale result unreadable for {job['name']}: {e}; using {fallback}")
+            return fallback
+        if not res.get("ok") or not 0.85 < float(res.get("scale", 0)) < 1.15:
+            log(f"LiDAR scale for {job['name']}: not enough to go on ({res.get('comparisons')} comparisons); using {fallback}")
+            job["lidar_scale"].update(fit=res)
+            return fallback
+        job["lidar_scale"] = {"scale": res["scale"], "source": "fitted", **res}
+        log(f"LiDAR depth scale for {job['name']}: {res['scale']:.4f} from {res['comparisons']:,} comparisons "
+            f"(error {res['error_mm_before']:.1f} -> {res['error_mm_after']:.1f} mm)")
+        return res["scale"]
+
     def match_db_path(self, cache_dir):
         """Where this worker keeps a capture's time-correction feature matches (see MATCH_DB_VERSION)."""
         g = self.gsplat.get("scripts", "") if self.gsplat else ""
@@ -2242,12 +2559,28 @@ class RemoteWorker:
             return None
         return f"{g.rstrip('/').rsplit('/', 2)[0]}/match_cache/{Path(cache_dir).name}/{MATCH_DB_VERSION}.db"
 
-    def download(self, remote_path, local):
+    def download(self, remote_path, local, job=None):
+        """Copy one file from the worker. With job, its progress shows on the job's card."""
         tmp = Path(str(local) + ".partial")
-        r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", f"{self.ssh}:/{remote_path}", str(tmp)],
-                           capture_output=True, text=True, timeout=3600)
-        if r.returncode:
-            raise RuntimeError(f"download from {self.label} failed: {r.stderr.strip()[:200]}")
+        cmd = ["scp", "-q", "-o", "BatchMode=yes", f"{self.ssh}:/{remote_path}", str(tmp)]
+        if job is None:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            code, err = r.returncode, r.stderr
+        else:
+            size = self.ps(f"(Get-Item '{remote_path}' -ErrorAction SilentlyContinue).Length", check=False).strip()
+            total = int(size) if size.isdigit() else 0
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            t0 = time.time()
+            while proc.poll() is None:
+                if time.time() - t0 > 3600:
+                    proc.kill()
+                if total:
+                    have = tmp.stat().st_size if tmp.exists() else 0
+                    set_progress(job, round(have / 2**20), round(total / 2**20), "MB", "downloading " + Path(remote_path).name)
+                time.sleep(1)
+            code, err = proc.returncode, proc.stderr.read()
+        if code:
+            raise RuntimeError(f"download from {self.label} failed: {err.strip()[:200]}")
         tmp.replace(local)
 
     def remove(self, remote_path):
@@ -2287,22 +2620,44 @@ class RemoteWorker:
         return f"{d}/snapshots/export_{step}.ply"
 
     # -- job plumbing
-    def upload_dir(self, parent, names, dest, beat):
-        """Stream folders to the worker with tar (-h follows symlinks such as images/)."""
+    def upload_dir(self, parent, names, dest, beat, job=None):
+        """Stream folders to the worker with tar (-h follows symlinks such as images/).
+        With job, the bytes sent so far show as progress on its card."""
         env = dict(os.environ, COPYFILE_DISABLE="1")   # no macOS ._ metadata files
         tar = subprocess.Popen(["tar", "-C", str(parent), "-chf", "-", *names],
                                stdout=subprocess.PIPE, env=env)
-        up = subprocess.Popen(self._ssh(f'tar -xf - -C "{dest}"'), stdin=tar.stdout,
+        up = subprocess.Popen(self._ssh(f'tar -xf - -C "{dest}"'), stdin=subprocess.PIPE,
                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        tar.stdout.close()
+        total = sum(f.stat().st_size for n in names for f in Path(parent, n).rglob("*")
+                    if f.is_file()) if job is not None else 0
+        sent = [0]
+
+        def relay():   # tar -> ssh, counting
+            try:
+                while chunk := tar.stdout.read(1 << 20):
+                    up.stdin.write(chunk)
+                    sent[0] += len(chunk)
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            finally:
+                try:
+                    up.stdin.close()
+                except OSError:
+                    pass
+        th = threading.Thread(target=relay, daemon=True)
+        th.start()
         try:
             while up.poll() is None:
                 beat()
+                if job is not None and total:
+                    set_progress(job, round(min(sent[0], total) / 2**20), round(total / 2**20), "MB",
+                                 "sending " + " + ".join(names))
                 time.sleep(1)
         except BaseException:   # cancelled: don't leave the transfer running
             tar.kill()
             up.kill()
             raise
+        th.join(5)
         tar.wait()
         if up.returncode or tar.returncode:
             raise RuntimeError(f"upload to {self.label} failed: {up.stderr.read().decode()[-200:]}")
@@ -2313,19 +2668,19 @@ class RemoteWorker:
         if r.returncode:
             raise RuntimeError(f"upload to {self.label} failed: {r.stderr.strip()[:200]}")
 
-    def upload_capture(self, d, colmap_dir, sensor, beat, have_images=False):
+    def upload_capture(self, d, colmap_dir, sensor, beat, have_images=False, job=None):
         """A fresh <d>/data with the trainable photos + poses (and the LiDAR depth maps).
         have_images: the photos are already there (uploaded for pose refinement); keep them."""
         if have_images:
             self.ps(f"Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '{d}/data/sparse','{d}/out',"
                     f"'{d}/data/sensor_data'; New-Item -ItemType Directory -Force '{d}/out' | Out-Null")
-            self.upload_dir(colmap_dir, ["sparse"], f"{d}/data", beat)
+            self.upload_dir(colmap_dir, ["sparse"], f"{d}/data", beat, job)
         else:
             self.ps(f"Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '{d}'; "
                     f"New-Item -ItemType Directory -Force '{d}/data','{d}/out' | Out-Null")
-            self.upload_dir(colmap_dir, ["images", "sparse"], f"{d}/data", beat)
+            self.upload_dir(colmap_dir, ["images", "sparse"], f"{d}/data", beat, job)
         if sensor:
-            self.upload_dir(sensor.parent, [sensor.name], f"{d}/data", beat)
+            self.upload_dir(sensor.parent, [sensor.name], f"{d}/data", beat, job)
 
     def can_refine(self):
         """Pose refinement here needs COLMAP and the gs scripts (run with the gsplat Python)."""
@@ -2339,8 +2694,8 @@ class RemoteWorker:
         beat(force=True)
         self.ps(f"Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '{d}'; "
                 f"New-Item -ItemType Directory -Force '{d}/data','{d}/orig' | Out-Null")
-        self.upload_dir(colmap_dir, ["images"], f"{d}/data", beat)
-        self.upload_dir(colmap_dir, ["sparse"], f"{d}/orig", beat)
+        self.upload_dir(colmap_dir, ["images"], f"{d}/data", beat, job)
+        self.upload_dir(colmap_dir, ["sparse"], f"{d}/orig", beat, job)
         job["images_on"] = self.name
         self.sync_gsplat()
         cwd = self.gsplat["scripts"]
@@ -2360,6 +2715,8 @@ class RemoteWorker:
             phases = [l[7:].strip() for l in out_.splitlines() if l.startswith("PHASE: ")]
             if phases:
                 job["phase"] = f"refining poses on {self.label}: {phases[-1]}"
+            colmap_log()
+        colmap_log = self.colmap_poll(job, f"{d}/refine/colmap.log")
         code = self.run(self.gsplat["python"], args, cwd, d, "refine", beat, poll)
         if code:
             last = self.ps(f"Get-Content '{d}/refine.log' -Tail 3 -ErrorAction SilentlyContinue", check=False)
@@ -2377,6 +2734,14 @@ class RemoteWorker:
                             f"{self.ssh}:/{dst}/"], capture_output=True, text=True, timeout=300)
         if r.returncode:
             raise RuntimeError(f"copying the gsplat scripts to {self.label} failed: {r.stderr.strip()[:200]}")
+
+    def colmap_poll(self, job, log_path):
+        """A poll() for run() that shows a COLMAP log's progress on the job's card."""
+        def poll():
+            p = colmap_progress(self.ps(f"Get-Content '{log_path}' -Tail 40 -ErrorAction SilentlyContinue", check=False))
+            if p:
+                set_progress(job, *p)
+        return poll
 
     def run(self, exe, args, cwd, d, name, beat, poll=None, job=None, pending_settings=None, env_path=None):
         """Run a program on the worker and wait for it, logging to <d>/<name>.log/.err.
@@ -2457,7 +2822,7 @@ class RemoteWorker:
         gs = st.get("trainer") == "gsplat" and bool(self.gsplat)
         job.update(phase=f"uploading to {self.label}", step=None, eta=None, paused=False)
         beat(force=True)
-        self.upload_capture(d, colmap_dir, sensor if gs else None, beat,
+        self.upload_capture(d, colmap_dir, sensor if gs else None, beat, job=job,
                             have_images=job.get("images_on") == self.name)
         if gs:
             self.sync_gsplat()
@@ -2493,6 +2858,11 @@ class RemoteWorker:
                             args += ["--far-flat-weight", g["far_flat_weight"]]
                 if st.get("depth_supervision"):
                     args += ["--depth-weight", g["depth_weight"]]
+                scale = self.lidar_depth_scale(cfg, job, d, raw, beat)
+                if scale != 1.0:
+                    args += ["--depth-scale", scale]
+            if (job.get("frame_check") and (Path(job["frame_check"]).parent / "images" / "photo_scales.json").exists()):
+                args += ["--photo-scales", f"{d}/data/images/photo_scales.json"]
             if st.get("flatten"):
                 args += ["--flat-weight", g["flat_weight"]]
             args += gsplat_recipe_args(st, g, total)
@@ -2564,7 +2934,7 @@ class RemoteWorker:
         beat(force=True)
         out_dir.mkdir(parents=True, exist_ok=True)
         final = out_dir / f"export_{total}.ply"
-        self.download(f"{d}/out/export_{total}.ply", final)
+        self.download(f"{d}/out/export_{total}.ply", final, job)
         try:
             self.download(f"{d}/train.log", out_dir.parent / "train.log")
         except Exception:
@@ -2614,7 +2984,8 @@ class RemoteWorker:
                     "--match-args", f"--FeatureMatching.type ALIKED_LIGHTGLUE --AlikedMatching.lightglue_model_path "
                                     f"{m}/aliked-lightglue.onnx --AlikedMatching.lightglue_min_score 0.5 "
                                     f"--TwoViewGeometry.max_error 2"]
-            code = self.run(py, args, cwd, d, "sweep_features", beat, env_path=al.get("cuda_path"))
+            code = self.run(py, args, cwd, d, "sweep_features", beat, self.colmap_poll(job, f"{d}/sweeps/colmap/colmap.log"),
+                            env_path=al.get("cuda_path"))
             if code:
                 raise RuntimeError(f"feature matching exit {code} {self.failure(d, 'sweep_features')}")
             job["phase"] = f"sweep correction on {self.label}: match search"
@@ -2629,7 +3000,7 @@ class RemoteWorker:
             al = self.spec.get("aliked") or {}
             if not al.get("models"):
                 raise RuntimeError(f"time correction needs an \"aliked\" entry for {self.label} in config.json")
-            db, match_cached = f"{d}/sweeps/upright/database.db", False
+            db, match_cached, n_pairs = f"{d}/sweeps/upright/database.db", False, None
             marker = cache_dir / f"{MATCH_DB_VERSION}-matches.json" if cache_dir else None
             kept = self.match_db_path(cache_dir) if cache_dir else None
             if marker and marker.exists() and kept:   # the worker still has this capture's matches?
@@ -2642,12 +3013,28 @@ class RemoteWorker:
                 except (ValueError, OSError):
                     pass
             if not match_cached:
+                # only the photo pairs whose views overlap (from the poses and the scene points),
+                # with links across sweeps kept on purpose; every pair if that can't be worked out
+                pairs = None
+                if cfg.get("match_pairs", "overlap") == "overlap":
+                    job["phase"] = f"sweep correction on {self.label}: choosing photo pairs"
+                    beat(force=True)
+                    code = self.run(py, [f"{cwd}/overlap_pairs.py", "--model", sp, "--out", f"{d}/sweeps/pairs.txt"],
+                                    cwd, d, "sweep_pairs", beat)
+                    if code:
+                        log(f"could not choose photo pairs for {job['name']} {self.failure(d, 'sweep_pairs')}; "
+                            "matching every pair")
+                    else:
+                        pairs = f"{d}/sweeps/pairs.txt"
+                        n = self.ps(f"(Get-Content '{pairs}' | Measure-Object -Line).Lines", check=False).strip()
+                        n_pairs = int(n) if n.isdigit() else None
                 job["phase"] = f"sweep correction on {self.label}: matching uprighted photos"
                 beat(force=True)
                 args = [f"{cwd}/upright_match.py", "--colmap", self.spec["colmap"].replace("\\", "/"),
                         "--images", f"{d}/data/images", "--model", sp, "--work", f"{d}/sweeps/upright",
-                        "--models", al["models"].rstrip("/"), "--max-image-size", 960]
-                code = self.run(py, args, cwd, d, "sweep_features", beat, env_path=al.get("cuda_path"))
+                        "--models", al["models"].rstrip("/"), "--max-image-size", 960] + (["--pairs", pairs] if pairs else [])
+                code = self.run(py, args, cwd, d, "sweep_features", beat,
+                                self.colmap_poll(job, f"{d}/sweeps/upright/colmap.log"), env_path=al.get("cuda_path"))
                 if code:
                     raise RuntimeError(f"feature matching exit {code} {self.failure(d, 'sweep_features')}")
                 if kept and marker:   # keep them: a failure after this point, or another run, reuses them
@@ -2656,12 +3043,14 @@ class RemoteWorker:
                                        f"Copy-Item -Force '{db}' '{kept}.partial'; Move-Item -Force '{kept}.partial' '{kept}'; "
                                        f"(Get-Item '{kept}').Length", timeout=900).strip()
                         marker.parent.mkdir(parents=True, exist_ok=True)
-                        marker.write_text(json.dumps({"worker": self.name, "path": kept, "size": int(size),
+                        marker.write_text(json.dumps({"worker": self.name, "path": kept, "size": int(size), "pairs": n_pairs,
                                                       "saved": dt.datetime.now().isoformat(timespec="seconds")}))
                         db = kept
                     except Exception as e:
                         log(f"could not keep the feature matches: {e}")
             job["phase"] = f"sweep correction on {self.label}: time correction"
+            set_progress(job, label="solving", expected=SWEEP_SECONDS_FIXED["time"]
+                         + SWEEP_SECONDS_PER_PHOTO["time"] * (job.get("frames") or 100))
             beat(force=True)
             args = [f"{cwd}/time_correct.py", db, "--raw", "--poses", sp,
                     "--out", f"{d}/sweeps/sweeps.json", "--write-model", f"{d}/sweeps/model",
@@ -2672,13 +3061,19 @@ class RemoteWorker:
             corrected, report = f"{d}/sweeps/model/images.txt", f"{d}/sweeps/sweeps.json"
         else:
             job["phase"] = f"sweep correction on {self.label}: render search (long)"
+            expected = sweep_seconds(dict(job.get("settings") or {}, trainer="gsplat", sweep_correction="render"),
+                                     job.get("frames"), None, list_caches())
+            set_progress(job, label="render search", expected=expected)
             beat(force=True)
             args = [f"{cwd}/sweep_correct.py", f"{d}/data", "--out", f"{d}/sweeps"]
             def poll():
                 out_ = self.ps(f"Get-Content '{d}/sweep_render.log' -Tail 20 -ErrorAction SilentlyContinue", check=False)
                 lines = [l.strip()[4:] for l in out_.splitlines() if l.strip().startswith("=== sweep ")]
                 if lines:
+                    prev = job.get("progress")
                     job["phase"] = f"sweep correction on {self.label}: {lines[-1][:80]}"
+                    if prev:   # the same estimate, carried across the per-sweep phase names
+                        job["progress"] = dict(prev, phase=job["phase"])
             code = self.run(py, args, cwd, d, "sweep_render", beat, poll)
             if code:
                 raise RuntimeError(f"render search exit {code} {self.failure(d, 'sweep_render')}")
@@ -2690,7 +3085,7 @@ class RemoteWorker:
         rep_ = json.loads((tmp / "sweeps.json").read_text())
         if method == "time":   # per photo, not per sweep
             ph = rep_.get("photos", {})
-            summary = {"photos": len(ph), "seconds": round(time.time() - t0), "match_cached": match_cached,
+            summary = {"photos": len(ph), "seconds": round(time.time() - t0), "match_cached": match_cached, "pairs": n_pairs,
                        "max_shift_mm": round(max([math.hypot(*v["shift_mm"]) for v in ph.values()] or [0]), 2)}
         else:
             moved = [v for v in rep_.get("sweeps", {}).values() if not v.get("anchor")]
@@ -2764,12 +3159,12 @@ class RemoteWorker:
             d = self.job_dir(name)
             remote_ply = f"{d}/out/{Path(ply).name}"
             if sensor and not (st.get("trainer") == "gsplat"):   # Brush runs didn't upload depth
-                self.upload_dir(sensor.parent, [sensor.name], f"{d}/data", beat)
+                self.upload_dir(sensor.parent, [sensor.name], f"{d}/data", beat, job)
         else:
             d = self.job_dir(name + "-prune")
             job["phase"] = f"uploading to {self.label} for pruning"
             beat(force=True)
-            self.upload_capture(d, colmap_dir, sensor, beat)
+            self.upload_capture(d, colmap_dir, sensor, beat, job=job)
             remote_ply = f"{d}/in.ply"
             self.upload_file(ply, remote_ply)
         self.sync_gsplat()
@@ -2792,7 +3187,7 @@ class RemoteWorker:
             if code:
                 raise RuntimeError(f"pruning on {self.label} exited with {code} {self.failure(d, 'prune')}")
             local = out_dir / f"pruned_{pct}.ply"
-            self.download(f"{d}/prune/pruned.ply", local)
+            self.download(f"{d}/prune/pruned.ply", local, job)
             self.download(f"{d}/prune/prune.json", out_dir / "prune.json")
             return local, json.loads((out_dir / "prune.json").read_text())
         finally:
@@ -2860,6 +3255,15 @@ def process(cfg, paths, state, status, item, beat, worker=None):
             beat()
             unpack(local_zip, job_dir / "data")
         colmap = find_colmap(job_dir / "data")
+        if load_config().get("drop_blank_frames", True) and not (colmap / "dropped_frames").exists():
+            job["phase"] = "checking frames"
+            beat()
+            cfg_now = load_config()
+            dropped = drop_blank_frames(colmap, lambda names: frame_widths(cfg_now, colmap / "images", names))
+            job["frame_check"] = str(colmap / "frame_check.json")
+            if dropped:
+                job["dropped_frames"] = [{"photo": n, "why": w} for n, w, _ in dropped]
+                log(f"{name}: dropped {len(dropped)} frame(s): " + ", ".join(f"{n} ({w}: {d})" for n, w, d in dropped))
         sensor = find_sensor_data(job_dir / "data")
         if not job.get("quality"):
             job["quality"] = find_capture_quality(job_dir / "data")
@@ -3079,6 +3483,51 @@ def download_path(paths, name, fname):
         return None
 
 
+def viewer_command(cfg):
+    """The splat viewer from config ("viewer": its executable; "viewer_args": extra arguments, default
+    ["--up", "-y"] for results flipped right way up), or None when none is set up."""
+    exe = Path(os.path.expanduser(cfg.get("viewer") or "")) if cfg.get("viewer") else None
+    if exe is None or not exe.is_file() or not os.access(exe, os.X_OK):
+        return None
+    return [str(exe)] + [str(a) for a in cfg.get("viewer_args", ["--up", "-y"])]
+
+
+def viewer_layers(cfg, name):
+    """Overlay layers for a result: files in config "viewer_layers_dir" named after its capture
+    (<capture>-*.ply as point layers, <capture>-*.txt as line layers). The capture is the longest
+    dash-separated start of the result's name (without "exp-") that has layer files."""
+    if not cfg.get("viewer_layers_dir"):
+        return []
+    d = Path(os.path.expanduser(cfg["viewer_layers_dir"]))
+    if not d.is_dir():
+        return []
+    files = sorted(f for f in d.iterdir() if f.is_file() and f.suffix in (".ply", ".txt") and not f.name.startswith("."))
+    words = (name[4:] if name.startswith("exp-") else name).split("-")
+    for k in range(len(words), 0, -1):
+        cap = "-".join(words[:k])
+        mine = [f for f in files if f.stem.startswith(cap + "-")]
+        if mine:
+            return [a for f in mine for a in (("--points" if f.suffix == ".ply" else "--lines"), f"{f.stem}={f}")]
+    return []
+
+
+def open_in_viewer(cfg, paths, name, fname):
+    """Open one of a result's files (only those offered for download) in the viewer, detached, with
+    the capture's overlay layers (see viewer_layers)."""
+    f = download_path(paths, name, fname)
+    if f is None or not fname.endswith((".ply", ".spz")):
+        raise ValueError("no such result file")
+    cmd = viewer_command(cfg)
+    if cmd is None:
+        raise ValueError("no viewer set up (config.json: \"viewer\")")
+    exe = Path(cmd[0])
+    cwd = Path(os.path.expanduser(cfg["viewer_dir"])) if cfg.get("viewer_dir") else exe.parent
+    log = open(APP_HOME / "viewer.log", "ab")
+    subprocess.Popen([cmd[0], str(f)] + cmd[1:] + viewer_layers(cfg, name), cwd=cwd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                     start_new_session=True)
+    log.close()
+
+
 def history_id(h):
     """Stable id of a history entry (for dismissing it from the dashboard)."""
     return str(h.get("finished_ts") or f"{h.get('name')}|{h.get('finished')}")
@@ -3104,6 +3553,7 @@ def record(state, job, result, duration, detail):
             "kind": job.get("kind"), "frames": job.get("frames"),
             "settings": job.get("settings"), "train_seconds": job.get("train_seconds"),
             "total_seconds": job.get("total_seconds"), "pre_seconds": job.get("pre_seconds"),
+            "sweep_seconds": (job.get("sweeps") or {}).get("seconds") if not (job.get("sweeps") or {}).get("cached") else 0,
             "worker": job.get("worker"), "trainer": job.get("trainer"),
             "file": job.get("file"),
             "files": job.get("files"), "quality": job.get("quality")})
@@ -3361,7 +3811,9 @@ def overhead_seconds(state, worker, frames, prune):
     """(before training, after training) seconds a capture needs on this machine besides
     training: uploads, pose refinement and depth maps before; downloads, pruning, orienting,
     compression and copying out after. From the last few finished runs there (preferring
-    ones with Prune set the same way), scaled by photo count. (None, None) if unknown."""
+    ones with Prune set the same way), scaled by photo count. (None, None) if unknown.
+    Sweep correction is left out (sweep_seconds estimates it): runs that did one but didn't
+    record how long it took are skipped."""
     runs = []
     for h in state.get("history", []):
         if h.get("result") != "done" or not h.get("train_seconds"):
@@ -3371,8 +3823,13 @@ def overhead_seconds(state, worker, frames, prune):
         total = h.get("total_seconds") or parse_dur(h.get("duration"))
         if not total:
             continue
-        extra = max(0.0, total - h["train_seconds"])
+        sweep = h.get("sweep_seconds")
+        if sweep is None and (h.get("settings") or {}).get("sweep_correction", "off") not in (None, "off"):
+            continue   # its sweep correction is somewhere in pre_seconds, by an unknown amount
+        extra = max(0.0, total - h["train_seconds"] - (sweep or 0))
         pre = h.get("pre_seconds")
+        if pre is not None:
+            pre = max(0.0, pre - (sweep or 0))
         pruned = bool((h.get("settings") or {}).get("prune_pct"))
         runs.append((h.get("frames"), extra, pre, pruned))
     same = [r for r in runs if r[3] == bool(prune)]
@@ -3395,10 +3852,11 @@ def overhead_seconds(state, worker, frames, prune):
 
 SWEEP_SECONDS_PER_PHOTO = {"match": 3.0, "render": 36.0, "time": 0.3}   # fallbacks until cached runs say otherwise
 SWEEP_SECONDS_FIXED = {"match": 60.0, "render": 120.0, "time": 120.0}
-SWEEP_SECONDS_PER_PAIR = 0.014   # time: LightGlue on every photo pair (PC, 960 px)
+SWEEP_SECONDS_PER_PAIR = 0.018   # time: LightGlue per photo pair (PC, 960 px)
+OVERLAP_PAIRS_PER_PHOTO = 27     # time: pairs overlap_pairs.py keeps per photo (about 8 in its sweep, 25 across)
 
 
-RENDER_SECONDS_PER_SWEEP = 500.0   # PC, full-shelf: one leave-one-out training + search per sweep
+RENDER_SECONDS_PER_SWEEP = 500.0   # PC, ~800-photo capture: one leave-one-out training + search per sweep
 
 
 def sweep_seconds(st, frames, name, caches, sweeps=None):
@@ -3415,15 +3873,17 @@ def sweep_seconds(st, frames, name, caches, sweeps=None):
                  for m, v in c["sweeps"].items() if m.split(" ")[0] == "render" and v.get("seconds") and v.get("sweeps")]
         rate = sorted(rates)[len(rates) // 2] if rates else RENDER_SECONDS_PER_SWEEP
         return SWEEP_SECONDS_FIXED[method] + rate * max(sweeps - 1, 0)
-    if method == "time":   # matching every pair dominates: grows with the square of the photo count
+    if method == "time":   # matching dominates: the overlapping photo pairs (or every pair, in older runs)
         n = frames or 100
+        base = SWEEP_SECONDS_FIXED["time"] + SWEEP_SECONDS_PER_PHOTO["time"] * n
         if any(c.get("match_db") for c in mine):   # matches kept from an earlier run: only the solve is left
-            return SWEEP_SECONDS_FIXED["time"] + SWEEP_SECONDS_PER_PHOTO["time"] * n
-        rates = [(v["seconds"] - SWEEP_SECONDS_FIXED["time"]) / (c["photos"] ** 2 / 2) for c in caches
+            return base
+        rates = [(v["seconds"] - SWEEP_SECONDS_FIXED["time"] - SWEEP_SECONDS_PER_PHOTO["time"] * c["photos"])
+                 / (v.get("pairs") or c["photos"] ** 2 / 2) for c in caches
                  if (c.get("photos") or 0) > 50 for m, v in c["sweeps"].items()
                  if m.split(" ")[0] == "time" and v.get("seconds") and not v.get("match_cached")]
         pair = sorted(rates)[len(rates) // 2] if rates else SWEEP_SECONDS_PER_PAIR
-        return SWEEP_SECONDS_FIXED["time"] + SWEEP_SECONDS_PER_PHOTO["time"] * n + max(pair, 0.002) * n * n / 2
+        return base + max(pair, 0.002) * min(n * (n - 1) / 2, OVERLAP_PAIRS_PER_PHOTO * n)
     rates = [v["seconds"] / c["photos"] for c in caches if c.get("photos")
              for m, v in c["sweeps"].items() if m.split(" ")[0] == method and v.get("seconds")]
     rate = sorted(rates)[len(rates) // 2] if rates else SWEEP_SECONDS_PER_PHOTO[method]
@@ -3585,7 +4045,7 @@ def main():
                 reload_if_changed()
             claimed = {n for _, n in list(running.values())}
             any_gsplat = any(w.gsplat for w in status.workers.values())
-            experimenting = {e.get("worker") for e in read_experiments() if e["live"]}
+            experimenting = {e.get("worker") for e in read_experiments() if e["live"] and e.get("hold", True)}
             for w in list(status.workers.values()):   # remote GPUs first, then the Mac
                 if w.name in running or (w.remote and not w.online) or w.name in experimenting:
                     continue

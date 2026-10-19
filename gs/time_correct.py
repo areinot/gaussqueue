@@ -87,11 +87,48 @@ class Problem:
         self.pb = torch.tensor(M.p[1], device=dev)
         self.da, self.db = t(M.dc[0]), t(M.dc[1])
         self.xa, self.xb = t(M.x[0]), t(M.x[1])
+        self.pp = None   # optional shared principal-point shift (px, sensor frame), a [2] tensor
 
     def cameras(self, P):
-        """P [N, 6]: turn (deg, world axes, about the camera centre) and shift (mm)."""
+        """P [N, 6 or 7]: turn (deg, world axes, about the camera centre), shift (mm) and, with a 7th
+        column, a focal length change (per mille)."""
         R = rodrigues(torch.deg2rad(P[:, :3])) @ self.R0
-        return R, self.C0 + P[:, 3:] / 1000
+        return R, self.C0 + P[:, 3:6] / 1000
+
+    def intrinsics(self, P, idx):
+        """K rows (fx, fy, cx, cy) of photos idx, with P's focal change."""
+        K = self.K[idx]
+        if self.pp is not None:
+            K = torch.cat([K[:, :2], K[:, 2:] + self.pp], 1)
+        if P.shape[1] < 7:
+            return K
+        s = torch.exp(P[idx, 6] / 1000)[:, None]
+        return torch.cat([K[:, :2] * s, K[:, 2:]], 1)
+
+    def rays(self, P, d0, idx):
+        """Camera-frame unit rays of keypoints, re-aimed for P's focal change (a longer focal narrows them)."""
+        if P.shape[1] < 7 and self.pp is None:
+            return d0
+        xy = d0[:, :2] / d0[:, 2:]                        # (x - cx) / fx with the stored intrinsics
+        if self.pp is not None:
+            xy = xy - self.pp / self.K[idx][:, :2]
+        if P.shape[1] >= 7:
+            xy = xy / torch.exp(P[idx, 6] / 1000)[:, None]
+        r = torch.cat([xy, torch.ones_like(d0[:, 2:])], 1)
+        return r / r.norm(dim=1, keepdim=True)
+
+    def points(self, P, sel):
+        """Per match: the 3D point midway between the two rays where they pass closest (world)."""
+        R, C = self.cameras(P)
+        pa, pb = self.pa[sel], self.pb[sel]
+        da = torch.einsum("nij,nj->ni", R[pa], self.rays(P, self.da[sel], pa))
+        db = torch.einsum("nij,nj->ni", R[pb], self.rays(P, self.db[sel], pb))
+        w0 = C[pa] - C[pb]
+        b = (da * db).sum(-1)
+        d, e = (da * w0).sum(-1), (db * w0).sum(-1)
+        den = (1 - b * b).clamp_min(1e-9)
+        s1, s2 = (b * e - d) / den, (e - b * d) / den
+        return 0.5 * (C[pa] + s1[:, None] * da + C[pb] + s2[:, None] * db)
 
     def misses(self, P, sel=None):
         """Per match: reprojection miss in photo a and b (px), distance along each ray (m), depth in a."""
@@ -100,8 +137,8 @@ class Problem:
         da0, db0 = (self.da, self.db) if sel is None else (self.da[sel], self.db[sel])
         xa, xb = (self.xa, self.xb) if sel is None else (self.xa[sel], self.xb[sel])
         Ra, Rb, Ca, Cb = R[pa], R[pb], C[pa], C[pb]
-        da = torch.einsum("nij,nj->ni", Ra, da0)
-        db = torch.einsum("nij,nj->ni", Rb, db0)
+        da = torch.einsum("nij,nj->ni", Ra, self.rays(P, da0, pa))
+        db = torch.einsum("nij,nj->ni", Rb, self.rays(P, db0, pb))
         w0 = Ca - Cb
         b = (da * db).sum(-1)
         d, e = (da * w0).sum(-1), (db * w0).sum(-1)
@@ -113,8 +150,8 @@ class Problem:
             Xc = torch.einsum("nji,nj->ni", Rc, X - Cc)
             z = Xc[:, 2].clamp_min(1e-6)
             return torch.hypot(K[:, 0] * Xc[:, 0] / z + K[:, 2] - x[:, 0], K[:, 1] * Xc[:, 1] / z + K[:, 3] - x[:, 1]), Xc[:, 2]
-        ea, za = proj(Ra, Ca, self.K[pa], xa)
-        eb, _ = proj(Rb, Cb, self.K[pb], xb)
+        ea, za = proj(Ra, Ca, self.intrinsics(P, pa), xa)
+        eb, _ = proj(Rb, Cb, self.intrinsics(P, pb), xb)
         bad = (den < 1e-4) | (s1 < 0.03) | (s2 < 0.03)
         big = torch.full_like(ea, 1e4)
         return torch.where(bad, big, ea), torch.where(bad, big, eb), s1, s2, za
@@ -213,6 +250,53 @@ class Lidar:
         return (good / tot.clamp_min(1)).cpu().numpy(), tot.cpu().numpy()
 
 
+def curate(a, prob, sel, P0, sid, N):
+    """Fewer, surer matches: a match's point (from the uncorrected poses) must have LiDAR nearby, each
+    photo pair keeps its best-fitting match per image cell, then at most a few per pair (more across
+    sweeps, where the links that hold sweeps together are)."""
+    n0 = len(sel)
+    if a.curate_lidar:
+        vox = a.curate_mm / 1000
+        L = np.load(a.curate_lidar)
+        occ = np.unique(np.floor(L / vox).astype(np.int64), axis=0)
+        X = np.concatenate([prob.points(P0, sel[k:k + 2_000_000]).cpu().numpy()
+                            for k in range(0, len(sel), 2_000_000)])
+        key = np.floor(X / vox).astype(np.int64)
+        lo = occ.min(0) - 2
+        span = occ.max(0) - lo + 3
+        flat = lambda k: ((k[:, 0] - lo[0]) * span[1] + (k[:, 1] - lo[1])) * span[2] + (k[:, 2] - lo[2])
+        occ_f = np.sort(flat(occ))
+        near = np.zeros(len(key), bool)
+        inside = np.all((key >= lo + 1) & (key < lo + span - 1), 1)
+        for d in np.stack(np.meshgrid(*[[-1, 0, 1]] * 3, indexing="ij"), -1).reshape(-1, 3):
+            q = flat(key[inside] + d)
+            at = np.clip(np.searchsorted(occ_f, q), 0, len(occ_f) - 1)
+            near[np.flatnonzero(inside)[occ_f[at] == q]] = True
+        sel = sel[torch.tensor(near, device=sel.device)]
+        print(f"curate: {len(sel):,} of {n0:,} matches on the LiDAR surface (about {a.curate_mm:g} mm)", flush=True)
+    ea, eb, _, _, _ = prob.misses(P0, sel)
+    err = torch.maximum(ea, eb).cpu().numpy()
+    pa, pb = prob.pa[sel].cpu().numpy(), prob.pb[sel].cpu().numpy()
+    xa = prob.xa[sel].cpu().numpy()
+    cell = np.floor(xa / a.curate_cell).astype(np.int64)
+    pair = pa.astype(np.int64) * N + pb
+    group = (pair * 4096 + cell[:, 0]) * 4096 + cell[:, 1]
+    o = np.lexsort((err, group))                       # by cell, best fit first
+    first = np.r_[True, group[o][1:] != group[o][:-1]]
+    best = o[first]
+    o2 = best[np.lexsort((err[best], pair[best]))]     # each pair's cells, best fit first
+    p2 = pair[o2]
+    start = np.r_[0, np.flatnonzero(p2[1:] != p2[:-1]) + 1]
+    rank = np.arange(len(o2)) - np.repeat(start, np.diff(np.r_[start, len(o2)]))
+    cap = np.where(sid[pa[o2]] == sid[pb[o2]], a.curate_own, a.curate_cross)
+    keep = np.sort(o2[rank < cap])
+    out = sel[torch.tensor(keep, device=sel.device)]
+    cross = int((sid[pa[keep]] != sid[pb[keep]]).sum())
+    print(f"curate: {len(best):,} after one per {a.curate_cell:g} px cell, {len(out):,} after the per-pair caps "
+          f"({cross:,} across sweeps)", flush=True)
+    return out
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("database", nargs="+")
@@ -232,6 +316,18 @@ def main(argv=None):
     p.add_argument("--gap-seconds", type=float, default=5.0, help="no smoothness across a pause this long")
     p.add_argument("--prior-mm", type=float, default=20.0, help="weak pull of every correction toward zero")
     p.add_argument("--prior-deg", type=float, default=1.0)
+    p.add_argument("--focal", action="store_true",
+                   help="also fit each photo's focal length (ARKit's per-frame value is the start; focus breathing)")
+    p.add_argument("--radial", type=float, nargs=2, metavar=("FROM", "TO"),
+                   help="trust matches and edge pixels less toward the photo corners: full weight out to FROM, "
+                        "none at TO (shares of the distance from the centre to the corner, e.g. 0.7 1.0)")
+    p.add_argument("--principal", action="store_true",
+                   help="also fit one principal-point shift shared by all photos (px, the sensor's frame)")
+    p.add_argument("--prior-principal", type=float, default=10.0, help="px: weak pull toward ARKit's principal point")
+    p.add_argument("--anchor-tilt", action="store_true",
+                   help="let the anchor sweep tilt (turns about the horizontal axes); its heading and position stay fixed")
+    p.add_argument("--smooth-focal", type=float, default=1.0, help="per mille: allowed focal change between photos")
+    p.add_argument("--prior-focal", type=float, default=20.0, help="per mille: weak pull toward ARKit's focal")
     p.add_argument("--render", nargs="*", default=[], metavar="NAMES=SEARCH_JSON",
                    help="render-search results: the group's mean correction is pulled to the searched move")
     p.add_argument("--render-mm", type=float, default=1.5)
@@ -239,6 +335,11 @@ def main(argv=None):
                    help="pull each group photo's sideways/vertical shift (camera x, y) and turn to the searched move, "
                         "leaving the view direction to LiDAR and matches (renders pin lateral position, LiDAR depth)")
     p.add_argument("--render-deg", type=float, default=0.15)
+    p.add_argument("--edges", help="edge observations (json: lines {name: [point, direction]} and obs [[photo, line, "
+                                    "u, v], ...]): each photo's detected pixel on an edge must lie on that 3D line's "
+                                    "projection; only the distance across the edge counts")
+    p.add_argument("--edge-weight", type=float, default=1.0, help="per edge pixel, against 1 per feature match")
+    p.add_argument("--edge-robust", type=float, default=2.0, help="px, scale of the robust (Cauchy) edge loss")
     p.add_argument("--lidar", help="SplatKing sensor_data folder (original depth maps + per-frame json)")
     p.add_argument("--lidar-points", type=int, default=1500, help="LiDAR points used per photo")
     p.add_argument("--lidar-sigma", type=float, default=1.0, help="mm: a LiDAR miss this big costs as much as ...")
@@ -249,11 +350,25 @@ def main(argv=None):
     p.add_argument("--far-seconds", type=float, default=10.0)
     p.add_argument("--far-links", type=int, default=30, help="flag photos with fewer agreeing far matches than this")
     p.add_argument("--box", help="box.json: also report how far each correction moves the box centre, as seen from the photo")
+    p.add_argument("--anchor", help="a photo name: its sweep is the anchor (held fixed); default the largest sweep")
     p.add_argument("--sweep-jump", type=float, default=0.0)
     p.add_argument("--sweep-min", type=int, default=3)
     p.add_argument("--pair-cap", type=int, default=0, help="use at most this many band matches per photo pair (0 = all)")
+    p.add_argument("--curate", action="store_true",
+                   help="fewer, surer matches: on the LiDAR surface (--curate-lidar), the best per image cell per "
+                        "photo pair, at most --curate-cross / --curate-own per pair across / within sweeps")
+    p.add_argument("--curate-lidar", help="npy [n, 3]: LiDAR points in capture coordinates")
+    p.add_argument("--curate-mm", type=float, default=15.0, help="mm: a match's point must have LiDAR about this near")
+    p.add_argument("--curate-cell", type=float, default=64.0, help="px")
+    p.add_argument("--curate-cross", type=int, default=40)
+    p.add_argument("--curate-own", type=int, default=12)
+    p.add_argument("--subset", type=float, default=1.0, help="use a random share of the photo pairs (jitter runs)")
+    p.add_argument("--edge-subset", type=float, default=1.0, help="... and of the edge lines")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--apply", help="no solve: apply the corrections of this report (e.g. the median of jitter runs)")
     p.add_argument("--chunk", type=int, default=1_000_000, help="matches per backward pass (bounds GPU memory)")
     p.add_argument("--iters", type=int, default=300)
+    p.add_argument("--dump-matches", help="npz: every match's 3D point (final poses), its photos, and what the solve did with it")
     p.add_argument("--write-model")
     p.add_argument("--write-from")
     a = p.parse_args(argv)
@@ -271,12 +386,27 @@ def main(argv=None):
               "K": np.array([[im["cam"][k] for k in ("fx", "fy", "cx", "cy")] for im in images])}
     sid = np.array(T.find_sweeps(names, torch.tensor(c2w, dtype=torch.float32), a.sweep_jump, min_size=a.sweep_min))
     anchor = int(np.bincount(sid).argmax())
+    if a.anchor:
+        hit = [i for i, n in enumerate(names) if Path(n).stem == Path(a.anchor).stem]
+        if not hit:
+            raise SystemExit(f"--anchor {a.anchor}: no such photo")
+        anchor = int(sid[hit[0]])
     secs = capture_seconds(names)
 
     # every photo pair, not just across sweeps: the matches inside a sweep tie neighbours together
     M = ms.Matches(a.database, photos, np.arange(N), 0, raw=a.raw)
     prob = Problem(photos, M, dev, dtype)
-    P0 = torch.zeros(N, 6, dtype=dtype, device=dev)
+    D = 7 if a.focal else 6
+
+    def radial_weight(uv, K):
+        """1 near the middle of the photo, falling smoothly (cos^2) to 0 toward its corners."""
+        if not a.radial:
+            return torch.ones(len(uv), dtype=dtype, device=dev)
+        r = torch.hypot(uv[:, 0] - K[:, 2], uv[:, 1] - K[:, 3]) / torch.hypot(K[:, 2], K[:, 3])
+        t = ((r - a.radial[0]) / (a.radial[1] - a.radial[0])).clamp(0, 1)
+        return torch.cos(t * np.pi / 2) ** 2
+    m_w = radial_weight(prob.xa, prob.K[prob.pa]) * radial_weight(prob.xb, prob.K[prob.pb])
+    P0 = torch.zeros(N, D, dtype=dtype, device=dev)
     keep = []
     for k in range(0, len(prob.pa), 2_000_000):   # in chunks: big captures have tens of millions of raw matches
         ch = torch.arange(k, min(k + 2_000_000, len(prob.pa)), device=dev)
@@ -292,11 +422,17 @@ def main(argv=None):
     rel = np.einsum("nji,njk->nik", R[:-1], R[1:])
     step_deg = np.degrees(np.arccos(np.clip((np.trace(rel, axis1=1, axis2=2) - 1) / 2, -1, 1)))
     linked = np.diff(secs) <= a.gap_seconds
-    sig = np.stack([a.smooth_deg + a.smooth_turn_share * step_deg] * 3 + [a.smooth_mm + a.smooth_share * step_mm] * 3, 1)
+    sig = np.stack([a.smooth_deg + a.smooth_turn_share * step_deg] * 3 + [a.smooth_mm + a.smooth_share * step_mm] * 3
+                   + ([np.full(N - 1, a.smooth_focal)] if a.focal else []), 1)
     sig_t = torch.tensor(sig, dtype=dtype, device=dev)
     link_t = torch.tensor(linked, device=dev)
-    prior = torch.tensor([a.prior_deg] * 3 + [a.prior_mm] * 3, dtype=dtype, device=dev)
-    free = torch.tensor(sid != anchor, dtype=dtype, device=dev)[:, None]
+    prior = torch.tensor([a.prior_deg] * 3 + [a.prior_mm] * 3 + ([a.prior_focal] if a.focal else []), dtype=dtype, device=dev)
+    free = torch.tensor(sid != anchor, dtype=dtype, device=dev)[:, None].repeat(1, D)
+    if a.focal:
+        free[:, 6] = 1   # the anchor sweep's poses hold the frame; its focal lengths can still be wrong
+    if a.anchor_tilt:    # world up is +y: turns about x and z tilt the camera, about y turn its heading
+        free[:, 0] = 1
+        free[:, 2] = 1
     lidar = None
     if a.lidar:
         lidar = Lidar(a.lidar, names, secs, a.lidar_points, a.lidar_max_depth, dev, dtype)
@@ -318,9 +454,41 @@ def main(argv=None):
     gsig = torch.tensor([a.render_deg] * 3 + [a.render_mm] * 3, dtype=dtype, device=dev)
     R0_t = torch.tensor(R, dtype=dtype, device=dev)
 
+    # edge observations: photo pixels that must sit on a known 3D line (e.g. a shelf edge most photos agree on)
+    edges = None
+    if a.edges:
+        E = json.loads(Path(a.edges).read_text())
+        if a.edge_subset < 1:
+            rng_e = np.random.default_rng(a.seed + 1000)
+            E["lines"] = {k: v for k, v in E["lines"].items() if rng_e.random() < a.edge_subset}
+        rows = [(idx[Path(o[0]).stem], o[1], o[2], o[3]) for o in E["obs"] if Path(o[0]).stem in idx and o[1] in E["lines"]]
+        tt = lambda x: torch.tensor(np.asarray(x, float), dtype=dtype, device=dev)
+        edges = (torch.tensor([r[0] for r in rows], device=dev), tt([E["lines"][r[1]][0] for r in rows]),
+                 tt([E["lines"][r[1]][1] for r in rows]), tt([[r[2], r[3]] for r in rows]))
+        e_w = radial_weight(edges[3], prob.K[edges[0]])
+        print(f"edges: {len(rows):,} edge pixels on {len(E['lines'])} lines in {len(set(r[0] for r in rows))} photos", flush=True)
+
+    def edge_px(P):
+        """Per edge pixel: its distance across the edge from the line's projection (px)."""
+        ei, A, D, uv = edges
+        Rc, Cc = prob.cameras(P)
+        Re, Ce, K = Rc[ei], Cc[ei], prob.intrinsics(P, ei)
+        def pj(X):
+            Xc = torch.einsum("nji,nj->ni", Re, X - Ce)
+            z = Xc[:, 2].clamp_min(1e-6)
+            return torch.stack([K[:, 0] * Xc[:, 0] / z + K[:, 2], K[:, 1] * Xc[:, 1] / z + K[:, 3]], 1)
+        a1, a2 = pj(A), pj(A + 0.1 * D)
+        t_ = (a2 - a1) / (a2 - a1).norm(dim=1, keepdim=True).clamp_min(1e-9)
+        return ((uv - a1) * torch.stack([-t_[:, 1], t_[:, 0]], 1)).sum(1)
+
     def solve(sel, init=None, use_lidar=False):
-        X = (torch.zeros(N, 6, dtype=dtype, device=dev) if init is None else init.clone()).requires_grad_(True)
-        opt = torch.optim.LBFGS([X], lr=1, max_iter=a.iters, history_size=50, line_search_fn="strong_wolfe",
+        X = (torch.zeros(N, D, dtype=dtype, device=dev) if init is None else init.clone()).requires_grad_(True)
+        params = [X]
+        if a.principal:
+            pp = (torch.zeros(2, dtype=dtype, device=dev) if prob.pp is None else prob.pp.detach().clone()).requires_grad_(True)
+            prob.pp = pp
+            params.append(pp)
+        opt = torch.optim.LBFGS(params, lr=1, max_iter=a.iters, history_size=50, line_search_fn="strong_wolfe",
                                 tolerance_grad=1e-9, tolerance_change=1e-12)
         c2 = a.robust ** 2
 
@@ -330,21 +498,27 @@ def main(argv=None):
             if a.match_weight > 0:   # in chunks, each back-propagated on its own: memory stays bounded
                 for k in range(0, len(sel), a.chunk):
                     e1, e2, _, _, _ = prob.misses(X * free, sel[k:k + a.chunk])
-                    part = a.match_weight * (c2 * (torch.log1p(e1 ** 2 / c2) + torch.log1p(e2 ** 2 / c2))).sum() / c2
+                    part = a.match_weight * (m_w[sel[k:k + a.chunk]] * c2 * (torch.log1p(e1 ** 2 / c2)
+                                                                             + torch.log1p(e2 ** 2 / c2))).sum() / c2
                     part.backward()
                     total += float(part)
             P = X * free
             loss = torch.zeros((), dtype=dtype, device=dev)
             d = (P[1:] - P[:-1]) / sig_t
             loss = loss + (d ** 2).sum(-1)[link_t].sum() + ((P / prior) ** 2).sum()
+            if a.principal:
+                loss = loss + ((prob.pp / a.prior_principal) ** 2).sum()
             for m, target, _, per in groups:
                 if a.render_lateral:   # per photo: turn, and the shift along the camera's x and y axes
-                    d = P[m] - per
+                    d = P[m][:, :6] - per
                     axes = R0_t[m][:, :, :2]                     # camera x, y in world, [n, 3, 2]
                     lat = torch.einsum("nij,ni->nj", axes, d[:, 3:])
                     loss = loss + ((d[:, :3] / gsig[:3]) ** 2).sum() + ((lat / gsig[3]) ** 2).sum()
                 else:
-                    loss = loss + (((P[m].mean(0) - target) / gsig) ** 2).sum() * len(m)
+                    loss = loss + (((P[m][:, :6].mean(0) - target) / gsig) ** 2).sum() * len(m)
+            if edges is not None:
+                ce = a.edge_robust ** 2
+                loss = loss + a.edge_weight * (e_w * torch.log1p(edge_px(P) ** 2 / ce)).sum()
             if use_lidar:
                 r = lidar.residuals(*prob.cameras(P)) * 1000
                 cl = a.lidar_robust ** 2
@@ -352,9 +526,20 @@ def main(argv=None):
             loss.backward()
             return loss.detach() + total
         opt.step(closure)
+        if a.principal:
+            prob.pp = prob.pp.detach()
+            print(f"principal point shift: {prob.pp.cpu().numpy().round(2)} px", flush=True)
         return (X * free).detach()
 
     sel = torch.nonzero(keep).squeeze(1)
+    if a.subset < 1:   # a random share of the photo pairs, each pair wholly in or out
+        pid = (prob.pa[sel] * N + prob.pb[sel]).cpu().numpy()
+        up, inv = np.unique(pid, return_inverse=True)
+        pick = np.random.default_rng(a.seed).random(len(up)) < a.subset
+        sel = sel[torch.tensor(pick[inv], device=dev)]
+        print(f"subset (seed {a.seed}): {int(pick.sum())} of {len(up)} photo pairs, {len(sel):,} matches", flush=True)
+    if a.curate:
+        sel = curate(a, prob, sel, P0, sid, N)
     if a.pair_cap > 0:   # a random subset per photo pair: big captures have millions of matches
         pid = (prob.pa[sel] * N + prob.pb[sel]).cpu().numpy()
         order = np.random.default_rng(0).permutation(len(pid))
@@ -369,7 +554,14 @@ def main(argv=None):
     if lidar is not None:
         n_l = lidar.match(*prob.cameras(P0), reach[0], a.far_seconds)
         print(f"LiDAR round 1: {n_l:,} point pairs within {1000 * reach[0]:g} mm", flush=True)
-    P = solve(sel, use_lidar=lidar is not None)
+    if a.apply:
+        rep = json.loads(Path(a.apply).read_text())["photos"]
+        P = torch.tensor([rep[Path(n).stem]["turn_deg"] + rep[Path(n).stem]["shift_mm"]
+                          + ([rep[Path(n).stem].get("focal_permille", 0.0)] if a.focal else []) for n in names],
+                         dtype=dtype, device=dev) * free
+        print(f"applied the corrections of {a.apply}", flush=True)
+    else:
+        P = solve(sel, use_lidar=lidar is not None)
     # second solve without photo pairs whose matches mostly disagree after the first
     e1, e2, _, _, _ = prob.misses(P, sel)
     agree = (torch.maximum(e1, e2) < 2 * a.robust)
@@ -381,11 +573,29 @@ def main(argv=None):
     sel2 = sel[good_pair[inv]]
     print(f"first solve: {int(agree.sum()):,} matches agree; {int(good_pair.sum())} of {len(upair)} photo pairs kept "
           f"({len(sel2):,} matches)", flush=True)
-    P = solve(sel2, P, use_lidar=lidar is not None)
-    for k, rch in enumerate(reach[1:] if lidar is not None else []):
+    if not a.apply:
+        P = solve(sel2, P, use_lidar=lidar is not None)
+    for k, rch in enumerate(reach[1:] if lidar is not None and not a.apply else []):
         n_l = lidar.match(*prob.cameras(P), rch, a.far_seconds)
         print(f"LiDAR round {k + 2}: {n_l:,} point pairs within {1000 * rch:g} mm", flush=True)
         P = solve(sel2, P, use_lidar=True)
+
+    if a.dump_matches:   # 0 outside the band, 1 dropped by the per-pair cap, 2 dropped by the pair gate, 3 used and agreeing, 4 used, disagreeing
+        status = torch.zeros(len(prob.pa), dtype=torch.uint8, device=dev)
+        status[keep] = 1
+        status[sel] = 2
+        e1d, e2d, _, _, _ = prob.misses(P, sel2)
+        status[sel2] = torch.where(torch.maximum(e1d, e2d) < 2 * a.robust, 3, 4).to(torch.uint8)
+        X, err = [], []
+        for k in range(0, len(prob.pa), 2_000_000):
+            ch = torch.arange(k, min(k + 2_000_000, len(prob.pa)), device=dev)
+            X.append(prob.points(P, ch).float().cpu())
+            ea, eb, _, _, _ = prob.misses(P, ch)
+            err.append(torch.maximum(ea, eb).float().cpu())
+        np.savez_compressed(a.dump_matches, X=torch.cat(X).numpy(), status=status.cpu().numpy(), err=torch.cat(err).numpy(),
+                            pa=np.asarray(M.p[0], np.int32), pb=np.asarray(M.p[1], np.int32), names=np.array(names), sweep=sid)
+        print(f"dumped {len(prob.pa):,} matches: " + ", ".join(f"{n} {int((status == k).sum()):,}" for k, n in
+              enumerate(["outside band", "capped", "pair-gated", "used agreeing", "used disagreeing"])), flush=True)
 
     # report
     e1, e2, _, _, _ = prob.misses(P, sel2)
@@ -402,6 +612,14 @@ def main(argv=None):
         surf0, lid_n = lidar.on_surface(*prob.cameras(P0), 0.02, a.far_seconds, N)
         surf1, _ = lidar.on_surface(*prob.cameras(P), 0.02, a.far_seconds, N)
     report = {"device": dev, "anchor_sweep": anchor, "photos": {}, "groups": [g[2] for g in groups]}
+    if prob.pp is not None:
+        report["principal_shift_px"] = prob.pp.cpu().numpy().round(3).tolist()
+    edge_before = edge_after = None
+    if edges is not None:   # median |distance across the edge| per photo, before and after
+        e0, e1_ = (edge_px(Q).abs().detach().cpu().numpy() for Q in (P0, P))
+        ei_ = edges[0].cpu().numpy()
+        edge_before = {i: float(np.median(e0[ei_ == i])) for i in np.unique(ei_)}
+        edge_after = {i: float(np.median(e1_[ei_ == i])) for i in np.unique(ei_)}
     print(f"{'photo':>16s} sweep  links   far" + ("  lidar 2mm" if lidar is not None else "") + "   turn deg    shift mm"
           + ("   box centre moves mm" if a.box else ""))
     for i, n in enumerate(names):
@@ -411,14 +629,17 @@ def main(argv=None):
         lidar_ok = surf1 is not None and lid_n[i] >= 200 and surf1[i] >= 0.5
         flag = sid[i] != anchor and far_links[i] < a.far_links and not lidar_ok
         report["photos"][Path(n).stem] = {
-            "sweep": int(sid[i]), "turn_deg": Pn[i, :3].round(4).tolist(), "shift_mm": Pn[i, 3:].round(3).tolist(),
+            "sweep": int(sid[i]), "turn_deg": Pn[i, :3].round(4).tolist(), "shift_mm": Pn[i, 3:6].round(3).tolist(),
+            **({"focal_permille": round(float(Pn[i, 6]), 3)} if a.focal else {}),
             "links": int(links[i]), "far_links": int(far_links[i]), "needs_render": bool(flag),
+            **({"edge_px": [round(edge_before[i], 2), round(edge_after[i], 2)]} if edge_before and i in edge_before else {}),
             **({"lidar_on_surface": [round(float(surf0[i]), 3), round(float(surf1[i]), 3)]} if surf1 is not None else {}),
             **({"box_move_mm": disp.round(2).tolist()} if disp is not None else {})}
         print(f"{Path(n).stem[-17:]:>16s} {sid[i]:5d} {links[i]:6d} {far_links[i]:5d}"
               + (f" {100 * surf0[i]:3.0f}->{100 * surf1[i]:3.0f}%" if surf1 is not None else "")
               + f" {np.linalg.norm(Pn[i, :3]):9.3f}"
-              f" {np.linalg.norm(Pn[i, 3:]):7.2f} {str(Pn[i, 3:].round(1)):>20s}"
+              f" {np.linalg.norm(Pn[i, 3:6]):7.2f} {str(Pn[i, 3:6].round(1)):>20s}"
+              + (f" focal {Pn[i, 6]:+6.2f} pm" if a.focal else "")
               + (f" {np.linalg.norm(disp):6.1f} {str(disp.round(1))}" if disp is not None else "")
               + ("  anchor" if sid[i] == anchor else "  needs render search" if flag else ""))
     report["seconds"] = round(time.time() - t_start, 1)
@@ -435,6 +656,24 @@ def main(argv=None):
                 (out / f).write_bytes((src / f).read_bytes())
         at = {Path(n).stem: i for i, n in enumerate(names)}
         lines = [l.rstrip("\n") for l in open(src / "images.txt")]
+        if a.focal or prob.pp is not None:   # fitted focal lengths (photos sharing a camera: their mean), principal point
+            scale = {}
+            for l in lines:
+                f = l.split()
+                if not l.startswith("#") and len(f) >= 10 and Path(f[9]).stem in at:
+                    scale.setdefault(f[8], []).append(float(np.exp(Pn[at[Path(f[9]).stem], 6] / 1000)) if a.focal else 1.0)
+            pp = prob.pp.cpu().numpy() if prob.pp is not None else np.zeros(2)
+            cams = []
+            for l in open(src / "cameras.txt"):
+                f = l.split()
+                if not l.startswith("#") and len(f) >= 6 and f[0] in scale:
+                    k = float(np.mean(scale[f[0]]))
+                    n_f = 1 if f[1] in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL") else 2
+                    f[4:4 + n_f] = [f"{float(x) * k:.6f}" for x in f[4:4 + n_f]]
+                    f[4 + n_f:6 + n_f] = [f"{float(x) + d:.6f}" for x, d in zip(f[4 + n_f:6 + n_f], pp)]
+                    l = " ".join(f) + "\n"
+                cams.append(l)
+            (out / "cameras.txt").write_text("".join(cams))
         res, k = [], 0
         while k < len(lines):
             f = lines[k].split()
